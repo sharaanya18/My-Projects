@@ -10,9 +10,6 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 
-DATA_DIR = Path("dataset/public")
-OUT_PATH = Path("working/submission.csv")
-
 LABELS = np.array([1, 2, 3])
 
 TOKEN_FIELDS = [
@@ -62,7 +59,7 @@ def add_key_crossings(frame):
     return frame
 
 
-def load_data(data_dir=DATA_DIR):
+def load_data(data_dir):
     train = pd.read_csv(data_dir / "train.csv")
     targets = pd.read_csv(data_dir / "train_targets.csv")
     test = pd.read_csv(data_dir / "test.csv")
@@ -183,12 +180,12 @@ def cross_validate(train, y, priors, seeds=(0, 1, 2), n_splits=5):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
-    parser.add_argument("--out", type=Path, default=OUT_PATH)
+    parser.add_argument("public_dir", type=Path)
+    parser.add_argument("submission_out", type=Path)
     parser.add_argument("--cv", type=int, default=0, help="number of CV seeds to run before fitting")
     args = parser.parse_args()
 
-    train, test = load_data(args.data_dir)
+    train, test = load_data(args.public_dir)
     y = train["target"].to_numpy(int)
     priors = np.array([(y == c).mean() for c in LABELS])
     print(f"train={train.shape[0]} rows  test={test.shape[0]} rows  priors={np.round(priors, 4)}")
@@ -205,11 +202,11 @@ def main():
             "prediction": [json.dumps({"breadth": int(b)}, separators=(",", ":")) for b in predictions],
         }
     )
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    submission.to_csv(args.out, index=False)
+    args.submission_out.parent.mkdir(parents=True, exist_ok=True)
+    submission.to_csv(args.submission_out, index=False)
 
     counts = pd.Series(predictions).value_counts().sort_index()
-    print(f"wrote {args.out} ({len(submission)} rows)")
+    print(f"wrote {args.submission_out} ({len(submission)} rows)")
     print("predicted breadth distribution:", {int(k): int(v) for k, v in counts.items()})
 
 
