@@ -93,6 +93,43 @@ epigram's predicted rate to [0,1] before averaging collapses the score to
 averaging is what makes them meaningful, so the aggregate must stay the unit
 of prediction.
 
+## Distribution audit (why validation misled)
+
+A leaderboard submission of the ridge/rint model scored **0.638** against its
+0.7153 validation - below even the 0.657 group-CV floor. The audit explains it:
+
+| | train | val | test |
+| --- | --- | --- | --- |
+| hidden_count <= 3 | 59.9% | 55.6% | **72.6%** |
+| hidden_count > 8 | 12.2% | 19.4% | **4.5%** |
+| max cosine similarity to train | 0.573 | **0.622** | 0.573 |
+| shares a normalised text with train | - | **32.3%** | 18.5% |
+
+Validation is closer to train than train is to itself, and skews to large
+manuscripts; test is at normal distance and skews small. Small hidden_count
+makes Bray-Curtis coarser, so test is intrinsically harder. Reveal fractions
+are identical everywhere (0.475), and TF-IDF coverage is equal or better on
+test (246 vs 242 nonzero n-grams per epigram, no empty rows), so the shift is
+manuscript size and similarity - not sampling or vocabulary.
+
+Model selection therefore uses **group-held-out splits reweighted to the test
+size profile**, computed from the public test inputs only. On that estimator
+the submitted model scores 0.6574, close to its actual 0.638 - a usable proxy
+where validation was off by 0.077.
+
+| model | natural group split | test-matched | std |
+| --- | --- | --- | --- |
+| ridge, rint (scored 0.638) | 0.6680 | 0.6574 | +-0.0181 |
+| **blend, round-up-from-0.40** | **0.6842** | **0.6751** | **+-0.0139** |
+| + shrink 0.15 / 0.30 to prior | - | 0.6583 / 0.6444 | worse |
+| ExtraTrees alone | 0.6762 | 0.6664 | +-0.0200 |
+
+The blend is both the best and the **lowest-variance** of 27 configurations
+tested across 6 group splits; ExtraTrees alone is the most volatile, so
+blending is what buys robustness. Shrinkage toward the prior hurts uniformly.
+The 0.40 threshold still beats 0.45 and 0.50 after reweighting to the
+small-manuscript profile.
+
 ## Validation protocol
 
 Splits are manuscript-level throughout. Inside every CV fold the TF-IDF

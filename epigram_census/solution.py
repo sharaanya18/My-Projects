@@ -11,7 +11,7 @@ from sklearn.decomposition import TruncatedSVD
 from sklearn.ensemble import ExtraTreesRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import Ridge
-from sklearn.model_selection import KFold
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.preprocessing import normalize
 
 N_GENRES = 6
@@ -19,7 +19,8 @@ GENRE_COLS = ["g%d" % i for i in range(N_GENRES)]
 ALPHA_GRID = [0.1, 0.2, 0.3, 0.5, 0.8]
 N_FOLDS = 5
 SEED = 0
-CV_SEEDS = (0, 1, 2)
+N_GROUP_SPLITS = 6
+HOLDOUT_FRACTION = 0.25
 TFIDF = dict(analyzer="char_wb", ngram_range=(2, 4), min_df=3, sublinear_tf=True)
 SVD_DIMS = 200
 N_TREES = 300
@@ -129,26 +130,69 @@ def mean_bray_curtis(P, Y):
     return float(np.mean([bray_curtis(P[i], Y[i]) for i in range(len(Y))]))
 
 
-def cross_val_rates(L, R, alpha, ridge_only=False, n_folds=N_FOLDS, seed=SEED):
-    oof = np.zeros((len(L), N_GENRES))
-    splitter = KFold(n_folds, shuffle=True, random_state=seed)
-    for fit_idx, held_idx in splitter.split(np.arange(len(L))):
-        oof[held_idx] = predict_rates(
+def text_groups(rows):
+    parent = list(range(len(rows)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    seen = {}
+    for i, r in enumerate(rows):
+        for o in r["revealed_occurrences"]:
+            t = normalise(o["text"])
+            if t in seen:
+                a, b = find(i), find(seen[t])
+                if a != b:
+                    parent[a] = b
+            else:
+                seen[t] = i
+    return np.array([find(i) for i in range(len(rows))])
+
+
+def size_bucket(h):
+    return 0 if h <= 3 else (1 if h <= 8 else 2)
+
+
+def reweighted_bray_curtis(P, Y, hidden, target):
+    b = np.array([size_bucket(x) for x in hidden])
+    source = np.array([(b == k).mean() for k in range(3)])
+    w = np.array([target[k] / max(source[k], 1e-9) for k in b])
+    w = w / w.sum()
+    s = np.array([bray_curtis(P[i], Y[i]) for i in range(len(Y))])
+    return float((w * s).sum())
+
+
+def group_holdout_score(L, R, hidden, Y, groups, alpha, target, ridge_only=False):
+    splitter = GroupShuffleSplit(
+        N_GROUP_SPLITS, test_size=HOLDOUT_FRACTION, random_state=SEED
+    )
+    scores = []
+    for fit_idx, held_idx in splitter.split(np.arange(len(L)), groups=groups):
+        pred = predict_rates(
             [L[i] for i in fit_idx],
             R[fit_idx],
             [L[i] for i in held_idx],
             alpha,
             ridge_only=ridge_only,
         )
-    return oof
+        counts = to_counts(pred, hidden[held_idx])
+        scores.append(
+            reweighted_bray_curtis(counts, Y[held_idx], hidden[held_idx], target)
+        )
+    return float(np.mean(scores)), float(np.std(scores))
 
 
-def select_alpha(L, R, hidden, Y):
+def select_alpha(L, R, hidden, Y, groups, target):
     scores = {}
     for alpha in ALPHA_GRID:
-        oof = cross_val_rates(L, R, alpha, ridge_only=True)
-        scores[alpha] = mean_bray_curtis(to_counts(oof, hidden), Y)
-        print("  alpha %-5s cross-validated Bray-Curtis %.4f" % (alpha, scores[alpha]))
+        m, sd = group_holdout_score(
+            L, R, hidden, Y, groups, alpha, target, ridge_only=True
+        )
+        scores[alpha] = m
+        print("  alpha %-5s group-holdout Bray-Curtis %.4f +-%.4f" % (alpha, m, sd))
     best = max(scores, key=scores.get)
     print("  selected alpha %s" % best)
     return best
@@ -209,14 +253,20 @@ def main():
 
     print("manuscripts: %d train, %d validation, %d test" % (len(train), len(valid), len(test)))
 
-    print("selecting the ridge penalty by %d-fold cross-validation on train" % N_FOLDS)
-    alpha = select_alpha(L_train, R_train, h_train, Y_train)
+    target = np.array([size_bucket(r["hidden_count"]) for r in test])
+    target = np.array([(target == k).mean() for k in range(3)])
+    print("test hidden_count profile (<=3, 4-8, >8): %s" % np.round(target, 3))
 
-    oof = np.mean(
-        [cross_val_rates(L_train, R_train, alpha, seed=s) for s in CV_SEEDS], axis=0
+    groups = text_groups(train)
+    print("%d text-linked groups over %d train manuscripts" % (len(set(groups)), len(train)))
+    print("selecting the ridge penalty on %d group-held-out splits, reweighted to the "
+          "test size profile" % N_GROUP_SPLITS)
+    alpha = select_alpha(L_train, R_train, h_train, Y_train, groups, target)
+
+    m, sd = group_holdout_score(
+        L_train, R_train, h_train, Y_train, groups, alpha, target
     )
-    print("train cross-validated Bray-Curtis %.4f (%d seeds)"
-          % (mean_bray_curtis(to_counts(oof, h_train), Y_train), len(CV_SEEDS)))
+    print("group-held-out Bray-Curtis (test-matched) %.4f +-%.4f" % (m, sd))
     if use_valid:
         valid_rates = predict_rates(L_train, R_train, L_valid, alpha)
         print("held-out validation Bray-Curtis %.4f"
