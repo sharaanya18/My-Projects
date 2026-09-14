@@ -61,10 +61,22 @@ Task baseline 0.66, quoted high score 0.70.
 
 ## Usage
 
-    python solution.py --data /path/to/public --out submission.csv
+The platform supplies both paths positionally:
 
-Optional `--alpha` skips the cross-validated search. Needs only numpy, scipy
-and scikit-learn; runs on CPU in a few minutes, well inside the 90-minute
-budget. Output is validated against `sample_submission.csv` before exit:
-exact query-id set, no duplicates, every count a finite integer within
-`[0, hidden_count]`.
+    python3 solution.py <public_dir> <submission_out>
+
+Locally:
+
+    python3 solution.py ./dataset/public ./working/submission.csv
+
+The parent directory of the output is created if it does not exist.
+Inputs are read from `*.jsonl` when present and from the `*.csv` mirrors
+otherwise (the mirrors parse to identical records, so either works).
+
+Needs only numpy, scipy and scikit-learn -- no pandas, no network, no
+pretrained weights. A full run is about four minutes on CPU, well inside the
+90-minute budget.
+
+Output is validated before exit: exact query-id set against
+`sample_submission.csv`, no duplicates, and every count a finite integer
+within `[0, hidden_count]`.

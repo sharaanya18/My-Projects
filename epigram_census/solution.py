@@ -1,10 +1,9 @@
-import argparse
 import csv
 import json
-import os
 import re
 import sys
 import unicodedata
+from pathlib import Path
 
 import numpy as np
 import scipy.sparse as sp
@@ -23,12 +22,35 @@ TFIDF = dict(analyzer="char_wb", ngram_range=(2, 4), min_df=3, sublinear_tf=True
 _GREEK_ONLY = re.compile(r"[^Ͱ-Ͽἀ-῿\s]")
 
 
-def read_jsonl(path):
-    with open(path, encoding="utf-8") as fh:
-        return [json.loads(line) for line in fh if line.strip()]
+csv.field_size_limit(1 << 30)
 
 
-def read_labels(path):
+def has_split(data_dir, split):
+    d = Path(data_dir)
+    return (d / (split + ".jsonl")).exists() or (d / (split + ".csv")).exists()
+
+
+def read_queries(data_dir, split):
+    jsonl = Path(data_dir) / (split + ".jsonl")
+    if jsonl.exists():
+        with open(jsonl, encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+    rows = []
+    with open(Path(data_dir) / (split + ".csv"), encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            rows.append(
+                {
+                    "query_id": row["query_id"],
+                    "total_count": int(row["total_count"]),
+                    "hidden_count": int(row["hidden_count"]),
+                    "revealed_occurrences": json.loads(row["revealed_occurrences"]),
+                }
+            )
+    return rows
+
+
+def read_labels(data_dir, split):
+    path = Path(data_dir) / (split + "_labels.csv")
     out = {}
     with open(path, encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
@@ -115,8 +137,8 @@ def check_submission(path, rows, counts, hidden, data_dir):
     ids = [r["query_id"] for r in rows]
     if len(set(ids)) != len(ids):
         raise ValueError("duplicate query_id in submission")
-    sample = os.path.join(data_dir, "sample_submission.csv")
-    if os.path.exists(sample):
+    sample = Path(data_dir) / "sample_submission.csv"
+    if sample.exists():
         with open(sample, encoding="utf-8") as fh:
             expected = [row["query_id"] for row in csv.DictReader(fh)]
         if sorted(expected) != sorted(ids):
@@ -128,50 +150,56 @@ def check_submission(path, rows, counts, hidden, data_dir):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data", default="data")
-    parser.add_argument("--out", default="submission.csv")
-    parser.add_argument("--alpha", type=float, default=None)
-    args = parser.parse_args()
+    if len(sys.argv) < 3:
+        print("usage: python3 solution.py <public_dir> <submission_out>")
+        return 2
+    public_dir = Path(sys.argv[1])
+    submission_out = Path(sys.argv[2])
 
-    train = read_jsonl(os.path.join(args.data, "train.jsonl"))
-    valid = read_jsonl(os.path.join(args.data, "validation.jsonl"))
-    test = read_jsonl(os.path.join(args.data, "test.jsonl"))
-    y_train = read_labels(os.path.join(args.data, "train_labels.csv"))
-    y_valid = read_labels(os.path.join(args.data, "validation_labels.csv"))
+    train = read_queries(public_dir, "train")
+    test = read_queries(public_dir, "test")
+    y_train = read_labels(public_dir, "train")
 
-    L_train, L_valid, L_test = docs_of(train), docs_of(valid), docs_of(test)
-    h_train, h_valid, h_test = hidden_counts(train), hidden_counts(valid), hidden_counts(test)
+    L_train, L_test = docs_of(train), docs_of(test)
+    h_train, h_test = hidden_counts(train), hidden_counts(test)
     Y_train = np.array([y_train[r["query_id"]] for r in train])
-    Y_valid = np.array([y_valid[r["query_id"]] for r in valid])
     R_train = Y_train / h_train[:, None]
-    R_valid = Y_valid / h_valid[:, None]
+
+    use_valid = has_split(public_dir, "validation") and (
+        Path(public_dir) / "validation_labels.csv"
+    ).exists()
+    if use_valid:
+        valid = read_queries(public_dir, "validation")
+        y_valid = read_labels(public_dir, "validation")
+        L_valid = docs_of(valid)
+        h_valid = hidden_counts(valid)
+        Y_valid = np.array([y_valid[r["query_id"]] for r in valid])
+        R_valid = Y_valid / h_valid[:, None]
+    else:
+        valid = []
 
     print("manuscripts: %d train, %d validation, %d test" % (len(train), len(valid), len(test)))
 
     print("selecting the ridge penalty by %d-fold cross-validation on train" % N_FOLDS)
-    if args.alpha is None:
-        alpha, cv_score = select_alpha(L_train, R_train, h_train, Y_train)
-    else:
-        alpha = args.alpha
-        cv_score = mean_bray_curtis(
-            to_counts(cross_val_rates(L_train, R_train, alpha), h_train), Y_train
-        )
-        print("  alpha %s cross-validated Bray-Curtis %.4f" % (alpha, cv_score))
+    alpha, cv_score = select_alpha(L_train, R_train, h_train, Y_train)
 
-    valid_rates = predict_rates(L_train, R_train, L_valid, alpha)
-    valid_score = mean_bray_curtis(to_counts(valid_rates, h_valid), Y_valid)
-    print("held-out validation Bray-Curtis %.4f" % valid_score)
     print("train cross-validated Bray-Curtis %.4f" % cv_score)
-
-    L_fit = L_train + L_valid
-    R_fit = np.vstack([R_train, R_valid])
+    if use_valid:
+        valid_rates = predict_rates(L_train, R_train, L_valid, alpha)
+        valid_score = mean_bray_curtis(to_counts(valid_rates, h_valid), Y_valid)
+        print("held-out validation Bray-Curtis %.4f" % valid_score)
+        L_fit = L_train + L_valid
+        R_fit = np.vstack([R_train, R_valid])
+    else:
+        L_fit, R_fit = L_train, R_train
     test_rates = predict_rates(L_fit, R_fit, L_test, alpha)
     counts = to_counts(test_rates, h_test).astype(int)
 
-    write_submission(args.out, test, counts)
-    check_submission(args.out, test, counts, h_test, args.data)
-    print("wrote %s (%d rows)" % (args.out, len(test)))
+    submission_out.parent.mkdir(parents=True, exist_ok=True)
+    write_submission(submission_out, test, counts)
+    check_submission(submission_out, test, counts, h_test, public_dir)
+    print("wrote %s (%d rows)" % (submission_out, len(test)))
+    return 0
 
 
 if __name__ == "__main__":
