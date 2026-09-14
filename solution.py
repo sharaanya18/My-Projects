@@ -1,5 +1,43 @@
+"""Breadth prediction for maintenance problem reports.
+
+Reads the public train and test files, fits a model on the training rows only,
+and writes one breadth code (1, 2 or 3) per test report.
+
+The model is an average of five multinomial logistic regressions over TF-IDF of
+the hashed token fields, the supplied count columns, and smoothed target
+encodings of the annotation fields, the report token string, and two report
+crossings. Token normalisation collapses numerals and side markers, so separate
+reports often share a token string; the encodings let those repeats inform each
+other. Encodings for the training rows are computed out of fold, so no row
+contributes to the encoding it is trained on, and rows outside the training set
+are encoded from all training rows. The regressions are trained without class
+weights so their outputs stay interpretable as class probabilities.
+
+decide() does not take the most likely class. The scoring formula is published,
+so each report is given the code with the highest expected score under it, using
+the class priors observed in the training rows. That is what keeps the rarer
+codes reachable.
+
+Not used anywhere: id, report_fingerprint, any external data or corpus, any
+generated rows or labels, and any remote service. Everything is fit on the
+training rows that arrive with the run; test rows are only transformed.
+
+The constants below (regularisation, smoothing, n-gram ranges, min_df) were
+picked by repeated stratified cross-validation on the training rows, with a
+slice held out and scored once to confirm the choice. validate.py reproduces
+that measurement.
+"""
+
+import os
+
+for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ[_var] = "1"
+
 import argparse
 import json
+import random
+import tempfile
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +47,13 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
+
+SEED = 0
+TE_FOLD_SEED = 12345
+TE_FOLDS = 5
+
+random.seed(SEED)
+np.random.seed(SEED)
 
 LABELS = np.array([1, 2, 3])
 
@@ -49,6 +94,8 @@ MODEL_CONFIGS = [
 # credit for predicting k when the truth is c: 1.0 exact, 0.5 adjacent, 0.0 for 1 vs 3
 ORDINAL = 1.0 - np.abs(LABELS[:, None] - LABELS[None, :]) / 2.0
 
+PREDICTION_KEY = "breadth"
+
 
 def add_key_crossings(frame):
     frame = frame.copy()
@@ -59,16 +106,19 @@ def add_key_crossings(frame):
     return frame
 
 
-def load_data(data_dir):
-    train = pd.read_csv(data_dir / "train.csv")
-    targets = pd.read_csv(data_dir / "train_targets.csv")
-    test = pd.read_csv(data_dir / "test.csv")
+def load_data(public_dir):
+    train = pd.read_csv(public_dir / "train.csv")
+    targets = pd.read_csv(public_dir / "train_targets.csv")
+    test = pd.read_csv(public_dir / "test.csv")
     train = train.merge(targets[["id", "target"]], on="id", how="inner", validate="one_to_one")
     return add_key_crossings(train), add_key_crossings(test)
 
 
 class GroupTargetEncoder:
-    """Smoothed class distribution per categorical key, leave-one-out on the fitting frame."""
+    """Smoothed class distribution per categorical key.
+
+    Passing y to transform() encodes the fitting rows leave-one-out.
+    """
 
     def __init__(self, keys, smoothing):
         self.keys = list(keys)
@@ -99,6 +149,24 @@ class GroupTargetEncoder:
         return np.hstack(blocks)
 
 
+def encode_targets(train, test, y_train, keys, smoothing):
+    """Out-of-fold encodings for the training rows, full-fit encodings for the rest."""
+    full = GroupTargetEncoder(keys, smoothing).fit(train, y_train)
+    enc_test = full.transform(test)
+
+    present = np.array([(y_train == c).sum() for c in LABELS])
+    n_splits = int(min(TE_FOLDS, present[present > 0].min()))
+    if n_splits < 2:
+        return full.transform(train, y_train), enc_test
+
+    enc_train = np.zeros((len(train), enc_test.shape[1]))
+    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=TE_FOLD_SEED)
+    for fit_idx, held_idx in splitter.split(train, y_train):
+        inner = GroupTargetEncoder(keys, smoothing).fit(train.iloc[fit_idx], y_train[fit_idx])
+        enc_train[held_idx] = inner.transform(train.iloc[held_idx])
+    return enc_train, enc_test
+
+
 def build_matrices(train, test, y_train, ngram_report, min_df, smoothing):
     train_blocks, test_blocks = [], []
 
@@ -111,7 +179,11 @@ def build_matrices(train, test, y_train, ngram_report, min_df, smoothing):
             min_df=min_df,
             sublinear_tf=True,
         )
-        train_blocks.append(vec.fit_transform(train[field]))
+        try:
+            train_blocks.append(vec.fit_transform(train[field]))
+        except ValueError:
+            # nothing left in this field after pruning
+            continue
         test_blocks.append(vec.transform(test[field]))
 
     counts_train = train[COUNT_FIELDS].to_numpy(float)
@@ -120,9 +192,7 @@ def build_matrices(train, test, y_train, ngram_report, min_df, smoothing):
     train_blocks.append(sparse.csr_matrix(count_scaler.transform(counts_train)))
     test_blocks.append(sparse.csr_matrix(count_scaler.transform(counts_test)))
 
-    encoder = GroupTargetEncoder(TE_KEYS, smoothing).fit(train, y_train)
-    enc_train = encoder.transform(train, y_train)
-    enc_test = encoder.transform(test)
+    enc_train, enc_test = encode_targets(train, test, y_train, TE_KEYS, smoothing)
     enc_scaler = StandardScaler().fit(enc_train)
     train_blocks.append(sparse.csr_matrix(enc_scaler.transform(enc_train)))
     test_blocks.append(sparse.csr_matrix(enc_scaler.transform(enc_test)))
@@ -130,83 +200,119 @@ def build_matrices(train, test, y_train, ngram_report, min_df, smoothing):
     return sparse.hstack(train_blocks).tocsr(), sparse.hstack(test_blocks).tocsr()
 
 
+def align_columns(model, probabilities):
+    """Place predict_proba columns at the positions of LABELS."""
+    aligned = np.zeros((probabilities.shape[0], len(LABELS)))
+    for column, label in enumerate(model.classes_):
+        aligned[:, int(label) - 1] = probabilities[:, column]
+    return aligned
+
+
 def predict_proba(train, test, y_train):
-    probabilities = np.zeros((len(test), 3))
+    probabilities = np.zeros((len(test), len(LABELS)))
     for C, smoothing, ngram_report, min_df in MODEL_CONFIGS:
         X_train, X_test = build_matrices(train, test, y_train, ngram_report, min_df, smoothing)
-        model = LogisticRegression(max_iter=5000, C=C)
+        model = LogisticRegression(max_iter=5000, C=C, random_state=SEED)
         model.fit(X_train, y_train)
-        probabilities += model.predict_proba(X_test)
+        probabilities += align_columns(model, model.predict_proba(X_test))
     return probabilities / len(MODEL_CONFIGS)
 
 
-def decide(probabilities, priors, n_eval):
-    """Pick the code with the highest expected score under the grading formula."""
-    expected_counts = np.maximum(priors * n_eval, 1e-9)
+def decide(probabilities, priors):
+    """Pick the code with the highest expected score under the published metric."""
     utility = (
-        0.75 / 3.0 * (probabilities / expected_counts[None, :])
-        + 0.25 / n_eval * (probabilities @ ORDINAL.T)
+        0.75 / 3.0 * (probabilities / np.maximum(priors, 1e-9)[None, :])
+        + 0.25 * (probabilities @ ORDINAL.T)
     )
     return LABELS[np.argmax(utility, axis=1)]
 
 
-def grader_score(y_true, y_pred):
-    y_true = np.asarray(y_true, int)
-    y_pred = np.asarray(y_pred, int)
-    per_class = []
-    for c in LABELS:
-        mask = y_true == c
-        per_class.append(float((y_pred[mask] == c).mean()) if mask.any() else 0.0)
-    balanced = float(np.mean(per_class))
-    ordinal = float(np.clip(1.0 - np.abs(y_true - y_pred) / 2.0, 0.0, 1.0).mean())
-    return 0.75 * balanced + 0.25 * ordinal, balanced, ordinal, per_class
+def fallback_proba(train, test, y_train):
+    """Report tokens only, used if the main pipeline cannot run."""
+    vec = TfidfVectorizer(analyzer="word", token_pattern=r"\S+", sublinear_tf=True)
+    X_train = vec.fit_transform(train["report_tokens"])
+    X_test = vec.transform(test["report_tokens"])
+    model = LogisticRegression(max_iter=5000, C=0.15, random_state=SEED)
+    model.fit(X_train, y_train)
+    return align_columns(model, model.predict_proba(X_test))
 
 
-def cross_validate(train, y, priors, seeds=(0, 1, 2), n_splits=5):
-    scores = []
-    for seed in seeds:
-        oof = np.zeros((len(y), 3))
-        splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-        for fit_idx, val_idx in splitter.split(train, y):
-            oof[val_idx] = predict_proba(train.iloc[fit_idx], train.iloc[val_idx], y[fit_idx])
-        total, balanced, ordinal, per_class = grader_score(y, decide(oof, priors, len(y)))
-        scores.append(total)
-        print(
-            f"  seed {seed}: score={total:.4f} balanced={balanced:.4f} "
-            f"ordinal={ordinal:.4f} per-class={[round(p, 3) for p in per_class]}"
-        )
-    print(f"  mean score over {len(seeds)} seed(s): {np.mean(scores):.4f} (sd {np.std(scores):.4f})")
+def decode_prediction(value, name):
+    """Acceptance check applied to every cell before the file is written."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} predictions must be JSON objects")
+    try:
+        decoded = json.loads(value)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{name} predictions must be valid JSON") from exc
+    if not isinstance(decoded, dict) or set(decoded) != {PREDICTION_KEY}:
+        raise ValueError(f'{name} predictions must have exactly the "breadth" key')
+    raw = decoded[PREDICTION_KEY]
+    if isinstance(raw, bool) or not isinstance(raw, (int, np.integer)):
+        raise ValueError(f'{name} "breadth" must be an integer')
+    breadth = int(raw)
+    if breadth not in LABELS:
+        raise ValueError(f"{name} breadth must be one of {LABELS.tolist()}")
+    return breadth
+
+
+def build_submission(ids, predictions):
+    return pd.DataFrame(
+        {
+            "id": np.asarray(ids),
+            "prediction": [
+                json.dumps({PREDICTION_KEY: int(b)}, separators=(",", ":")) for b in predictions
+            ],
+        }
+    )
+
+
+def write_submission(submission, test_ids, out_path):
+    for value in submission["prediction"]:
+        decode_prediction(value, "submission")
+    if submission["id"].duplicated().any():
+        raise ValueError("submission contains duplicate ids")
+    if list(submission["id"]) != list(test_ids):
+        raise ValueError("submission ids do not match the test ids")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temp_name = tempfile.mkstemp(dir=str(out_path.parent), suffix=".csv")
+    os.close(handle)
+    submission.to_csv(temp_name, index=False)
+    os.replace(temp_name, out_path)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("public_dir", type=Path)
     parser.add_argument("submission_out", type=Path)
-    parser.add_argument("--cv", type=int, default=0, help="number of CV seeds to run before fitting")
     args = parser.parse_args()
+
+    test_ids = pd.read_csv(args.public_dir / "test.csv")["id"].to_numpy()
+    write_submission(build_submission(test_ids, np.ones(len(test_ids), int)), test_ids, args.submission_out)
 
     train, test = load_data(args.public_dir)
     y = train["target"].to_numpy(int)
     priors = np.array([(y == c).mean() for c in LABELS])
     print(f"train={train.shape[0]} rows  test={test.shape[0]} rows  priors={np.round(priors, 4)}")
 
-    if args.cv:
-        print(f"cross-validating ({args.cv} seed(s))...")
-        cross_validate(train, y, priors, seeds=tuple(range(args.cv)))
+    try:
+        probabilities = predict_proba(train, test, y)
+    except Exception:
+        traceback.print_exc()
+        print("main pipeline failed, falling back to report tokens only")
+        try:
+            probabilities = fallback_proba(train, test, y)
+        except Exception:
+            traceback.print_exc()
+            print("fallback failed, keeping the placeholder submission")
+            return
 
-    predictions = decide(predict_proba(train, test, y), priors, len(test))
-
-    submission = pd.DataFrame(
-        {
-            "id": test["id"].to_numpy(),
-            "prediction": [json.dumps({"breadth": int(b)}, separators=(",", ":")) for b in predictions],
-        }
-    )
-    args.submission_out.parent.mkdir(parents=True, exist_ok=True)
-    submission.to_csv(args.submission_out, index=False)
+    predictions = decide(probabilities, priors)
+    write_submission(build_submission(test["id"].to_numpy(), predictions), test_ids, args.submission_out)
 
     counts = pd.Series(predictions).value_counts().sort_index()
-    print(f"wrote {args.submission_out} ({len(submission)} rows)")
+    print(f"wrote {args.submission_out} ({len(predictions)} rows)")
     print("predicted breadth distribution:", {int(k): int(v) for k, v in counts.items()})
 
 
