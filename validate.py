@@ -137,6 +137,23 @@ def structural_features(frame):
 def encode_targets(train, evaluate, y_train, keys, smoothing, mode):
     if mode == "oof":
         return sol.encode_targets(train, evaluate, y_train, keys, smoothing)
+    if mode.startswith("oof_multi"):
+        levels = [2.0, 10.0, 50.0]
+        parts = [sol.encode_targets(train, evaluate, y_train, keys, lvl) for lvl in levels]
+        return np.hstack([p[0] for p in parts]), np.hstack([p[1] for p in parts])
+    if mode.startswith("oof_bag"):
+        repeats = int(mode.split("_bag")[1] or 5)
+        full = sol.GroupTargetEncoder(keys, smoothing).fit(train, y_train)
+        enc_eval = full.transform(evaluate)
+        stacked = []
+        for offset in range(repeats):
+            enc_train = np.zeros((len(train), enc_eval.shape[1]))
+            splitter = StratifiedKFold(n_splits=5, shuffle=True, random_state=sol.TE_FOLD_SEED + offset)
+            for fit_idx, held_idx in splitter.split(train, y_train):
+                inner = sol.GroupTargetEncoder(keys, smoothing).fit(train.iloc[fit_idx], y_train[fit_idx])
+                enc_train[held_idx] = inner.transform(train.iloc[held_idx])
+            stacked.append(enc_train)
+        return np.mean(stacked, axis=0), enc_eval
     full = sol.GroupTargetEncoder(keys, smoothing).fit(train, y_train)
     return full.transform(train, y_train), full.transform(evaluate)
 
@@ -241,6 +258,10 @@ VARIANTS = {
     "oof_struct_cross": dict(
         te_mode="oof", te_keys=BASE_KEYS + EXTRA_CROSS_KEYS, model="lr", structural=True
     ),
+    "oof_multi": dict(te_mode="oof_multi", te_keys=BASE_KEYS, model="lr"),
+    "oof_bag3": dict(te_mode="oof_bag3", te_keys=BASE_KEYS, model="lr"),
+    "oof_bag5": dict(te_mode="oof_bag5", te_keys=BASE_KEYS, model="lr"),
+    "oof_bag10": dict(te_mode="oof_bag10", te_keys=BASE_KEYS, model="lr"),
     "oof_lgbm": dict(te_mode="oof", te_keys=BASE_KEYS, model="lr+lgbm"),
     "oof_struct_lgbm": dict(te_mode="oof", te_keys=BASE_KEYS, model="lr+lgbm", structural=True),
 }
