@@ -7,11 +7,9 @@ from pathlib import Path
 
 import numpy as np
 import scipy.sparse as sp
-from sklearn.decomposition import TruncatedSVD
-from sklearn.ensemble import ExtraTreesRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import Ridge
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.model_selection import KFold
 from sklearn.preprocessing import normalize
 
 N_GENRES = 6
@@ -19,16 +17,10 @@ GENRE_COLS = ["g%d" % i for i in range(N_GENRES)]
 ALPHA_GRID = [0.1, 0.2, 0.3, 0.5, 0.8]
 N_FOLDS = 5
 SEED = 0
-N_GROUP_SPLITS = 6
-HOLDOUT_FRACTION = 0.25
 TFIDF = dict(analyzer="char_wb", ngram_range=(2, 4), min_df=3, sublinear_tf=True)
-SVD_DIMS = 200
-N_TREES = 300
-MIN_LEAF = 2
-BLEND_RIDGE = 0.5
-ROUND_UP_FROM = 0.40
 
 _GREEK_ONLY = re.compile(r"[^Ͱ-Ͽἀ-῿\s]")
+
 
 csv.field_size_limit(1 << 30)
 
@@ -86,39 +78,21 @@ def fit_vectoriser(doc_lists):
 
 
 def pool(vec, doc_lists):
-    rows = [sp.csr_matrix(vec.transform(docs).mean(axis=0)) for docs in doc_lists]
+    rows = [
+        sp.csr_matrix(normalize(vec.transform(docs)).mean(axis=0)) for docs in doc_lists
+    ]
     return normalize(sp.vstack(rows).tocsr())
 
 
-def fit_models(X_fit, R_fit, alpha):
-    ridge = Ridge(alpha=alpha).fit(X_fit, R_fit)
-    svd = TruncatedSVD(SVD_DIMS, random_state=SEED).fit(X_fit)
-    trees = ExtraTreesRegressor(
-        N_TREES, random_state=SEED, n_jobs=-1, min_samples_leaf=MIN_LEAF
-    ).fit(svd.transform(X_fit), R_fit)
-    return ridge, svd, trees
-
-
-def apply_models(models, X_query):
-    ridge, svd, trees = models
-    return BLEND_RIDGE * ridge.predict(X_query) + (1.0 - BLEND_RIDGE) * trees.predict(
-        svd.transform(X_query)
-    )
-
-
-def predict_rates(L_fit, R_fit, L_query, alpha, ridge_only=False):
+def predict_rates(L_fit, R_fit, L_query, alpha):
     vec = fit_vectoriser(L_fit)
-    X_fit = pool(vec, L_fit)
-    X_query = pool(vec, L_query)
-    if ridge_only:
-        return Ridge(alpha=alpha).fit(X_fit, R_fit).predict(X_query)
-    return apply_models(fit_models(X_fit, R_fit, alpha), X_query)
+    model = Ridge(alpha=alpha).fit(pool(vec, L_fit), R_fit)
+    return model.predict(pool(vec, L_query))
 
 
 def to_counts(rates, hidden):
     scaled = np.clip(rates, 0.0, 1.0) * hidden[:, None]
-    counts = np.floor(scaled + (1.0 - ROUND_UP_FROM))
-    return np.clip(counts, 0.0, hidden[:, None])
+    return np.clip(np.rint(scaled), 0.0, hidden[:, None])
 
 
 def bray_curtis(p, y):
@@ -130,72 +104,25 @@ def mean_bray_curtis(P, Y):
     return float(np.mean([bray_curtis(P[i], Y[i]) for i in range(len(Y))]))
 
 
-def text_groups(rows):
-    parent = list(range(len(rows)))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    seen = {}
-    for i, r in enumerate(rows):
-        for o in r["revealed_occurrences"]:
-            t = normalise(o["text"])
-            if t in seen:
-                a, b = find(i), find(seen[t])
-                if a != b:
-                    parent[a] = b
-            else:
-                seen[t] = i
-    return np.array([find(i) for i in range(len(rows))])
-
-
-def size_bucket(h):
-    return 0 if h <= 3 else (1 if h <= 8 else 2)
-
-
-def reweighted_bray_curtis(P, Y, hidden, target):
-    b = np.array([size_bucket(x) for x in hidden])
-    source = np.array([(b == k).mean() for k in range(3)])
-    w = np.array([target[k] / max(source[k], 1e-9) for k in b])
-    w = w / w.sum()
-    s = np.array([bray_curtis(P[i], Y[i]) for i in range(len(Y))])
-    return float((w * s).sum())
-
-
-def group_holdout_score(L, R, hidden, Y, groups, alpha, target, ridge_only=False):
-    splitter = GroupShuffleSplit(
-        N_GROUP_SPLITS, test_size=HOLDOUT_FRACTION, random_state=SEED
-    )
-    scores = []
-    for fit_idx, held_idx in splitter.split(np.arange(len(L)), groups=groups):
-        pred = predict_rates(
-            [L[i] for i in fit_idx],
-            R[fit_idx],
-            [L[i] for i in held_idx],
-            alpha,
-            ridge_only=ridge_only,
+def cross_val_rates(L, R, alpha, n_folds=N_FOLDS, seed=SEED):
+    oof = np.zeros((len(L), N_GENRES))
+    splitter = KFold(n_folds, shuffle=True, random_state=seed)
+    for fit_idx, held_idx in splitter.split(np.arange(len(L))):
+        oof[held_idx] = predict_rates(
+            [L[i] for i in fit_idx], R[fit_idx], [L[i] for i in held_idx], alpha
         )
-        counts = to_counts(pred, hidden[held_idx])
-        scores.append(
-            reweighted_bray_curtis(counts, Y[held_idx], hidden[held_idx], target)
-        )
-    return float(np.mean(scores)), float(np.std(scores))
+    return oof
 
 
-def select_alpha(L, R, hidden, Y, groups, target):
+def select_alpha(L, R, hidden, Y):
     scores = {}
     for alpha in ALPHA_GRID:
-        m, sd = group_holdout_score(
-            L, R, hidden, Y, groups, alpha, target, ridge_only=True
-        )
-        scores[alpha] = m
-        print("  alpha %-5s group-holdout Bray-Curtis %.4f +-%.4f" % (alpha, m, sd))
+        oof = cross_val_rates(L, R, alpha)
+        scores[alpha] = mean_bray_curtis(to_counts(oof, hidden), Y)
+        print("  alpha %-5s cross-validated Bray-Curtis %.4f" % (alpha, scores[alpha]))
     best = max(scores, key=scores.get)
     print("  selected alpha %s" % best)
-    return best
+    return best, scores[best]
 
 
 def write_submission(path, rows, counts):
@@ -206,7 +133,7 @@ def write_submission(path, rows, counts):
             writer.writerow([row["query_id"]] + [int(v) for v in values])
 
 
-def check_submission(rows, counts, hidden, data_dir):
+def check_submission(path, rows, counts, hidden, data_dir):
     ids = [r["query_id"] for r in rows]
     if len(set(ids)) != len(ids):
         raise ValueError("duplicate query_id in submission")
@@ -253,35 +180,24 @@ def main():
 
     print("manuscripts: %d train, %d validation, %d test" % (len(train), len(valid), len(test)))
 
-    target = np.array([size_bucket(r["hidden_count"]) for r in test])
-    target = np.array([(target == k).mean() for k in range(3)])
-    print("test hidden_count profile (<=3, 4-8, >8): %s" % np.round(target, 3))
+    print("selecting the ridge penalty by %d-fold cross-validation on train" % N_FOLDS)
+    alpha, cv_score = select_alpha(L_train, R_train, h_train, Y_train)
 
-    groups = text_groups(train)
-    print("%d text-linked groups over %d train manuscripts" % (len(set(groups)), len(train)))
-    print("selecting the ridge penalty on %d group-held-out splits, reweighted to the "
-          "test size profile" % N_GROUP_SPLITS)
-    alpha = select_alpha(L_train, R_train, h_train, Y_train, groups, target)
-
-    m, sd = group_holdout_score(
-        L_train, R_train, h_train, Y_train, groups, alpha, target
-    )
-    print("group-held-out Bray-Curtis (test-matched) %.4f +-%.4f" % (m, sd))
+    print("train cross-validated Bray-Curtis %.4f" % cv_score)
     if use_valid:
         valid_rates = predict_rates(L_train, R_train, L_valid, alpha)
-        print("held-out validation Bray-Curtis %.4f"
-              % mean_bray_curtis(to_counts(valid_rates, h_valid), Y_valid))
+        valid_score = mean_bray_curtis(to_counts(valid_rates, h_valid), Y_valid)
+        print("held-out validation Bray-Curtis %.4f" % valid_score)
         L_fit = L_train + L_valid
         R_fit = np.vstack([R_train, R_valid])
     else:
         L_fit, R_fit = L_train, R_train
-
     test_rates = predict_rates(L_fit, R_fit, L_test, alpha)
     counts = to_counts(test_rates, h_test).astype(int)
 
     submission_out.parent.mkdir(parents=True, exist_ok=True)
     write_submission(submission_out, test, counts)
-    check_submission(test, counts, h_test, public_dir)
+    check_submission(submission_out, test, counts, h_test, public_dir)
     print("wrote %s (%d rows)" % (submission_out, len(test)))
     return 0
 

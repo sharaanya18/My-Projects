@@ -93,42 +93,35 @@ epigram's predicted rate to [0,1] before averaging collapses the score to
 averaging is what makes them meaningful, so the aggregate must stay the unit
 of prediction.
 
-## Distribution audit (why validation misled)
+## Reverted to the ridge-only baseline
 
-A leaderboard submission of the ridge/rint model scored **0.638** against its
-0.7153 validation - below even the 0.657 group-CV floor. The audit explains it:
+The blend (ridge + SVD-ExtraTrees), the 0.40 rounding threshold and the
+test-size-reweighted selection metric have all been removed. The model is
+again char_wb 2-4 mean-pooled TF-IDF into ridge, counts by ordinary rint
+rounding, penalty chosen on plain 5-fold CV under the unweighted competition
+metric. Train CV 0.6861, validation 0.7153, 53s.
 
-| | train | val | test |
-| --- | --- | --- | --- |
-| hidden_count <= 3 | 59.9% | 55.6% | **72.6%** |
-| hidden_count > 8 | 12.2% | 19.4% | **4.5%** |
-| max cosine similarity to train | 0.573 | **0.622** | 0.573 |
-| shares a normalised text with train | - | **32.3%** | 18.5% |
+The reason is a methodological defect, not a score. In the blended version
+the penalty was selected with `ridge_only=True` while the shipped predictor
+was a 50/50 blend, so the hyperparameter was tuned for a model that was not
+the one making predictions. With ridge alone, cross-validation, validation
+and the test prediction all route through the same `predict_rates`, so the
+tuned model and the shipped model are the same object by construction.
 
-Validation is closer to train than train is to itself, and skews to large
-manuscripts; test is at normal distance and skews small. Small hidden_count
-makes Bray-Curtis coarser, so test is intrinsically harder. Reveal fractions
-are identical everywhere (0.475), and TF-IDF coverage is equal or better on
-test (246 vs 242 nonzero n-grams per epigram, no empty rows), so the shift is
-manuscript size and similarity - not sampling or vocabulary.
+The test-matched reweighting was also dropped: model selection now uses the
+unweighted mean Bray-Curtis that the competition actually scores.
 
-Model selection therefore uses **group-held-out splits reweighted to the test
-size profile**, computed from the public test inputs only. On that estimator
-the submitted model scores 0.6574, close to its actual 0.638 - a usable proxy
-where validation was off by 0.077.
+The distribution audit below is retained because it is a measurement of the
+data, not a modelling choice, and it explains why validation reads high. It
+no longer drives any decision.
 
-| model | natural group split | test-matched | std |
-| --- | --- | --- | --- |
-| ridge, rint (scored 0.638) | 0.6680 | 0.6574 | +-0.0181 |
-| **blend, round-up-from-0.40** | **0.6842** | **0.6751** | **+-0.0139** |
-| + shrink 0.15 / 0.30 to prior | - | 0.6583 / 0.6444 | worse |
-| ExtraTrees alone | 0.6762 | 0.6664 | +-0.0200 |
-
-The blend is both the best and the **lowest-variance** of 27 configurations
-tested across 6 group splits; ExtraTrees alone is the most volatile, so
-blending is what buys robustness. Shrinkage toward the prior hurts uniformly.
-The 0.40 threshold still beats 0.45 and 0.50 after reweighting to the
-small-manuscript profile.
+One fact worth recording: the 0.638 leaderboard score was produced by this
+ridge-only configuration. The reverted submission is byte-identical to the
+scored one. Reverting therefore restores a known 0.638, it does not recover
+a higher score. The blend was never scored on the leaderboard, so whether it
+would help remains untested against the real evaluation group; its only
+evidence is held-out estimates, which for this dataset have proved
+optimistic.
 
 ## Validation protocol
 
