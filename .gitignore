@@ -1,2 +1,5 @@
 # Challenge data is supplied externally, not versioned here.
 dataset/public/*.csv
+
+# Bytecode cache from importing solution.py in validate.py.
+__pycache__/
