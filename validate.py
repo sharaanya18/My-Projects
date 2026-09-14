@@ -239,8 +239,34 @@ def lightgbm_probabilities(features, y_train, smoothing=10.0, n_components=100):
     model.fit(dense_train, y_train)
     return sol.align_columns(model, model.predict_proba(dense_eval))
 
+def two_stage_probabilities(features, y_train, n_eval, stage2_C=None):
+    upper = y_train > 1
+    if upper.sum() < 2 or len(np.unique(y_train[upper])) < 2:
+        return logistic_probabilities(features, y_train, n_eval)
+    p_upper = np.zeros(n_eval)
+    p_top = np.zeros(n_eval)
+    for C, smoothing, ngram_report, min_df in sol.MODEL_CONFIGS:
+        X_train, X_eval = features.matrices(ngram_report, min_df, smoothing)
+        first = LogisticRegression(max_iter=5000, C=C, random_state=SEED)
+        first.fit(X_train, upper.astype(int))
+        p_upper += first.predict_proba(X_eval)[:, 1]
+        second = LogisticRegression(max_iter=5000, C=C if stage2_C is None else stage2_C, random_state=SEED)
+        second.fit(X_train[upper], (y_train[upper] == 3).astype(int))
+        p_top += second.predict_proba(X_eval)[:, 1]
+    n = len(sol.MODEL_CONFIGS)
+    p_upper /= n
+    p_top /= n
+    return np.column_stack([1.0 - p_upper, p_upper * (1.0 - p_top), p_upper * p_top])
+
+
 def fold_probabilities(train, evaluate, y_train, variant):
     features = FoldFeatures(train, evaluate, y_train, variant)
+    if variant.get("model", "lr") == "two_stage":
+        return two_stage_probabilities(features, y_train, len(evaluate), variant.get("stage2_C"))
+    if variant.get("model", "lr") == "two_stage_blend":
+        direct = logistic_probabilities(features, y_train, len(evaluate))
+        staged = two_stage_probabilities(features, y_train, len(evaluate), variant.get("stage2_C"))
+        return 0.5 * direct + 0.5 * staged
     probabilities = logistic_probabilities(features, y_train, len(evaluate))
     if variant.get("model") == "lr+lgbm":
         probabilities = 0.5 * probabilities + 0.5 * lightgbm_probabilities(features, y_train)
@@ -258,6 +284,13 @@ VARIANTS = {
     "oof_struct_cross": dict(
         te_mode="oof", te_keys=BASE_KEYS + EXTRA_CROSS_KEYS, model="lr", structural=True
     ),
+    "two_stage": dict(te_mode="oof", te_keys=BASE_KEYS, model="two_stage"),
+    "two_stage_blend": dict(te_mode="oof", te_keys=BASE_KEYS, model="two_stage_blend"),
+    "two_stage_blend_c05": dict(te_mode="oof", te_keys=BASE_KEYS, model="two_stage_blend", stage2_C=0.05),
+    "two_stage_c05": dict(te_mode="oof", te_keys=BASE_KEYS, model="two_stage", stage2_C=0.05),
+    "two_stage_c10": dict(te_mode="oof", te_keys=BASE_KEYS, model="two_stage", stage2_C=0.10),
+    "two_stage_c30": dict(te_mode="oof", te_keys=BASE_KEYS, model="two_stage", stage2_C=0.30),
+    "two_stage_c100": dict(te_mode="oof", te_keys=BASE_KEYS, model="two_stage", stage2_C=1.00),
     "oof_multi": dict(te_mode="oof_multi", te_keys=BASE_KEYS, model="lr"),
     "oof_bag3": dict(te_mode="oof_bag3", te_keys=BASE_KEYS, model="lr"),
     "oof_bag5": dict(te_mode="oof_bag5", te_keys=BASE_KEYS, model="lr"),
