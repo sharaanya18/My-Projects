@@ -59,6 +59,38 @@ generalises across manuscripts better than whole-word matching.
 
 Task baseline 0.66, quoted high score 0.70.
 
+### How much of the train CV is text overlap
+
+The organisers keep manuscripts linked by repeated *exact* text in the same
+split, and that holds: across splits, zero raw texts are shared. But the
+accent-stripping normalisation above collapses orthographic variants, which
+re-links manuscripts the organisers had separated. Under normalised text,
+118 of 509 train manuscripts (23.2%) share a text with another train
+manuscript, the largest linked group being 24.
+
+So plain shuffled KFold is optimistic. Grouping train by shared normalised
+text (union-find) and using GroupKFold gives 0.657 rather than 0.686.
+
+That 0.657 is a floor, not the expected test score, because the graded test
+set is *not* overlap-free either:
+
+| condition | manuscripts sharing a normalised text with the fitting set |
+| --- | --- |
+| GroupKFold simulates | 0% |
+| plain KFold simulates | 23.2% |
+| **the graded test set actually has** | **19.7%** |
+
+Plain KFold (23.2%) approximates the real test condition (19.7%) far better
+than GroupKFold (0%), so the honest range is 0.657 as a pessimistic floor,
+0.686 as the best-matched estimate, and 0.715 on the held-out validation
+split.
+
+The choice of alpha is unaffected. Plain KFold, GroupKFold and the held-out
+validation split all peak at alpha = 0.3, so the leakage moves the level but
+not the ranking, and the shipped model is the same either way. Three
+independent estimators agreeing on the same alpha is stronger evidence for
+it than any one of them alone.
+
 ## Usage
 
 The platform supplies both paths positionally:
