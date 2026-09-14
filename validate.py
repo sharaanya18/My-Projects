@@ -286,6 +286,19 @@ def assign_clusters(train, evaluate, threshold=0.8, max_posting=200):
     return train_labels, np.array(eval_labels)
 
 
+VIEWS = {
+    "full": dict(fields=sol.TOKEN_FIELDS, binary=False, svd=0),
+    "no_te": dict(fields=sol.TOKEN_FIELDS, binary=False, svd=0, te=False),
+    "report_no_te": dict(fields=["report_tokens"], binary=False, svd=0, te=False),
+    "report": dict(fields=["report_tokens"], binary=False, svd=0),
+    "annot": dict(fields=[f for f in sol.TOKEN_FIELDS if f != "report_tokens"], binary=False, svd=0),
+    "binary": dict(fields=sol.TOKEN_FIELDS, binary=True, svd=0),
+    "svd": dict(fields=sol.TOKEN_FIELDS, binary=False, svd=120),
+}
+
+BASE_MEMBERS = [("full",) + cfg for cfg in sol.MODEL_CONFIGS]
+
+
 class FoldFeatures:
 
     def __init__(self, train, evaluate, y_train, variant):
@@ -305,21 +318,35 @@ class FoldFeatures:
         self._tfidf = {}
         self._encodings = {}
 
-    def tfidf(self, ngram_report, min_df):
-        key = (ngram_report, min_df)
+    def tfidf(self, ngram_report, min_df, view="full"):
+        key = (ngram_report, min_df, view)
         if key not in self._tfidf:
+            spec = VIEWS[view]
             train_blocks, eval_blocks = [], []
-            for field in sol.TOKEN_FIELDS:
+            for field in spec["fields"]:
                 ngram = ngram_report if field == "report_tokens" else (1, 1)
-                vec = TfidfVectorizer(
-                    analyzer="word", token_pattern=r"\S+", ngram_range=ngram,
-                    min_df=min_df, sublinear_tf=True,
-                )
+                if spec["binary"]:
+                    vec = TfidfVectorizer(
+                        analyzer="word", token_pattern=r"\S+", ngram_range=ngram,
+                        min_df=min_df, binary=True, use_idf=False, sublinear_tf=False,
+                    )
+                else:
+                    vec = TfidfVectorizer(
+                        analyzer="word", token_pattern=r"\S+", ngram_range=ngram,
+                        min_df=min_df, sublinear_tf=True,
+                    )
                 try:
                     train_blocks.append(vec.fit_transform(self.train[field]))
                 except ValueError:
                     continue
                 eval_blocks.append(vec.transform(self.evaluate[field]))
+            if spec["svd"] and train_blocks:
+                stacked_train = sparse.hstack(train_blocks).tocsr()
+                stacked_eval = sparse.hstack(eval_blocks).tocsr()
+                n_components = min(spec["svd"], stacked_train.shape[1] - 1)
+                svd = TruncatedSVD(n_components=n_components, random_state=SEED).fit(stacked_train)
+                train_blocks = [sparse.csr_matrix(svd.transform(stacked_train))]
+                eval_blocks = [sparse.csr_matrix(svd.transform(stacked_eval))]
             self._tfidf[key] = (train_blocks, eval_blocks)
         return self._tfidf[key]
 
@@ -340,8 +367,16 @@ class FoldFeatures:
             eval_parts.append(structural_features(self.evaluate))
         return np.hstack(train_parts), np.hstack(eval_parts)
 
-    def matrices(self, ngram_report, min_df, smoothing):
-        train_blocks, eval_blocks = self.tfidf(ngram_report, min_df)
+    def matrices(self, ngram_report, min_df, smoothing, view="full"):
+        train_blocks, eval_blocks = self.tfidf(ngram_report, min_df, view)
+        if not VIEWS[view].get("te", True):
+            counts_train = self.train[sol.COUNT_FIELDS].to_numpy(float)
+            counts_eval = self.evaluate[sol.COUNT_FIELDS].to_numpy(float)
+            scaler = StandardScaler().fit(counts_train)
+            return (
+                sparse.hstack(train_blocks + [sparse.csr_matrix(scaler.transform(counts_train))]).tocsr(),
+                sparse.hstack(eval_blocks + [sparse.csr_matrix(scaler.transform(counts_eval))]).tocsr(),
+            )
         dense_train, dense_eval = self.dense(smoothing)
         scaler = StandardScaler().fit(dense_train)
         return (
@@ -349,14 +384,19 @@ class FoldFeatures:
             sparse.hstack(eval_blocks + [sparse.csr_matrix(scaler.transform(dense_eval))]).tocsr(),
         )
 
-def logistic_probabilities(features, y_train, n_eval):
-    probabilities = np.zeros((n_eval, 3))
-    for C, smoothing, ngram_report, min_df in sol.MODEL_CONFIGS:
-        X_train, X_eval = features.matrices(ngram_report, min_df, smoothing)
+def member_probabilities(features, y_train, n_eval, members):
+    stack = []
+    for view, C, smoothing, ngram_report, min_df in members:
+        X_train, X_eval = features.matrices(ngram_report, min_df, smoothing, view)
         model = LogisticRegression(max_iter=5000, C=C, random_state=SEED)
         model.fit(X_train, y_train)
-        probabilities += sol.align_columns(model, model.predict_proba(X_eval))
-    return probabilities / len(sol.MODEL_CONFIGS)
+        stack.append(sol.align_columns(model, model.predict_proba(X_eval)))
+    return np.array(stack)
+
+
+def logistic_probabilities(features, y_train, n_eval, members=None):
+    members = members or BASE_MEMBERS
+    return member_probabilities(features, y_train, n_eval, members).mean(axis=0)
 
 def lightgbm_probabilities(features, y_train, smoothing=10.0, n_components=100):
     import lightgbm as lgb
@@ -405,7 +445,7 @@ def fold_probabilities(train, evaluate, y_train, variant):
         direct = logistic_probabilities(features, y_train, len(evaluate))
         staged = two_stage_probabilities(features, y_train, len(evaluate), variant.get("stage2_C"))
         return 0.5 * direct + 0.5 * staged
-    probabilities = logistic_probabilities(features, y_train, len(evaluate))
+    probabilities = logistic_probabilities(features, y_train, len(evaluate), variant.get("members"))
     if variant.get("model") == "lr+lgbm":
         probabilities = 0.5 * probabilities + 0.5 * lightgbm_probabilities(features, y_train)
     return probabilities
@@ -422,6 +462,23 @@ VARIANTS = {
     "oof_struct_cross": dict(
         te_mode="oof", te_keys=BASE_KEYS + EXTRA_CROSS_KEYS, model="lr", structural=True
     ),
+    "ens_plus_note": dict(te_mode="oof", te_keys=BASE_KEYS, model="lr",
+                          members=BASE_MEMBERS + [("no_te", 0.15, 10.0, (1, 2), 2)]),
+    "ens_plus_note2": dict(te_mode="oof", te_keys=BASE_KEYS, model="lr",
+                           members=BASE_MEMBERS + [("no_te", 0.15, 10.0, (1, 2), 2), ("report_no_te", 0.15, 10.0, (1, 2), 2)]),
+    "ens_half_note": dict(te_mode="oof", te_keys=BASE_KEYS, model="lr", members=[
+        ("full", 0.15, 10.0, (1, 2), 2), ("full", 0.10, 5.0, (1, 2), 2), ("full", 0.20, 20.0, (1, 2), 2),
+        ("no_te", 0.15, 10.0, (1, 2), 2), ("no_te", 0.30, 10.0, (1, 2), 2),
+    ]),
+    "ens_views": dict(te_mode="oof", te_keys=BASE_KEYS, model="lr", members=[
+        ("full", 0.15, 10.0, (1, 2), 2), ("report", 0.15, 10.0, (1, 2), 2), ("annot", 0.15, 10.0, (1, 2), 2),
+        ("binary", 0.15, 10.0, (1, 2), 2), ("svd", 0.15, 10.0, (1, 2), 2),
+    ]),
+    "ens_plus_report": dict(te_mode="oof", te_keys=BASE_KEYS, model="lr",
+                            members=BASE_MEMBERS + [("report", 0.15, 10.0, (1, 2), 2)]),
+    "ens_plus_all": dict(te_mode="oof", te_keys=BASE_KEYS, model="lr",
+                         members=BASE_MEMBERS + [("report", 0.15, 10.0, (1, 2), 2), ("annot", 0.15, 10.0, (1, 2), 2),
+                                                 ("binary", 0.15, 10.0, (1, 2), 2), ("svd", 0.15, 10.0, (1, 2), 2)]),
     "backoff": dict(te_mode="backoff", te_keys=BASE_KEYS, model="lr"),
     "oof_counts": dict(te_mode="oof_counts", te_keys=BASE_KEYS, model="lr"),
     "backoff_counts": dict(te_mode="backoff_counts", te_keys=BASE_KEYS, model="lr"),
