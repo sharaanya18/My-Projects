@@ -1,14 +1,3 @@
-"""Local validation harness for solution.py.
-
-Everything is measured on the training rows only. A fixed stratified 15% slice
-is held out first and the experiments run on the remaining 85%, so a variant is
-chosen on cross-validation and confirmed once on data it never saw.
-
-Usage:
-  python3 validate.py <public_dir> --variants baseline,oof_te --seeds 5
-  python3 validate.py <public_dir> --variants baseline,oof_te --holdout
-"""
-
 import os
 
 for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
@@ -36,14 +25,9 @@ HOLDOUT_SEED = 20240601
 random.seed(SEED)
 np.random.seed(SEED)
 
-# ----------------------------------------------------------------------------
-# official evaluator, copied verbatim
-# ----------------------------------------------------------------------------
-
 LABELS = np.array([1, 2, 3], dtype=int)
 REQUIRED_COLUMNS = ["id", "prediction"]
 PREDICTION_KEY = "breadth"
-
 
 def _decode_prediction(value, name):
     if not isinstance(value, str) or not value.strip():
@@ -62,7 +46,6 @@ def _decode_prediction(value, name):
         raise ValueError(f"{name} breadth must be one of {LABELS.tolist()}")
     return breadth
 
-
 def _validated_predictions(frame, name):
     if not isinstance(frame, pd.DataFrame):
         raise ValueError(f"{name} must be a pandas DataFrame")
@@ -79,14 +62,12 @@ def _validated_predictions(frame, name):
     checked["_breadth"] = breadths
     return checked
 
-
 def _balanced_breadth_coverage(y_true, y_pred):
     per_breadth = []
     for breadth in LABELS:
         mask = y_true == breadth
         per_breadth.append(float(np.mean(y_pred[mask] == breadth)) if mask.any() else 0.0)
     return float(np.mean(per_breadth))
-
 
 def grade(submission, answers):
     submitted = _validated_predictions(submission, "submission")
@@ -104,9 +85,7 @@ def grade(submission, answers):
     score = 0.75 * balanced_coverage + 0.25 * float(ordinal_utility)
     return float(np.clip(score, 0.0, 1.0))
 
-
 def score_predictions(ids, y_true, y_pred):
-    """Route predictions through the official grader, plus diagnostics."""
     to_frame = lambda values: pd.DataFrame(
         {"id": ids, "prediction": [json.dumps({PREDICTION_KEY: int(v)}, separators=(",", ":")) for v in values]}
     )
@@ -119,11 +98,6 @@ def score_predictions(ids, y_true, y_pred):
         confusion[t - 1, p - 1] += 1
     distribution = {int(c): int((y_pred == c).sum()) for c in LABELS}
     return total, recall, confusion, distribution
-
-
-# ----------------------------------------------------------------------------
-# feature variants
-# ----------------------------------------------------------------------------
 
 ANNOTATION_KEYS = [
     "location_tokens",
@@ -139,7 +113,6 @@ SHARED_FIELDS = [
     "problem_type_tokens",
 ]
 
-
 def add_extra_crossings(frame):
     frame = frame.copy()
     frame["part_x_type"] = frame["problem_part_tokens"] + " || " + frame["problem_type_tokens"]
@@ -147,9 +120,7 @@ def add_extra_crossings(frame):
     frame["location_x_part"] = frame["location_tokens"] + " || " + frame["problem_part_tokens"]
     return frame
 
-
 def structural_features(frame):
-    """Row-local shape of the token fields."""
     columns = []
     report_tokens = [str(s).split() for s in frame["report_tokens"]]
     report_sets = [set(t) for t in report_tokens]
@@ -163,17 +134,13 @@ def structural_features(frame):
         columns.append([len(a & b) for a, b in zip(report_sets, other)])
     return np.asarray(columns, dtype=float).T
 
-
 def encode_targets(train, evaluate, y_train, keys, smoothing, mode):
-    """Target encodings for the training rows and for rows outside them."""
     if mode == "oof":
         return sol.encode_targets(train, evaluate, y_train, keys, smoothing)
     full = sol.GroupTargetEncoder(keys, smoothing).fit(train, y_train)
     return full.transform(train, y_train), full.transform(evaluate)
 
-
 class FoldFeatures:
-    """Builds and caches the blocks needed by the configs inside one fold."""
 
     def __init__(self, train, evaluate, y_train, variant):
         self.train = train
@@ -227,7 +194,6 @@ class FoldFeatures:
             sparse.hstack(eval_blocks + [sparse.csr_matrix(scaler.transform(dense_eval))]).tocsr(),
         )
 
-
 def logistic_probabilities(features, y_train, n_eval):
     probabilities = np.zeros((n_eval, 3))
     for C, smoothing, ngram_report, min_df in sol.MODEL_CONFIGS:
@@ -236,7 +202,6 @@ def logistic_probabilities(features, y_train, n_eval):
         model.fit(X_train, y_train)
         probabilities += sol.align_columns(model, model.predict_proba(X_eval))
     return probabilities / len(sol.MODEL_CONFIGS)
-
 
 def lightgbm_probabilities(features, y_train, smoothing=10.0, n_components=100):
     import lightgbm as lgb
@@ -257,7 +222,6 @@ def lightgbm_probabilities(features, y_train, smoothing=10.0, n_components=100):
     model.fit(dense_train, y_train)
     return sol.align_columns(model, model.predict_proba(dense_eval))
 
-
 def fold_probabilities(train, evaluate, y_train, variant):
     features = FoldFeatures(train, evaluate, y_train, variant)
     probabilities = logistic_probabilities(features, y_train, len(evaluate))
@@ -265,30 +229,21 @@ def fold_probabilities(train, evaluate, y_train, variant):
         probabilities = 0.5 * probabilities + 0.5 * lightgbm_probabilities(features, y_train)
     return probabilities
 
-
 BASE_KEYS = sol.TE_KEYS
 
 VARIANTS = {
-    # round 1: encoding scheme and key set
     "baseline": dict(te_mode="loo", te_keys=BASE_KEYS, model="lr"),
     "oof_te": dict(te_mode="oof", te_keys=BASE_KEYS, model="lr"),
     "loo_annot": dict(te_mode="loo", te_keys=ANNOTATION_KEYS, model="lr"),
     "oof_annot": dict(te_mode="oof", te_keys=ANNOTATION_KEYS, model="lr"),
-    # round 2: structural features and further crossings
     "oof_struct": dict(te_mode="oof", te_keys=BASE_KEYS, model="lr", structural=True),
     "oof_cross": dict(te_mode="oof", te_keys=BASE_KEYS + EXTRA_CROSS_KEYS, model="lr"),
     "oof_struct_cross": dict(
         te_mode="oof", te_keys=BASE_KEYS + EXTRA_CROSS_KEYS, model="lr", structural=True
     ),
-    # round 3: blend with gradient boosting on dense features
     "oof_lgbm": dict(te_mode="oof", te_keys=BASE_KEYS, model="lr+lgbm"),
     "oof_struct_lgbm": dict(te_mode="oof", te_keys=BASE_KEYS, model="lr+lgbm", structural=True),
 }
-
-
-# ----------------------------------------------------------------------------
-# protocol
-# ----------------------------------------------------------------------------
 
 def load_dev_holdout(public_dir):
     train, _ = sol.load_data(public_dir)
@@ -298,10 +253,8 @@ def load_dev_holdout(public_dir):
     dev_idx, holdout_idx = next(splitter.split(train, y))
     return train.iloc[np.sort(dev_idx)].reset_index(drop=True), train.iloc[np.sort(holdout_idx)].reset_index(drop=True)
 
-
 def _one_fold(dev, y, variant, fit_idx, val_idx):
     return val_idx, fold_probabilities(dev.iloc[fit_idx], dev.iloc[val_idx], y[fit_idx], variant)
-
 
 def cross_validate(dev, variant, seeds, n_jobs):
     y = dev["target"].to_numpy(int)
@@ -319,7 +272,6 @@ def cross_validate(dev, variant, seeds, n_jobs):
         per_seed.append((score_predictions(dev["id"].to_numpy(), y, sol.decide(oof, priors)), oof))
     return per_seed
 
-
 def holdout_score(dev, holdout, variant):
     y = dev["target"].to_numpy(int)
     priors = np.array([(y == c).mean() for c in LABELS])
@@ -328,9 +280,7 @@ def holdout_score(dev, holdout, variant):
         holdout["id"].to_numpy(), holdout["target"].to_numpy(int), sol.decide(probabilities, priors)
     )
 
-
 def report_calibration(dev, per_seed):
-    """Mean predicted probability against observed frequency, per class."""
     y = dev["target"].to_numpy(int)
     oof = np.mean([r[1] for r in per_seed], axis=0)
     for c in LABELS:
@@ -346,7 +296,6 @@ def report_calibration(dev, per_seed):
                     f"      p in [{low},{high}): n={int(band.sum()):5d} "
                     f"mean p={oof[band, c - 1].mean():.3f} actual={float((y[band] == c).mean()):.3f}"
                 )
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -388,7 +337,6 @@ def main():
         if args.holdout:
             total, hrecall, hconf, hdist = holdout_score(dev, holdout, variant)
             print(f"    holdout={total:.4f}  recall={np.round(hrecall, 3)}  predicted={hdist}")
-
 
 if __name__ == "__main__":
     main()

@@ -1,33 +1,3 @@
-"""Breadth prediction for maintenance problem reports.
-
-Reads the public train and test files, fits a model on the training rows only,
-and writes one breadth code (1, 2 or 3) per test report.
-
-The model is an average of five multinomial logistic regressions over TF-IDF of
-the hashed token fields, the supplied count columns, and smoothed target
-encodings of the annotation fields, the report token string, and two report
-crossings. Token normalisation collapses numerals and side markers, so separate
-reports often share a token string; the encodings let those repeats inform each
-other. Encodings for the training rows are computed out of fold, so no row
-contributes to the encoding it is trained on, and rows outside the training set
-are encoded from all training rows. The regressions are trained without class
-weights so their outputs stay interpretable as class probabilities.
-
-decide() does not take the most likely class. The scoring formula is published,
-so each report is given the code with the highest expected score under it, using
-the class priors observed in the training rows. That is what keeps the rarer
-codes reachable.
-
-Not used anywhere: id, report_fingerprint, any external data or corpus, any
-generated rows or labels, and any remote service. Everything is fit on the
-training rows that arrive with the run; test rows are only transformed.
-
-The constants below (regularisation, smoothing, n-gram ranges, min_df) were
-picked by repeated stratified cross-validation on the training rows, with a
-slice held out and scored once to confirm the choice. validate.py reproduces
-that measurement.
-"""
-
 import os
 
 for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
@@ -82,7 +52,6 @@ TE_KEYS = [
     "report_x_part",
 ]
 
-# C, encoder smoothing, report n-gram range, min_df
 MODEL_CONFIGS = [
     (0.10, 5.0, (1, 2), 2),
     (0.15, 10.0, (1, 2), 2),
@@ -91,11 +60,9 @@ MODEL_CONFIGS = [
     (0.15, 10.0, (1, 3), 3),
 ]
 
-# credit for predicting k when the truth is c: 1.0 exact, 0.5 adjacent, 0.0 for 1 vs 3
 ORDINAL = 1.0 - np.abs(LABELS[:, None] - LABELS[None, :]) / 2.0
 
 PREDICTION_KEY = "breadth"
-
 
 def add_key_crossings(frame):
     frame = frame.copy()
@@ -105,7 +72,6 @@ def add_key_crossings(frame):
     frame["report_x_part"] = frame["report_tokens"] + " || " + frame["problem_part_tokens"]
     return frame
 
-
 def load_data(public_dir):
     train = pd.read_csv(public_dir / "train.csv")
     targets = pd.read_csv(public_dir / "train_targets.csv")
@@ -113,12 +79,7 @@ def load_data(public_dir):
     train = train.merge(targets[["id", "target"]], on="id", how="inner", validate="one_to_one")
     return add_key_crossings(train), add_key_crossings(test)
 
-
 class GroupTargetEncoder:
-    """Smoothed class distribution per categorical key.
-
-    Passing y to transform() encodes the fitting rows leave-one-out.
-    """
 
     def __init__(self, keys, smoothing):
         self.keys = list(keys)
@@ -148,9 +109,7 @@ class GroupTargetEncoder:
             blocks.append(np.hstack([encoded, np.log1p(total)]))
         return np.hstack(blocks)
 
-
 def encode_targets(train, test, y_train, keys, smoothing):
-    """Out-of-fold encodings for the training rows, full-fit encodings for the rest."""
     full = GroupTargetEncoder(keys, smoothing).fit(train, y_train)
     enc_test = full.transform(test)
 
@@ -165,7 +124,6 @@ def encode_targets(train, test, y_train, keys, smoothing):
         inner = GroupTargetEncoder(keys, smoothing).fit(train.iloc[fit_idx], y_train[fit_idx])
         enc_train[held_idx] = inner.transform(train.iloc[held_idx])
     return enc_train, enc_test
-
 
 def build_matrices(train, test, y_train, ngram_report, min_df, smoothing):
     train_blocks, test_blocks = [], []
@@ -182,7 +140,6 @@ def build_matrices(train, test, y_train, ngram_report, min_df, smoothing):
         try:
             train_blocks.append(vec.fit_transform(train[field]))
         except ValueError:
-            # nothing left in this field after pruning
             continue
         test_blocks.append(vec.transform(test[field]))
 
@@ -199,14 +156,11 @@ def build_matrices(train, test, y_train, ngram_report, min_df, smoothing):
 
     return sparse.hstack(train_blocks).tocsr(), sparse.hstack(test_blocks).tocsr()
 
-
 def align_columns(model, probabilities):
-    """Place predict_proba columns at the positions of LABELS."""
     aligned = np.zeros((probabilities.shape[0], len(LABELS)))
     for column, label in enumerate(model.classes_):
         aligned[:, int(label) - 1] = probabilities[:, column]
     return aligned
-
 
 def predict_proba(train, test, y_train):
     probabilities = np.zeros((len(test), len(LABELS)))
@@ -217,18 +171,14 @@ def predict_proba(train, test, y_train):
         probabilities += align_columns(model, model.predict_proba(X_test))
     return probabilities / len(MODEL_CONFIGS)
 
-
 def decide(probabilities, priors):
-    """Pick the code with the highest expected score under the published metric."""
     utility = (
         0.75 / 3.0 * (probabilities / np.maximum(priors, 1e-9)[None, :])
         + 0.25 * (probabilities @ ORDINAL.T)
     )
     return LABELS[np.argmax(utility, axis=1)]
 
-
 def fallback_proba(train, test, y_train):
-    """Report tokens only, used if the main pipeline cannot run."""
     vec = TfidfVectorizer(analyzer="word", token_pattern=r"\S+", sublinear_tf=True)
     X_train = vec.fit_transform(train["report_tokens"])
     X_test = vec.transform(test["report_tokens"])
@@ -236,9 +186,7 @@ def fallback_proba(train, test, y_train):
     model.fit(X_train, y_train)
     return align_columns(model, model.predict_proba(X_test))
 
-
 def decode_prediction(value, name):
-    """Acceptance check applied to every cell before the file is written."""
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} predictions must be JSON objects")
     try:
@@ -255,7 +203,6 @@ def decode_prediction(value, name):
         raise ValueError(f"{name} breadth must be one of {LABELS.tolist()}")
     return breadth
 
-
 def build_submission(ids, predictions):
     return pd.DataFrame(
         {
@@ -265,7 +212,6 @@ def build_submission(ids, predictions):
             ],
         }
     )
-
 
 def write_submission(submission, test_ids, out_path):
     for value in submission["prediction"]:
@@ -280,7 +226,6 @@ def write_submission(submission, test_ids, out_path):
     os.close(handle)
     submission.to_csv(temp_name, index=False)
     os.replace(temp_name, out_path)
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -314,7 +259,6 @@ def main():
     counts = pd.Series(predictions).value_counts().sort_index()
     print(f"wrote {args.submission_out} ({len(predictions)} rows)")
     print("predicted breadth distribution:", {int(k): int(v) for k, v in counts.items()})
-
 
 if __name__ == "__main__":
     main()
