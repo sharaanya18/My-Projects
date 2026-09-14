@@ -134,7 +134,88 @@ def structural_features(frame):
         columns.append([len(a & b) for a, b in zip(report_sets, other)])
     return np.asarray(columns, dtype=float).T
 
+BACKOFF_PARENTS = {
+    "report_x_location": "report_tokens",
+    "report_x_part": "report_tokens",
+    "report_tokens": None,
+    "location_tokens": None,
+    "problem_part_tokens": None,
+    "tagged_problem_tokens": None,
+    "report_cluster": None,
+}
+
+
+class BackoffTargetEncoder:
+    def __init__(self, keys, smoothing, parents=None, with_counts=False):
+        self.keys = list(keys)
+        self.smoothing = float(smoothing)
+        self.parents = dict(parents or BACKOFF_PARENTS)
+        self.with_counts = with_counts
+
+    def fit(self, frame, y):
+        self.priors_ = np.array([(y == c).mean() for c in LABELS])
+        self.tables_ = {}
+        for key in self.keys:
+            levels, inverse = np.unique(frame[key].fillna("").to_numpy(), return_inverse=True)
+            counts = np.zeros((len(levels), 3))
+            np.add.at(counts, (inverse, y - 1), 1.0)
+            self.tables_[key] = ({v: i for i, v in enumerate(levels)}, counts)
+        return self
+
+    def _observed(self, frame, key, y):
+        lookup, counts = self.tables_[key]
+        index = np.array([lookup.get(v, -1) for v in frame[key].fillna("").to_numpy()])
+        observed = np.where((index >= 0)[:, None], counts[np.clip(index, 0, None)], 0.0)
+        if y is not None:
+            observed = observed - np.eye(3)[y - 1]
+        return np.maximum(observed, 0.0)
+
+    def transform(self, frame, y=None):
+        observed = {key: self._observed(frame, key, y) for key in self.keys}
+        estimates = {}
+        blocks = []
+        for key in self.keys:
+            parent = self.parents.get(key)
+            if parent is not None and parent in estimates:
+                target = estimates[parent]
+            else:
+                target = np.repeat(self.priors_[None, :], len(frame), axis=0)
+            total = observed[key].sum(axis=1, keepdims=True)
+            estimate = (observed[key] + self.smoothing * target) / (total + self.smoothing)
+            estimates[key] = estimate
+            block = [estimate, np.log1p(total)]
+            if self.with_counts:
+                block.append(1.0 / (1.0 + total))
+                block.append((total > 0).astype(float))
+            blocks.append(np.hstack(block))
+        return np.hstack(blocks)
+
+
+def backoff_encode(train, evaluate, y_train, keys, smoothing, with_counts=False, hierarchical=True):
+    parents = None if hierarchical else {k: None for k in keys}
+    make = lambda: BackoffTargetEncoder(keys, smoothing, parents=parents, with_counts=with_counts)
+    full = make().fit(train, y_train)
+    enc_eval = full.transform(evaluate)
+    present = np.array([(y_train == c).sum() for c in LABELS])
+    n_splits = int(min(5, present[present > 0].min()))
+    if n_splits < 2:
+        return full.transform(train, y_train), enc_eval
+    enc_train = np.zeros((len(train), enc_eval.shape[1]))
+    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=sol.TE_FOLD_SEED)
+    for fit_idx, held_idx in splitter.split(train, y_train):
+        inner = make().fit(train.iloc[fit_idx], y_train[fit_idx])
+        enc_train[held_idx] = inner.transform(train.iloc[held_idx])
+    return enc_train, enc_eval
+
+
 def encode_targets(train, evaluate, y_train, keys, smoothing, mode):
+    if mode == "backoff":
+        return backoff_encode(train, evaluate, y_train, keys, smoothing)
+    if mode == "backoff_counts":
+        return backoff_encode(train, evaluate, y_train, keys, smoothing, with_counts=True)
+    if mode == "oof_counts":
+        return backoff_encode(train, evaluate, y_train, keys, smoothing,
+                              with_counts=True, hierarchical=False)
     if mode == "oof":
         return sol.encode_targets(train, evaluate, y_train, keys, smoothing)
     if mode.startswith("oof_multi"):
@@ -157,13 +238,70 @@ def encode_targets(train, evaluate, y_train, keys, smoothing, mode):
     full = sol.GroupTargetEncoder(keys, smoothing).fit(train, y_train)
     return full.transform(train, y_train), full.transform(evaluate)
 
+def assign_clusters(train, evaluate, threshold=0.8, max_posting=200):
+    train_sets = [set(str(v).split()) for v in train["report_tokens"]]
+    postings = {}
+    for i, tokens in enumerate(train_sets):
+        for t in tokens:
+            postings.setdefault(t, []).append(i)
+    parent = list(range(len(train_sets)))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def candidates(tokens):
+        found = set()
+        for t in tokens:
+            posting = postings.get(t)
+            if posting is not None and len(posting) <= max_posting:
+                found.update(posting)
+        return found
+
+    def similarity(a, b):
+        union = len(a | b)
+        return len(a & b) / union if union else 0.0
+
+    for i, tokens in enumerate(train_sets):
+        for j in candidates(tokens):
+            if j <= i:
+                continue
+            if similarity(tokens, train_sets[j]) >= threshold:
+                ra, rb = find(i), find(j)
+                if ra != rb:
+                    parent[max(ra, rb)] = min(ra, rb)
+
+    train_labels = np.array([f"c{find(i)}" for i in range(len(train_sets))])
+    eval_labels = []
+    for value in evaluate["report_tokens"]:
+        tokens = set(str(value).split())
+        best, best_score = "", threshold
+        for j in candidates(tokens):
+            score = similarity(tokens, train_sets[j])
+            if score >= best_score:
+                best, best_score = train_labels[j], score
+        eval_labels.append(best)
+    return train_labels, np.array(eval_labels)
+
+
 class FoldFeatures:
 
     def __init__(self, train, evaluate, y_train, variant):
+        self.variant = variant
+        self.te_keys = list(variant["te_keys"])
+        threshold = variant.get("cluster")
+        if threshold:
+            train = train.copy()
+            evaluate = evaluate.copy()
+            train["report_cluster"], evaluate["report_cluster"] = assign_clusters(
+                train, evaluate, threshold
+            )
+            self.te_keys.append("report_cluster")
         self.train = train
         self.evaluate = evaluate
         self.y_train = y_train
-        self.variant = variant
         self._tfidf = {}
         self._encodings = {}
 
@@ -189,7 +327,7 @@ class FoldFeatures:
         if smoothing not in self._encodings:
             self._encodings[smoothing] = encode_targets(
                 self.train, self.evaluate, self.y_train,
-                self.variant["te_keys"], smoothing, self.variant["te_mode"],
+                self.te_keys, smoothing, self.variant["te_mode"],
             )
         return self._encodings[smoothing]
 
@@ -284,6 +422,13 @@ VARIANTS = {
     "oof_struct_cross": dict(
         te_mode="oof", te_keys=BASE_KEYS + EXTRA_CROSS_KEYS, model="lr", structural=True
     ),
+    "backoff": dict(te_mode="backoff", te_keys=BASE_KEYS, model="lr"),
+    "oof_counts": dict(te_mode="oof_counts", te_keys=BASE_KEYS, model="lr"),
+    "backoff_counts": dict(te_mode="backoff_counts", te_keys=BASE_KEYS, model="lr"),
+    "oof_cluster": dict(te_mode="oof", te_keys=BASE_KEYS, model="lr", cluster=0.8),
+    "backoff_cluster": dict(te_mode="backoff", te_keys=BASE_KEYS, model="lr", cluster=0.8),
+    "oof_cluster90": dict(te_mode="oof", te_keys=BASE_KEYS, model="lr", cluster=0.9),
+    "oof_cluster95": dict(te_mode="oof", te_keys=BASE_KEYS, model="lr", cluster=0.95),
     "two_stage": dict(te_mode="oof", te_keys=BASE_KEYS, model="two_stage"),
     "two_stage_blend": dict(te_mode="oof", te_keys=BASE_KEYS, model="two_stage_blend"),
     "two_stage_blend_c05": dict(te_mode="oof", te_keys=BASE_KEYS, model="two_stage_blend", stage2_C=0.05),
@@ -308,7 +453,9 @@ def load_dev_holdout(public_dir):
     return train.iloc[np.sort(dev_idx)].reset_index(drop=True), train.iloc[np.sort(holdout_idx)].reset_index(drop=True)
 
 def _one_fold(dev, y, variant, fit_idx, val_idx):
-    return val_idx, fold_probabilities(dev.iloc[fit_idx], dev.iloc[val_idx], y[fit_idx], variant)
+    keys = dev["report_tokens"].to_numpy()
+    matched = np.isin(keys[val_idx], keys[fit_idx])
+    return val_idx, fold_probabilities(dev.iloc[fit_idx], dev.iloc[val_idx], y[fit_idx], variant), matched
 
 def cross_validate(dev, variant, seeds, n_jobs):
     y = dev["target"].to_numpy(int)
@@ -321,9 +468,18 @@ def cross_validate(dev, variant, seeds, n_jobs):
             for fit_idx, val_idx in splitter.split(dev, y)
         )
         oof = np.zeros((len(y), 3))
-        for val_idx, probabilities in results:
+        matched = np.zeros(len(y), bool)
+        for val_idx, probabilities, match in results:
             oof[val_idx] = probabilities
-        per_seed.append((score_predictions(dev["id"].to_numpy(), y, sol.decide(oof, priors)), oof))
+            matched[val_idx] = match
+        predictions = sol.decide(oof, priors)
+        split_recall = {}
+        for label, mask in (("matched", matched), ("unmatched", ~matched)):
+            split_recall[label] = [
+                float((predictions[(y == c) & mask] == c).mean()) if ((y == c) & mask).sum() else np.nan
+                for c in LABELS
+            ]
+        per_seed.append((score_predictions(dev["id"].to_numpy(), y, predictions), oof, split_recall))
     return per_seed
 
 def holdout_score(dev, holdout, variant):
@@ -374,6 +530,8 @@ def main():
         recall = np.mean([r[0][1] for r in per_seed], axis=0)
         confusion = np.sum([r[0][2] for r in per_seed], axis=0)
         distribution = per_seed[-1][0][3]
+        matched_recall = np.nanmean([r[2]["matched"] for r in per_seed], axis=0)
+        unmatched_recall = np.nanmean([r[2]["unmatched"] for r in per_seed], axis=0)
         line = f"{name:26s} cv={scores.mean():.4f} +/-{scores.std():.4f}"
         if baseline_scores is None:
             baseline_scores = scores
@@ -385,6 +543,8 @@ def main():
         if baseline_scores is not scores:
             print(f"    per-seed gain={np.round(scores - baseline_scores, 4)}")
         print(f"    per-class recall={np.round(recall, 3)}  predicted={distribution}")
+        print(f"    recall | matched  ={np.round(matched_recall, 3)}")
+        print(f"    recall | unmatched={np.round(unmatched_recall, 3)}")
         print(f"    confusion (rows=true) =\n{confusion}")
         if args.calibration:
             report_calibration(dev, per_seed)
