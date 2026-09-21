@@ -1,0 +1,25 @@
+# Core -- required by everything in nlp_knowledge/code/. Versions are the ones
+# this knowledge base was tested against in this session.
+numpy>=2.0
+pandas>=2.2
+scikit-learn>=1.5
+scipy>=1.13
+
+# Optional: GBDT / learning-to-rank rungs (playbooks/ranking.md, models/gbdt_on_text.md)
+# lightgbm>=4.3
+# xgboost>=2.0
+
+# Optional: faster BM25 for large corpora (techniques/information_retrieval.md)
+# bm25s>=0.2
+
+# Optional: dense retrieval / reranking / fine-tuning.
+# REQUIRES access to huggingface.co, which is BLOCKED in this container.
+# Confirm model download works before planning around these.
+# torch>=2.3
+# sentence-transformers>=5.0
+# transformers>=4.44
+# datasets>=2.20
+# faiss-cpu>=1.8
+
+# Optional: PDF/resource ingestion (used to read the source PDF)
+# pypdf>=5.0
