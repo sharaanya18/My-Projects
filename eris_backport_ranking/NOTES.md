@@ -70,15 +70,17 @@ on the mean picks whichever model is best on the regions it already recognises, 
 the exact failure being designed around.
 
 Note that low capacity is *not* the answer on its own — the logit is clearly the worst of
-the three. What helps is a representation that survives the covariate shift, plus selection
-that rewards the weak folds.
+the three. What helps is metric-aligned scoring, heavy seed ensembling, and selection that
+rewards the weak folds.
 
-The trained neural ranker lands in the same band on these folds (worst half 0.55–0.58
-across the configurations tried, mean 0.71–0.75), i.e. within the noise of the tree
-baselines. Since the difference is not measurable and guidebook §5.3 is explicit that a
-ranking challenge wants a genuinely trained ranking model rather than hand-engineered
-features fed to an off-the-shelf ranker, the shipped solution is neural only — no GBM in
-the blend.
+Individual neural configurations land across 0.516–0.610 worst-half on these folds, i.e.
+straddling the tree baselines rather than beating them; the shipped two-head blend reaches
+0.633 (§6). Since no single family dominates and guidebook §5.3 is explicit that a ranking
+challenge wants a genuinely trained ranking model rather than hand-engineered features fed
+to an off-the-shelf ranker, the shipped solution is neural only — no GBM in the blend. To be
+clear about what was and was not measured: the neural and tree families were each scored on
+these folds, but a neural+GBM *blend* was never run, so that decision rests on §5.3 and on
+neither family dominating, not on a blend experiment.
 
 ## 4. What the shipped solution does
 
