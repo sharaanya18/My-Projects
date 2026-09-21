@@ -1,0 +1,29 @@
+data directory            : /home/user/My-Projects/eris_backport_ranking/data
+train rows / test rows    : 2418 / 586
+numeric / categorical     : 34 / 17 profile fields
+region-disjoint folds     : 7 of 10 regions usable  (train->valid: 1785->545, 1873->458, 2167->246, 2141->275, 1871->516, 2263->153, 2238->178)
+  [eg] {'transform': 'rank', 'epochs': 90, 'lr': 0.003, 'weight_decay': 0.03, 'hidden': 64, 'depth': 1, 'dropout': 0.35, 'emb_dim': 4, 'batch_size': 256} -> worst-half 0.5689  mean 0.7402
+  [eg] {'transform': 'rank', 'epochs': 140, 'lr': 0.002, 'weight_decay': 0.03, 'hidden': 64, 'depth': 2, 'dropout': 0.4, 'emb_dim': 4, 'batch_size': 256} -> worst-half 0.5278  mean 0.7039
+  [eg] {'transform': 'rank', 'epochs': 140, 'lr': 0.002, 'weight_decay': 0.1, 'hidden': 96, 'depth': 2, 'dropout': 0.3, 'emb_dim': 6, 'batch_size': 256} -> worst-half 0.5583  mean 0.7190
+  [eg] {'transform': 'log', 'epochs': 90, 'lr': 0.003, 'weight_decay': 0.03, 'hidden': 64, 'depth': 1, 'dropout': 0.35, 'emb_dim': 4, 'batch_size': 256} -> worst-half 0.5956  mean 0.7346
+  [eg] {'transform': 'log', 'epochs': 140, 'lr': 0.002, 'weight_decay': 0.03, 'hidden': 64, 'depth': 2, 'dropout': 0.4, 'emb_dim': 4, 'batch_size': 256} -> worst-half 0.6102  mean 0.7498
+  [eg] selected (within 0.005 of best 0.6102)
+  [listnet] {'transform': 'rank', 'epochs': 90, 'lr': 0.003, 'weight_decay': 0.03, 'hidden': 64, 'depth': 1, 'dropout': 0.35, 'emb_dim': 4, 'batch_size': 256} -> worst-half 0.5204  mean 0.6840
+  [listnet] {'transform': 'rank', 'epochs': 140, 'lr': 0.002, 'weight_decay': 0.03, 'hidden': 64, 'depth': 2, 'dropout': 0.4, 'emb_dim': 4, 'batch_size': 256} -> worst-half 0.5550  mean 0.6972
+  [listnet] {'transform': 'rank', 'epochs': 140, 'lr': 0.002, 'weight_decay': 0.1, 'hidden': 96, 'depth': 2, 'dropout': 0.3, 'emb_dim': 6, 'batch_size': 256} -> worst-half 0.5156  mean 0.6850
+  [listnet] {'transform': 'log', 'epochs': 90, 'lr': 0.003, 'weight_decay': 0.03, 'hidden': 64, 'depth': 1, 'dropout': 0.35, 'emb_dim': 4, 'batch_size': 256} -> worst-half 0.5406  mean 0.6558
+  [listnet] {'transform': 'log', 'epochs': 140, 'lr': 0.002, 'weight_decay': 0.03, 'hidden': 64, 'depth': 2, 'dropout': 0.4, 'emb_dim': 4, 'batch_size': 256} -> worst-half 0.6041  mean 0.7070
+  [listnet] selected (within 0.005 of best 0.6041)
+  head mixture: w(expected-gain)=0.50, chosen from 3 weights within 0.005 of the best -> worst-half region-disjoint NDCG@20 0.6334
+
+model                     : FieldRanker (learned field embeddings + MLP trunk)
+  expected-gain head      : {'transform': 'log', 'epochs': 140, 'lr': 0.002, 'weight_decay': 0.03, 'hidden': 64, 'depth': 2, 'dropout': 0.4, 'emb_dim': 4, 'batch_size': 256}
+                            worst-half region-disjoint NDCG@20 0.6102
+  listwise (ListNet) head : {'transform': 'log', 'epochs': 140, 'lr': 0.002, 'weight_decay': 0.03, 'hidden': 64, 'depth': 2, 'dropout': 0.4, 'emb_dim': 4, 'batch_size': 256}
+                            worst-half region-disjoint NDCG@20 0.6041
+  head mixture            : 0.50 expected-gain / 0.50 listwise
+validation NDCG@20        : 0.6334  (worst half of the region-disjoint folds)
+prediction range          : [0.017918, 0.996672]
+distinct predictions      : 538 of 586
+output path               : /home/user/My-Projects/eris_backport_ranking/working/submission.csv
+runtime                   : 848.6s

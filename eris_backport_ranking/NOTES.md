@@ -94,11 +94,13 @@ the trunk adds the interactions. Two heads are trained and blended:
 * **ListNet** — listwise softmax cross-entropy between the score distribution and the gain
   distribution over a sampled list, optimising the ordering directly.
 
-**Shift-robust encoding.** Numeric fields can be mapped through their own *training*
-empirical CDF to a normal score instead of log1p-and-standardise. With the test projects
-several times larger on mean `additions` and `docs_file_count`, a per-field CDF mapping is
-invariant to that rescaling where a standardised log1p value is not. Which of the two is
-used is one of the things the in-script search decides.
+**Two numeric encodings, chosen by the search.** Fields can be standardised log1p values,
+or mapped through their own *training* empirical CDF to a normal score. The CDF mapping was
+put in because it is invariant to the magnitude shift between train and test projects, where
+a standardised log1p value is not — but the search does not agree: on the region-disjoint
+folds the plain log1p encoding wins for both heads (worst half 0.610 / 0.604 against
+0.569 / 0.555 for the rank transform). Both are left in the grid and the folds decide; the
+hypothesis was worth testing and it lost.
 
 **Everything is learned in-script.** The field representation, each head's hyperparameters
 (a fixed 5-point grid, every point always evaluated), and the head mixture all come from
@@ -157,7 +159,26 @@ test rows, calibrating scores to the test distribution, or pseudo-labelling woul
 the score and are all prohibited by guidebook §4.2 — it is about realism, not labels. The
 rank transform here is fitted on training rows only, and test rows get one forward pass each.
 
-## 6. Determinism, checked rather than asserted
+## 6. What the shipped solution actually scores
+
+One full run of the plan as committed (`python3 solution.py`, 848.6 s, CPU only):
+
+```
+region-disjoint folds : 7 of 10 regions usable
+  expected-gain head  : worst-half 0.6102   (mean 0.7498)
+  listwise head       : worst-half 0.6041   (mean 0.7070)
+  head mixture        : 0.50 / 0.50, chosen from 3 weights within 0.005 of the best
+validation NDCG@20    : 0.6334   (worst half of the region-disjoint folds)
+```
+
+For reference on the same folds: `solution_1`'s HGB+RF scores 0.600 worst-half and took
+0.54 on the real hidden set. So this is a real gain on the pessimistic criterion, not a
+better number on a more forgiving one — but see §2 about how noisy a single 586-row draw is.
+
+The run produced 586 rows in test order, all finite, no duplicate ids, and finished in
+14 minutes — well inside the hour.
+
+## 7. Determinism, checked rather than asserted
 
 Two independent runs of the same plan, in separate working directories:
 
@@ -170,7 +191,7 @@ $ md5sum det_a/working/submission.csv det_b/working/submission.csv
 Byte-identical, `diff` clean. The only `time.time()` calls left in the script report the
 elapsed runtime at the end; nothing branches on them.
 
-## 7. Running it
+## 8. Running it
 
 ```
 project/
