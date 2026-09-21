@@ -6,7 +6,7 @@
 
 | # | Violation | Where |
 |---|---|---|
-| 1 | The artifact is never written to `working/submission.csv`. Both scripts take the output path from `sys.argv[2]` and, run with no arguments, print a usage line and `return 2` — producing **no submission file at all**. The challenge states: *"Write the final artifact to working/submission.csv when running a solution."* | `solution.py:325-328`, `solution_1.py:325-330` |
+| 1 | The artifact is never written to `working/submission.csv`. Both scripts take the output path from `sys.argv[2]` and, run with no arguments, print a usage line and `return 2` — producing **no submission file at all**. The challenge states: *"Write the final artifact to working/submission.csv when running a solution."* | `solution.py:324-329`, `solution_1.py:324-330` |
 | 2 | Guidebook §5.3 (ranking challenges): *"they hand-engineer features out of the data, and then run a classic ranking algorithm on top of those features. That's not enough."* `solution_1.py` is exactly that — 60 hand-built features into `HistGradientBoostingRegressor` + `RandomForestRegressor`, regressing the raw label. There is no trained ranking model in it. | `solution_1.py:204-239` |
 | 3 | Guidebook §1.1: hyperparameters must be **searched inside the submission script**, not hardcoded from an offline search. `solution_1.py` pins `max_iter=400, learning_rate=0.03, max_depth=5, …` and the blend `HGB_WEIGHT=0.6 / RF_WEIGHT=0.4`. | `solution_1.py:199-223` |
 | 4 | Guidebook §3.8: the script must be fully independent end-to-end. A script that requires two positional arguments is not. | both |
@@ -17,7 +17,7 @@ Everything below changes **which model gets built** depending on how fast the ho
 
 | # | Violation | Where |
 |---|---|---|
-| 1 | `TIME_BUDGET_S = 3000` plus `time_left()` gates on the hyperparameter grid, the feature screen, the grouped-CV views and the extrapolation views. A slower machine searches less and therefore ships a *different model*. | `solution.py:281, 364, 394, 400` |
+| 1 | `TIME_BUDGET_S = 3000` plus `time_left()` gates on the hyperparameter grid, the feature screen, the grouped-CV views and the extrapolation views. A slower machine searches less and therefore ships a *different model*. | `solution.py:8, 275-281, 364, 394, 401` |
 | 2 | `raise RuntimeError('no validation views could be built within the time budget')` — the script can fail outright purely because of machine speed. | `solution.py:409` |
 | 3 | `torch.use_deterministic_algorithms(True, warn_only=True)` — `warn_only` explicitly *permits* nondeterministic kernels instead of rejecting them. | `solution.py:196` |
 | 4 | `LGBMRanker` built without `deterministic=True`, `force_row_wise=True` or a pinned `n_jobs`, so histogram construction follows the host's core count. | `solution.py:248` |
@@ -28,12 +28,13 @@ Everything below changes **which model gets built** depending on how fast the ho
 
 This matters more than either check.
 
-**Random ranking on 586 rows scores 0.342 ± 0.101** (3000 draws). So 0.2258 is *below chance*, and 0.54 is about the 95th percentile of chance.
+**Random ranking on 586 rows scores 0.326 ± 0.101** (20 000 draws). So 0.2258 sits in the bottom 17% of what shuffling would give you, and 0.54 is the 97.7th percentile of chance — genuinely better than nothing, but not by much.
 
 The training rows are not i.i.d. with the hidden set, and the public validation signal is almost entirely fake:
 
 | Measurement | Value |
 |---|---|
+| Random ranking, 586 rows (20 000 draws) | **0.326 ± 0.101** |
 | Random 5-fold CV NDCG@20 (`solution_1`'s model) | **0.974** |
 | Its actual project-disjoint test score | **0.54** |
 | 1-nearest-neighbour label agreement inside train | **0.81** (chance 0.38) |
@@ -72,6 +73,13 @@ Note that low capacity is *not* the answer on its own — the logit is clearly t
 the three. What helps is a representation that survives the covariate shift, plus selection
 that rewards the weak folds.
 
+The trained neural ranker lands in the same band on these folds (worst half 0.55–0.58
+across the configurations tried, mean 0.71–0.75), i.e. within the noise of the tree
+baselines. Since the difference is not measurable and guidebook §5.3 is explicit that a
+ranking challenge wants a genuinely trained ranking model rather than hand-engineered
+features fed to an off-the-shelf ranker, the shipped solution is neural only — no GBM in
+the blend.
+
 ## 4. What the shipped solution does
 
 **Model.** A trained neural ranker (`FieldRanker`). Every `key=value` token of the profile
@@ -109,3 +117,62 @@ search.
   runtime budget rather than being cut short by a timer.
 * Only `train.csv`, `test.csv` and `train_targets.csv` are read. Test rows get one forward
   pass each and never touch fitting, feature statistics, thresholds or calibration.
+
+## 5. How to actually clear 0.5 on the hidden set
+
+**Calibrate your expectations first.** Random ranking scores 0.326 ± 0.101 here (20 000
+draws of 586 rows); a shuffle clears 0.50 on 5.3% of draws and 0.54 on 2.3%. Only the top 20
+of 586 rows count, so a single submission carries a lot of variance — 0.5 is about 1.7
+standard deviations above chance on one draw. A model with real signal clears it most of the
+time, not every time. Guidebook §1.2 applies: treat the public number as a soft signal, not
+proof.
+
+**The largest single lever is not modelling, it is not wrecking the model at selection
+time.** The family `solution_1` used scores roughly 0.54–0.60 on the honest folds. `solution.py`
+started from the same data and tuned itself down to 0.226 — below chance — purely by
+selecting a feature screen, hyperparameters and a blend weight against a validation signal
+that was measuring project memorisation. Deleting the bad selection recovers most of the gap
+before any new modelling happens.
+
+In rough order of payoff:
+
+1. **Never select on random K-fold.** It reports 0.97 here and ranks models wrongly. Hold
+   out whole regions and score the weak folds.
+2. **Rank by expected gain**, `3·P(active) + 1·P(light)`, not by a regression on the raw
+   label. It is the exact quantity NDCG's `2**rel - 1` mapping rewards, and it is free.
+3. **Ensemble seeds and average ranks.** The top 20 rows of 586 are unstable; a single fit
+   moves them around far more than the underlying model quality does.
+4. **Blend a pointwise and a listwise head.** Worth about +0.03 worst-half here
+   (0.552 / 0.553 separately → 0.583 blended).
+5. **Keep the search small.** Five configurations in one regularised family, an Occam
+   tie-break toward the simpler one, and a blend weight pulled toward balanced. Every extra
+   selected knob is another chance to fit seven noisy folds.
+6. **Do not reach for capacity, and do not run from it either.** A multinomial logit is the
+   worst model tested (0.425 worst-half). Depth-2 GBMs, `solution_1`'s deeper trees and the
+   neural ranker all land within noise of each other around 0.58–0.60. Representation and
+   selection discipline decide this problem; architecture barely does.
+
+**Things that look tempting and are not allowed.** Quantile-normalising features using the
+test rows, calibrating scores to the test distribution, or pseudo-labelling would all lift
+the score and are all prohibited by guidebook §4.2 — it is about realism, not labels. The
+rank transform here is fitted on training rows only, and test rows get one forward pass each.
+
+## 6. Running it
+
+```
+project/
+  solution.py
+  data/            # train.csv, test.csv, train_targets.csv (also found at ./, ./input,
+                   # ./public, ../data, /kaggle/input/*, or via ERIS_DATA_DIR)
+  working/         # created if missing; submission.csv is written here
+```
+
+```
+python3 solution.py
+```
+
+No arguments. `ERIS_DATA_DIR` and `ERIS_OUTPUT` exist only to relocate the two paths for
+local testing; both default to the layout above.
+
+Requires numpy, pandas, scipy, scikit-learn and torch — all present in the Kaggle image
+(guidebook §3.1). Runs on CPU by design; see the DETERMINISM section of the script.

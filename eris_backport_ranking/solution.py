@@ -47,6 +47,15 @@ seeded, `torch.use_deterministic_algorithms(True)` is enabled without `warn_only
 the search evaluates a fixed grid with no wall-clock branch anywhere. The same inputs
 produce the same `working/submission.csv` on every run.
 
+The usual advice is to put a timer in that cuts training short near the budget. That is
+deliberately not done here, because a timer is exactly what makes a run irreproducible -
+a slower host would search less of the grid and therefore ship a different model. The
+budget is respected by sizing the plan instead: the whole run is a fixed
+`len(SEARCH_SPACE) * 2 * len(folds) * SEARCH_SEEDS + 2 * FINAL_SEEDS` model fits of a
+network small enough to train on ~2.4k rows in seconds, which lands in the low tens of
+minutes with a wide margin on the hour. To make it cheaper, shrink the plan constants -
+do not add a clock.
+
 DATA USE
 --------
 `train.csv`, `test.csv` and `train_targets.csv` only. No external data, no network, no
