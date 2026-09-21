@@ -80,7 +80,6 @@ for _k, _v in (
     os.environ[_k] = _v
 
 import random
-import sys
 import time
 from pathlib import Path
 
