@@ -1,7 +1,5 @@
-# Shipd backport review-capacity ranking -- exact versions used and tested.
-# CPU only; no GPU, no model downloads, no network access required at runtime.
-numpy==2.4.6
-pandas==3.0.6
-scikit-learn==1.9.1
-scipy==1.17.1
-lightgbm==4.7.0
+# Shipd backport review-priority ranking -- v2 solution.py
+# solution.py imports ONLY: sys, pathlib (stdlib) + numpy, pandas.
+# No LightGBM, scikit-learn, torch or network access is required or used.
+numpy>=1.24
+pandas>=2.0
