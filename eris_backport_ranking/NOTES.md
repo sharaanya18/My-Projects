@@ -157,7 +157,20 @@ test rows, calibrating scores to the test distribution, or pseudo-labelling woul
 the score and are all prohibited by guidebook §4.2 — it is about realism, not labels. The
 rank transform here is fitted on training rows only, and test rows get one forward pass each.
 
-## 6. Running it
+## 6. Determinism, checked rather than asserted
+
+Two independent runs of the same plan, in separate working directories:
+
+```
+$ md5sum det_a/working/submission.csv det_b/working/submission.csv
+26796a4032c392acdf23d22da38c752c  det_a/working/submission.csv
+26796a4032c392acdf23d22da38c752c  det_b/working/submission.csv
+```
+
+Byte-identical, `diff` clean. The only `time.time()` calls left in the script report the
+elapsed runtime at the end; nothing branches on them.
+
+## 7. Running it
 
 ```
 project/
