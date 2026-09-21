@@ -1,5 +1,9 @@
-# Shipd backport review-priority ranking -- v2 solution.py
-# solution.py imports ONLY: sys, pathlib (stdlib) + numpy, pandas.
-# No LightGBM, scikit-learn, torch or network access is required or used.
+# Eris backport review-priority ranking -- solution.py
+# All of these ship in the Kaggle Docker image (Guidebook S3.1); nothing is
+# installed at runtime and no network access is used.
 numpy>=1.24
 pandas>=2.0
+scipy>=1.10
+scikit-learn>=1.3
+lightgbm>=4.0
+torch>=2.0

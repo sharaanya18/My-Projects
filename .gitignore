@@ -6,3 +6,4 @@ shipd/working/artifacts/
 shipd/working/*.npy
 shipd/working/*.npz
 shipd/working/model.pkl
+shipd/dataset/
