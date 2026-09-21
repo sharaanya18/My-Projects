@@ -1,0 +1,7 @@
+# Shipd backport review-capacity ranking -- exact versions used and tested.
+# CPU only; no GPU, no model downloads, no network access required at runtime.
+numpy==2.4.6
+pandas==3.0.6
+scikit-learn==1.9.1
+scipy==1.17.1
+lightgbm==4.7.0

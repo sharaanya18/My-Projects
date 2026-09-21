@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 artifacts/
 EXPERIMENT_LOG.jsonl
+shipd/working/artifacts/
+shipd/working/*.npy
+shipd/working/*.npz
+shipd/working/model.pkl
