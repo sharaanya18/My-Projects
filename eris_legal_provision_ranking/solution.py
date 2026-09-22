@@ -11,7 +11,6 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 
 warnings.filterwarnings("ignore")
 T0 = time.time()
-TIME_BUDGET = 3000.0
 SEED = 20240917
 N_BUCKETS = 384
 SLATE = 6
@@ -20,8 +19,7 @@ np.random.seed(SEED)
 PUB, OUT = "./dataset/public", "./working"
 os.makedirs(OUT, exist_ok=True)
 
-elapsed = lambda: time.time() - T0
-budget_ok = lambda: elapsed() < TIME_BUDGET
+elapsed = lambda: time.time() - T0   # log timestamps only, never control flow
 def log(*a):
     print("[%7.1fs]" % elapsed(), *a, flush=True)
 
@@ -370,20 +368,11 @@ BEST, PRED = {}, {}
 for fam, cfgs in SPACE.items():
     rows = []
     for hp in cfgs:
-        if not budget_ok():
-            log(f"  out of time, keeping first config for '{fam}'")
-            break
         fn = component(fam, **hp)
         cvs, ld = cv_oof(fn), lodo_oof(fn)
         cv, l, comb = summarize(cvs, ld)
         rows.append((comb, cv, l, hp, cvs, ld))
         log(f"  {fam:<5s} {str(hp):<66s} CV {cv:.4f}  LODO {l:.4f}  comb {comb:.4f}")
-    if not rows:
-        hp = cfgs[0]
-        fn = component(fam, **hp)
-        cvs, ld = cv_oof(fn, reps=1), lodo_oof(fn)
-        cv, l, comb = summarize(cvs, ld)
-        rows = [(comb, cv, l, hp, cvs, ld)]
     rows.sort(key=lambda r: -r[0])
     comb, cv, l, hp, cvs, ld = rows[0]
     BEST[fam], PRED[fam] = hp, (cvs, ld)
@@ -436,7 +425,13 @@ clg_te = rank01(CondLogit(**BEST["clg"]).fit(TR["X_cp"], Y).decision_function(FT
 gbdt_te = rank01(gb_scores(TR["X_small"], Y, FTE["X_small"], **BEST["gbdt"]))
 log("  three components fitted")
 
-pred = rank01(BEST_W[0] * set_te + BEST_W[1] * clg_te + BEST_W[2] * gbdt_te)
+# Blending rank-normalised components makes scores collide, which would leave
+# those rows to an arbitrary id-order tie-break. A tiny continuous term off the
+# conditional logit separates them on the signal itself instead.
+tiebreak = CondLogit(**BEST["clg"]).fit(TR["X_cp"], Y).decision_function(FTE["X_cp"])
+tiebreak = (tiebreak - tiebreak.mean()) / (tiebreak.std() + 1e-12)
+pred = rank01(BEST_W[0] * set_te + BEST_W[1] * clg_te + BEST_W[2] * gbdt_te
+              + 1e-6 * tiebreak)
 
 # staged files so the progression is reproducible from this run, not claimed
 STAGES = {
@@ -473,4 +468,4 @@ log("=" * 78)
 log(f"submission.csv: {len(sub)} rows, {sub['prediction'].nunique()} distinct scores, "
     f"range [{sub['prediction'].min():.4f}, {sub['prediction'].max():.4f}]")
 log(f"expected score -> grouped CV {cand[0][1]:.4f} | unseen direction {cand[0][2]:.4f}")
-log(f"runtime {elapsed():.1f}s of {TIME_BUDGET:.0f}s budget")
+log(f"runtime {elapsed():.1f}s")
