@@ -84,43 +84,44 @@ neither family dominating, not on a blend experiment.
 
 ## 4. What the shipped solution does
 
-**Model.** A trained neural ranker (`FieldRanker`). Every `key=value` token of the profile
-becomes a field token: categorical fields get a learned embedding, numeric fields get a
-learned per-field scale and shift. Those field vectors feed both a linear skip path and an
-MLP trunk — the skip carries the broad per-field effects that survive a change of project,
-the trunk adds the interactions. Two heads are trained and blended:
+**Model — a trained ranker as the major portion (§5.3).** `FieldRanker` is a neural network
+over the profile's fields: each categorical field gets a learned embedding, each numeric
+field a learned per-field scale and shift, and the field vectors feed a linear skip path
+plus an MLP trunk. The skip carries the broad per-field effects that survive a change of
+project; the trunk supplies the interactions. It is trained with **ListNet** — listwise
+softmax cross-entropy between the score distribution and the gain distribution over a
+sampled list — so the model optimises the ordering itself rather than a pointwise target.
+The same network also supports an **expected-gain** head, `3·P(active) + 1·P(light)`, which
+is exactly what NDCG's gain mapping rewards.
 
-* **expected gain** — a 3-way softmax over the graded classes, scored as
-  `E[2**y - 1] = 3·P(active) + 1·P(light)`. That is exactly the quantity NDCG's gain
-  mapping rewards, so it is the metric-aligned pointwise rule.
-* **ListNet** — listwise softmax cross-entropy between the score distribution and the gain
-  distribution over a sampled list, optimising the ordering directly.
+**Co-model.** A LightGBM **LambdaRank** model over the same encoded fields, weight learned
+in-script and capped at `MAX_TREE_WEIGHT = 0.5` so the neural ranker stays the major portion
+per §5.3. The two families disagree substantially on the hidden rows (Spearman ≈ 0.40
+between their test scores) and the public files cannot settle which generalises better, so
+the blend hedges rather than betting.
 
-**Two numeric encodings, chosen by the search.** Fields can be standardised log1p values,
-or mapped through their own *training* empirical CDF to a normal score. The CDF mapping was
-put in because it is invariant to the magnitude shift between train and test projects, where
-a standardised log1p value is not — but the search does not agree: on the region-disjoint
-folds the plain log1p encoding wins for both heads (worst half 0.610 / 0.604 against
-0.569 / 0.555 for the rank transform). Both are left in the grid and the folds decide; the
-hypothesis was worth testing and it lost.
+**Encoding is fixed, not searched.** Numeric fields go through their *training* empirical CDF
+to a normal score. An earlier version let the search choose between this and standardised
+log1p; it chose log1p — the held-out regions contain no magnitude shift, so the folds cannot
+see why the bound matters — and scored 0.27. See §6 for what this does and does not explain.
 
-**Everything is learned in-script.** The field representation, each head's hyperparameters
-(a fixed 5-point grid, every point always evaluated), and the head mixture all come from
-`train_targets.csv` via the region-disjoint folds. Nothing is carried in from an offline
-search.
+**Everything else is learned in-script (§1.1).** Both hyperparameter grids and the mixture
+weight come from `train_targets.csv` via the region-disjoint folds. Nothing is carried in
+from an offline search.
 
-**Compliance fixes.**
+**Compliance.**
 
-* Writes `working/submission.csv`, with no required CLI arguments; the data directory is
-  found by a fixed ordered search.
-* Thread counts and `PYTHONHASHSEED` pinned before numpy/torch load; one fixed CPU device
-  with no availability probe and no fallback; `torch.use_deterministic_algorithms(True)`
-  without `warn_only`; every model seeded.
-* **No wall-clock branch anywhere.** The work plan is a fixed number of fits, so the same
-  inputs give the same submission on any host. The plan is sized to finish well inside the
-  runtime budget rather than being cut short by a timer.
-* Only `train.csv`, `test.csv` and `train_targets.csv` are read. Test rows get one forward
-  pass each and never touch fitting, feature statistics, thresholds or calibration.
+* Writes `working/submission.csv`, no CLI arguments; data directory found by a fixed ordered
+  search.
+* §3.5 safeguard present: a valid submission after 9s, a 3000s deadline that falls through to
+  a fallback fixed by grid position, and a plan sized at ~7 minutes so the guard cannot fire.
+* §3.6 honoured: CUDA when present, with cuDNN determinism and a fixed cuBLAS workspace;
+  identical hyperparameters, seeds and fit counts on either device.
+* Threads and `PYTHONHASHSEED` pinned before the numeric libraries load; every model seeded;
+  `torch.use_deterministic_algorithms(True)` without `warn_only`; LightGBM with
+  `deterministic=True`, `force_row_wise=True`, `n_jobs=1`.
+* Only the three supplied files are read. Test rows get one forward pass each and never touch
+  fitting, feature statistics, thresholds or calibration.
 
 ## 5. How to actually clear 0.5 on the hidden set
 
@@ -161,37 +162,73 @@ test rows, calibrating scores to the test distribution, or pseudo-labelling woul
 the score and are all prohibited by guidebook §4.2 — it is about realism, not labels. The
 rank transform here is fitted on training rows only, and test rows get one forward pass each.
 
-## 6. What the shipped solution actually scores
+## 6. Second round: what the 0.27 submission taught us
 
-One full run of the plan as committed (`python3 solution.py`, 848.6 s, CPU only):
+The first version of this solution scored **0.27** on the hidden set and still failed
+Prompt Compliance. Three things came out of that.
+
+**I broke a stated requirement on purpose, and it was the wrong call.** Guidebook §3.5:
+*"One thing we always ask solvers to do: build a safeguard into your code that automatically
+stops training and moves to inference and submission once you hit somewhere around 50 to 55
+minutes (3000 to 3300 seconds)."* I removed the safeguard to satisfy the Deterministic
+Execution check and documented the removal — trading a stated requirement for a guess about
+another checker. Both are satisfiable at once, and the script now does: the plan is sized to
+finish in ~7 minutes, a valid submission is written from the first fitted model after 9s, and
+the 3000s guard falls through to a fallback fixed *by position in the grid* rather than to
+whatever was best so far. It cannot fire on a real host, so it cannot change the output.
+
+**§3.6 says the environment is an A10G.** The first version hard-pinned
+`torch.device("cpu")` with no GPU path at all, and "hardware" is named in the compliance
+message. The device is now chosen once at startup, using CUDA when present with cuDNN
+determinism and a fixed cuBLAS workspace, with identical hyperparameters either way.
+
+**§5.3 is the real tension, and it cuts against a trees-only rebuild.** Verbatim: *"Feature
+engineering plus an off-the-shelf ranking algorithm isn't the same as a model that's actually
+learned to rank, and it won't hold up here... a major portion of your overall solution still
+has to be a genuinely trained or fine-tuned model."* That is a precise description of
+`solution_1` — which scored 0.54 **and** failed Prompt Compliance. So the tree family gets
+the score and fails the check, while the neural family passes the check and scored below
+chance. The shipped answer is a trained listwise neural ranker as the major portion with a
+LambdaRank co-model capped at `MAX_TREE_WEIGHT = 0.5`, hedging across both.
+
+### What is *not* established
+
+The extrapolation story does not survive contact with the data. The 0.27 version put 7 of
+its top 20 beyond the training maximum on some field; the tree family, which scored 0.54,
+puts 10 of 20 there. Being out of range does not separate a good ranking from a bad one
+here. With three hidden-set observations against a metric whose own noise is ±0.10, the
+cause of 0.27 is **not identifiable from the public files**. The CDF encoding is kept
+because unbounded extrapolation on a deliberately project-disjoint split is a defect either
+way — after it, no encoded test value falls outside the encoded training range — not
+because it is a proven fix.
+
+### A bug worth recording
+
+The first attempt at the LambdaRank co-model scored 0.209 worst-half, against 0.555 for the
+network, and the blend gave it weight 0.00. The cause was mine: `lambdarank_truncation_level`
+set to the metric's own cutoff of 20, with the whole training set as a single group, so
+gradients flowed for only the top 20 rows of a ~2000-row list. Putting the truncation in the
+searched grid fixed it — 0.540 at truncation 2000, and the search correctly rejects 20.
+The metric's evaluation cutoff is not the right training truncation.
+
+## 7. What the shipped solution scores
+
+One full run (`python3 solution.py`, 445 s, CPU):
 
 ```
-region-disjoint folds : 7 of 10 regions usable
-  expected-gain head  : worst-half 0.6102   (mean 0.7498)
-  listwise head       : worst-half 0.6041   (mean 0.7070)
-  head mixture        : 0.50 / 0.50, chosen from 3 weights within 0.005 of the best
-validation NDCG@20    : 0.6334   (worst half of the region-disjoint folds)
+  listnet head       : worst-half 0.5550   (mean 0.6972)
+  lambdarank co-model: worst-half 0.5403   (mean 0.7141)
+  blend              : w(neural)=0.80 / w(tree)=0.20
+validation NDCG@20   : 0.5900   (worst half of the region-disjoint folds)
 ```
 
-For reference on the same folds: `solution_1`'s HGB+RF scores 0.600 worst-half and took
-0.54 on the real hidden set. So this is a real gain on the pessimistic criterion, not a
-better number on a more forgiving one — but see §2 about how noisy a single 586-row draw is.
+Two runs produced byte-identical submissions (md5 `fc5e69f3327e7e397e12e73931703883`),
+586 rows in test order, all finite, 538 distinct scores.
 
-The run produced 586 rows in test order, all finite, no duplicate ids, and finished in
-14 minutes — well inside the hour.
-
-## 7. Determinism, checked rather than asserted
-
-Two independent runs of the same plan, in separate working directories:
-
-```
-$ md5sum det_a/working/submission.csv det_b/working/submission.csv
-26796a4032c392acdf23d22da38c752c  det_a/working/submission.csv
-26796a4032c392acdf23d22da38c752c  det_b/working/submission.csv
-```
-
-Byte-identical, `diff` clean. The only `time.time()` calls left in the script report the
-elapsed runtime at the end; nothing branches on them.
+Treat 0.5900 as a proxy that has already been wrong once: it said 0.6334 for the version
+that scored 0.27. It is built from same-project rows and cannot see the covariate shift
+(adversarial AUC 0.968). The reason to expect better than 0.27 is the §5.3-compliant hedge
+across two families plus the fixed co-model, not the validation number.
 
 ## 8. Running it
 
@@ -210,5 +247,5 @@ python3 solution.py
 No arguments. `ERIS_DATA_DIR` and `ERIS_OUTPUT` exist only to relocate the two paths for
 local testing; both default to the layout above.
 
-Requires numpy, pandas, scipy, scikit-learn and torch — all present in the Kaggle image
-(guidebook §3.1). Runs on CPU by design; see the DETERMINISM section of the script.
+Requires numpy, pandas, scipy, scikit-learn, lightgbm and torch — all present in the Kaggle
+image (guidebook §3.1).
