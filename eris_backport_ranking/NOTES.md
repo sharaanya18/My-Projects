@@ -115,8 +115,12 @@ from an offline search.
   search.
 * §3.5 safeguard present: a valid submission after 9s, a 3000s deadline that falls through to
   a fallback fixed by grid position, and a plan sized at ~7 minutes so the guard cannot fire.
-* §3.6 honoured: CUDA when present, with cuDNN determinism and a fixed cuBLAS workspace;
-  identical hyperparameters, seeds and fit counts on either device.
+* §3.6: the device is pinned to CPU, deliberately. §3.6 states what hardware the run gets
+  and says to plan the time budget around it; it does not require the GPU. Pinning matters
+  because the free CSV check (§3.7) is only a useful preview of the paid script run if both
+  produce the same file — CPU and CUDA are each internally reproducible but do not agree bit
+  for bit, and with only the top 20 of 586 rows counted a small numerical difference can
+  move the ranking. The plan finishes in ~7 minutes on one CPU thread, far inside budget.
 * Threads and `PYTHONHASHSEED` pinned before the numeric libraries load; every model seeded;
   `torch.use_deterministic_algorithms(True)` without `warn_only`; LightGBM with
   `deterministic=True`, `force_row_wise=True`, `n_jobs=1`.
