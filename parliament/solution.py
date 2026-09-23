@@ -23,24 +23,20 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import normalize
 from sklearn.decomposition import TruncatedSVD
+from joblib import Parallel, delayed
 
 SEED = 0
 K = 6            # number of recurring groups (max n_groups on any board)
-N_REFINE = 3     # classifier-based refinement rounds of the global labels
+N_REFINE = 20    # classifier-based refinement rounds of the global labels
+MOMENTUM = 0.5   # averaging of cross-fitted probabilities across rounds
+SELF_TRAIN = 0   # rounds of transductive self-training on test texts
+N_FOLDS = 4
+N_JOBS = 4
 
 
 def clean(t):
     t = t.replace("[PARTEI]", " PARTEITOKEN ").replace("[NAME]", " NAMETOKEN ")
     return t
-
-
-def make_vectorizers():
-    word = TfidfVectorizer(preprocessor=lambda s: clean(s).lower(), ngram_range=(1, 2),
-                           min_df=3, max_df=0.5, sublinear_tf=True, max_features=300000)
-    char = TfidfVectorizer(preprocessor=lambda s: clean(s).lower(), analyzer="char_wb",
-                           ngram_range=(3, 5), min_df=5, max_df=0.5, sublinear_tf=True,
-                           max_features=300000)
-    return word, char
 
 
 def board_assign(score):
@@ -91,9 +87,13 @@ def discover_global_labels(boards, X):
 
 
 def fit_clf(Xs, y):
-    clf = LogisticRegression(C=10.0, max_iter=2000)
+    clf = LogisticRegression(C=10.0, max_iter=300, tol=1e-3)
     clf.fit(Xs, y)
     return clf
+
+
+def _fit_predict(X, y, tr, te):
+    return fit_clf(X[tr], y[tr]).predict_log_proba(X[te])
 
 
 def solve_board(logp, k):
@@ -118,6 +118,15 @@ def solve_board(logp, k):
 
 
 class Model:
+    """Fit on training boards; predict partitions of unseen boards."""
+
+    def __init__(self, n_refine=N_REFINE, momentum=MOMENTUM, self_train=SELF_TRAIN):
+        self.n_refine, self.momentum, self.self_train = n_refine, momentum, self_train
+
+    def _vec(self):
+        return TfidfVectorizer(preprocessor=lambda s: clean(s).lower(), min_df=5, max_df=0.5,
+                               sublinear_tf=True, max_features=40000)
+
     def fit(self, train):
         speeches, boards, off = [], [], 0
         for s, g in zip(train.speeches, train.groups):
@@ -125,54 +134,52 @@ class Model:
             speeches += sp
             boards.append((np.arange(off, off + len(sp)), gl))
             off += len(sp)
-        self.wv, self.cv = make_vectorizers()
-        Xw = self.wv.fit_transform(speeches)
-        Xc = self.cv.fit_transform(speeches)
-        X = normalize(self._stack(Xw, Xc))
-        # dense LSA space for discovery
-        self.svd = TruncatedSVD(300, random_state=SEED)
-        Z = normalize(self.svd.fit_transform(X))
+        self.vec = self._vec()
+        X = self.vec.fit_transform(speeches)
+        # 1. initial global groups: constrained clustering of group documents in LSA space
+        Z = normalize(TruncatedSVD(300, random_state=SEED).fit_transform(X))
         gassign, gmembers, bidx = discover_global_labels(boards, Z)
-        y = np.empty(len(speeches), int)
-        for gi, m in enumerate(gmembers):
-            y[m] = gassign[gi]
-        # refinement: cross-fitted classifier scores -> re-assign board groups
-        nb = len(boards)
-        fold = np.arange(nb) % 5
-        for r in range(N_REFINE):
-            P = np.zeros((len(speeches), K))
-            for f in range(5):
-                trb = np.concatenate([boards[b][0] for b in range(nb) if fold[b] != f])
-                teb = np.concatenate([boards[b][0] for b in range(nb) if fold[b] == f])
-                clf = fit_clf(X[trb], y[trb])
-                P[teb] = clf.predict_log_proba(X[teb])
-            changed = 0
-            for b in range(nb):
-                gi = bidx[b]
-                S = np.vstack([P[gmembers[g]].sum(0) for g in gi])
-                na = board_assign(S)
-                changed += (na != gassign[gi]).sum()
-                gassign[gi] = na
+
+        def labels():
+            y = np.empty(len(speeches), int)
             for gi, m in enumerate(gmembers):
                 y[m] = gassign[gi]
-            print(f"refine {r}: changed {changed} group labels", file=sys.stderr)
-        self.clf = fit_clf(X, y)
+            return y
+
+        # 2. refinement: cross-fitted classifier log-probs (averaged with momentum)
+        #    re-assign each board's groups to distinct global groups
+        nb = len(boards)
+        fold = np.arange(nb) % N_FOLDS
+        sfold = np.empty(len(speeches), int)
+        for b in range(nb):
+            sfold[boards[b][0]] = fold[b]
+        Pa = None
+        for r in range(self.n_refine):
+            y = labels()
+            res = Parallel(N_JOBS)(delayed(_fit_predict)(X, y, sfold != f, sfold == f)
+                                   for f in range(N_FOLDS))
+            P = np.zeros((len(speeches), K))
+            for f, p in enumerate(res):
+                P[sfold == f] = p
+            Pa = P if Pa is None else self.momentum * Pa + (1 - self.momentum) * P
+            for b in range(nb):
+                gi = bidx[b]
+                gassign[gi] = board_assign(np.vstack([Pa[gmembers[g]].sum(0) for g in gi]))
+        self.X, self.y = X, labels()
+        self.clf = fit_clf(X, self.y)
         return self
 
-    def _stack(self, Xw, Xc):
-        from scipy.sparse import hstack
-        return hstack([normalize(Xw), normalize(Xc)]).tocsr()
-
     def predict(self, test):
-        preds = []
-        for s, k in zip(test.speeches, test.n_groups):
-            sp = json.loads(s)
-            X = normalize(self._stack(self.wv.transform(sp), self.cv.transform(sp)))
-            lp = self.clf.predict_log_proba(X)
-            lab = solve_board(lp, int(k))
-            _, lab = np.unique(lab, return_inverse=True)
-            preds.append(lab.tolist())
-        return preds
+        sps = [json.loads(s) for s in test.speeches]
+        ks = [int(k) for k in test.n_groups]
+        Xt = [self.vec.transform(sp) for sp in sps]
+        clf = self.clf
+        for it in range(self.self_train + 1):
+            labs = [solve_board(clf.predict_log_proba(x), k) for x, k in zip(Xt, ks)]
+            if it < self.self_train:
+                # transductive self-training: add pseudo-labelled test speeches (texts only)
+                clf = fit_clf(vstack([self.X] + Xt), np.concatenate([self.y] + labs))
+        return [np.unique(l, return_inverse=True)[1].tolist() for l in labs]
 
 
 def main():
