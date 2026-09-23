@@ -9,19 +9,22 @@ test-set adaptation; each test board is predicted on its own).
   2. Refine the global labels by self-consistency: a cross-fitted speech classifier
      scores every board group and the board's groups are re-assigned (Hungarian),
      iterated with momentum on the probabilities.
-  3. Hyperparameter search (regularisation, n-gram range) by cross-fitted board ARI.
-  4. Final classifier; each test board picks exactly n_groups global groups and
+  3. Hyperparameter search (regularisation, n-gram range) by cross-fitted board ARI;
+     a second model (MLP on low-rank text features + writing-style statistics) is
+     ensembled with the TF-IDF logistic regression, its weight chosen the same way.
+  4. Final models; each test board picks exactly n_groups global groups and
      assigns every speech (each chosen group used >= 1 time) by max log-probability.
 Usage: python3 solution.py <public_dir> <submission_out>
 """
-import sys, json, time, itertools
+import sys, json, re, time, itertools
 from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.optimize import linear_sum_assignment
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import normalize
+from sklearn.preprocessing import normalize, StandardScaler
+from sklearn.neural_network import MLPClassifier
 from sklearn.decomposition import TruncatedSVD
 from joblib import Parallel, delayed
 
@@ -31,6 +34,7 @@ N_REFINE = 20    # classifier-based refinement rounds of the global labels
 MOMENTUM = 0.5   # averaging of cross-fitted probabilities across rounds
 C_GRID = (3.0, 10.0, 30.0)
 NGRAM_GRID = ((1, 1), (1, 2))
+W_GRID = (1.0, 0.8, 0.7, 0.6, 0.5)  # weight of the TF-IDF model in the ensemble
 TIME_BUDGET = 3000  # seconds; stop refinement/search and predict after this
 T0 = time.time()
 N_FOLDS = 4
@@ -97,6 +101,42 @@ def fit_clf(Xs, y, C=10.0):
 
 def _fit_predict(X, y, tr, te, C):
     return fit_clf(X[tr], y[tr], C).predict_log_proba(X[te])
+
+
+def style_features(t):
+    """Writing-style statistics of a speech (independent of TF-IDF)."""
+    w = re.findall(r"\w+", t)
+    sents = [x for x in re.split(r"[.!?]+", t) if x.strip()]
+    ns, nw = max(len(sents), 1), max(len(w), 1)
+    return [len(t), len(w) / ns, np.mean([len(x) for x in w]) if w else 0.0,
+            t.count("!") / ns, t.count("?") / ns, t.count("[PARTEI]"), t.count("[NAME]"),
+            t.count(",") / nw, t.count("\u201e") + t.count('"'),
+            sum(c.isdigit() for c in t) / max(len(t), 1),
+            len(set(x.lower() for x in w)) / nw, t.count(":"), t.count("\u2013") + t.count(" - ")]
+
+
+class DenseModel:
+    """MLP on a low-rank text representation plus style statistics."""
+
+    def fit(self, X, texts, y, seed=SEED):
+        self.svd = TruncatedSVD(256, random_state=seed).fit(X)
+        self.sc = StandardScaler().fit(self._raw(X, texts))
+        self.mlp = MLPClassifier((256,), alpha=1.0, early_stopping=True, max_iter=200,
+                                 random_state=seed).fit(self.sc.transform(self._raw(X, texts)), y)
+        return self
+
+    def _raw(self, X, texts):
+        S = np.log1p(np.abs(np.array([style_features(t) for t in texts], float)))
+        return np.hstack([self.svd.transform(X), S])
+
+    def predict_log_proba(self, X, texts):
+        return np.log(self.mlp.predict_proba(self.sc.transform(self._raw(X, texts))) + 1e-9)
+
+
+def _fit_predict_dense(X, texts, y, tr, te):
+    tt = [texts[i] for i in np.where(tr)[0]]
+    ts = [texts[i] for i in np.where(te)[0]]
+    return DenseModel().fit(X[tr], tt, y[tr]).predict_log_proba(X[te], ts)
 
 
 def ari(a, b):
@@ -190,27 +230,48 @@ class Model:
             gassign = new
         y = labels()
         # 3. hyperparameter search by cross-fitted board ARI
-        best, best_score = (NGRAM_GRID[-1], 10.0), -1
+        def board_score(P):
+            return np.mean([ari(lab, solve_board(P[idx], len(np.unique(lab))))
+                            for idx, lab in boards])
+
+        best, best_score, bestP = (NGRAM_GRID[-1], 10.0), -1, None
         for ng in NGRAM_GRID:
             for C in C_GRID:
-                if time.time() - T0 > TIME_BUDGET * 0.85:
+                if time.time() - T0 > TIME_BUDGET * 0.75:
                     break
                 P = self._cross_fit(Xs[ng], y, sfold, C)
-                score = np.mean([ari(lab, solve_board(P[idx], len(np.unique(lab))))
-                                 for idx, lab in boards])
+                score = board_score(P)
                 self.log(f"search ngram={ng} C={C}: board ARI {score:.4f}")
                 if score > best_score:
-                    best, best_score = (ng, C), score
+                    best, best_score, bestP = (ng, C), score, P
         self.log(f"selected ngram={best[0]} C={best[1]}")
+        # ensemble weight of the dense (MLP) model, also chosen by cross-fitted board ARI
+        self.w = 1.0
+        if time.time() - T0 < TIME_BUDGET * 0.85:
+            res = Parallel(N_JOBS)(delayed(_fit_predict_dense)(X, speeches, y, sfold != f, sfold == f)
+                                   for f in range(N_FOLDS))
+            D = np.zeros((len(speeches), K))
+            for f, p in enumerate(res):
+                D[sfold == f] = p
+            ws = {w: board_score(w * bestP + (1 - w) * D) if w < 1 else best_score for w in W_GRID}
+            self.log("ensemble weights: " + ", ".join(f"{w}: {v:.4f}" for w, v in ws.items()))
+            self.w = max(ws, key=ws.get)
         self.vec = vecs[best[0]]
         self.clf = fit_clf(Xs[best[0]], y, best[1])
+        self.dense = DenseModel().fit(X, speeches, y) if self.w < 1 else None
+        self.vec_dense = vecs[NGRAM_GRID[-1]]
+        self.log(f"selected TF-IDF weight {self.w}")
         return self
 
     def predict(self, test):
         preds = []
         for s, k in zip(test.speeches, test.n_groups):
             # each board is predicted on its own (no information shared across test boards)
-            lp = self.clf.predict_log_proba(self.vec.transform(json.loads(s)))
+            texts = json.loads(s)
+            lp = self.clf.predict_log_proba(self.vec.transform(texts))
+            if self.dense is not None:
+                lp = self.w * lp + (1 - self.w) * self.dense.predict_log_proba(
+                    self.vec_dense.transform(texts), texts)
             lab = solve_board(lp, int(k))
             preds.append(np.unique(lab, return_inverse=True)[1].tolist())
         return preds
