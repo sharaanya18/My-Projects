@@ -162,6 +162,8 @@ class Model:
         return P
 
     def fit(self, train):
+        global K
+        K = int(train.n_groups.max())
         speeches, boards, off = [], [], 0
         for s, g in zip(train.speeches, train.groups):
             sp, gl = json.loads(s), np.array(json.loads(g))
