@@ -1,24 +1,24 @@
 """Parliamentary group partitioning of shuffled debate boards.
 
-Pipeline (uses only the supplied speech texts and anonymous training partitions):
-  1. Discover the recurring groups: every (board, group) in train becomes a
-     "group document"; these are clustered into K global clusters with the
-     constraint that groups from the same board map to distinct clusters
-     (Hungarian assignment per board, iterated like constrained k-means,
-     then refined with a cross-fitted classifier).
-  2. Train a TF-IDF + logistic-regression speech classifier on the discovered
-     global labels.
-  3. For each test board, pick exactly n_groups global clusters and assign
-     every speech to one of them (each chosen cluster used at least once),
-     maximising the summed log-probability (exact, via Hungarian).
+Everything is learned inside this script from train.csv (no external data, no
+test-set adaptation; each test board is predicted on its own).
+  1. Discover the recurring groups: every (board, group) of train becomes a group
+     document; these are clustered into K global groups with the constraint that the
+     groups of one board go to distinct global groups (constrained k-means with a
+     Hungarian assignment per board).
+  2. Refine the global labels by self-consistency: a cross-fitted speech classifier
+     scores every board group and the board's groups are re-assigned (Hungarian),
+     iterated with momentum on the probabilities.
+  3. Hyperparameter search (regularisation, n-gram range) by cross-fitted board ARI.
+  4. Final classifier; each test board picks exactly n_groups global groups and
+     assigns every speech (each chosen group used >= 1 time) by max log-probability.
 Usage: python3 solution.py <public_dir> <submission_out>
 """
-import sys, json, re, itertools
+import sys, json, time, itertools
 from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.optimize import linear_sum_assignment
-from scipy.sparse import vstack
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import normalize
@@ -29,7 +29,10 @@ SEED = 0
 K = 6            # number of recurring groups (max n_groups on any board)
 N_REFINE = 20    # classifier-based refinement rounds of the global labels
 MOMENTUM = 0.5   # averaging of cross-fitted probabilities across rounds
-SELF_TRAIN = 0   # rounds of transductive self-training on test texts
+C_GRID = (3.0, 10.0, 30.0)
+NGRAM_GRID = ((1, 1), (1, 2))
+TIME_BUDGET = 3000  # seconds; stop refinement/search and predict after this
+T0 = time.time()
 N_FOLDS = 4
 N_JOBS = 4
 
@@ -48,8 +51,8 @@ def board_assign(score):
 
 
 def discover_global_labels(boards, X):
-    """boards: list of (speech_idx_array, local_labels). X: speech feature matrix (normalized).
-    Returns a global label per training speech."""
+    """boards: list of (speech_idx_array, local_labels); X: speech vectors (normalized).
+    Returns (global label per board group, member speech indices per group, group ids per board)."""
     # group documents = mean of member speech vectors
     gdocs, gboard, gmembers = [], [], []
     for b, (idx, lab) in enumerate(boards):
@@ -86,14 +89,19 @@ def discover_global_labels(boards, X):
     return best, gmembers, bidx
 
 
-def fit_clf(Xs, y):
-    clf = LogisticRegression(C=10.0, max_iter=300, tol=1e-3)
+def fit_clf(Xs, y, C=10.0):
+    clf = LogisticRegression(C=C, max_iter=300, tol=1e-3)
     clf.fit(Xs, y)
     return clf
 
 
-def _fit_predict(X, y, tr, te):
-    return fit_clf(X[tr], y[tr]).predict_log_proba(X[te])
+def _fit_predict(X, y, tr, te, C):
+    return fit_clf(X[tr], y[tr], C).predict_log_proba(X[te])
+
+
+def ari(a, b):
+    from sklearn.metrics import adjusted_rand_score
+    return adjusted_rand_score(a, b)
 
 
 def solve_board(logp, k):
@@ -120,12 +128,26 @@ def solve_board(logp, k):
 class Model:
     """Fit on training boards; predict partitions of unseen boards."""
 
-    def __init__(self, n_refine=N_REFINE, momentum=MOMENTUM, self_train=SELF_TRAIN):
-        self.n_refine, self.momentum, self.self_train = n_refine, momentum, self_train
+    def __init__(self, n_refine=N_REFINE, momentum=MOMENTUM, verbose=True):
+        self.n_refine, self.momentum, self.verbose = n_refine, momentum, verbose
 
-    def _vec(self):
-        return TfidfVectorizer(preprocessor=lambda s: clean(s).lower(), min_df=5, max_df=0.5,
-                               sublinear_tf=True, max_features=40000)
+    def log(self, *a):
+        if self.verbose:
+            print(f"[{time.time() - T0:6.0f}s]", *a, file=sys.stderr, flush=True)
+
+    @staticmethod
+    def _vec(ngram):
+        return TfidfVectorizer(preprocessor=lambda s: clean(s).lower(), ngram_range=ngram,
+                               min_df=5, max_df=0.5, sublinear_tf=True,
+                               max_features=40000 * ngram[1])
+
+    def _cross_fit(self, X, y, sfold, C):
+        res = Parallel(N_JOBS)(delayed(_fit_predict)(X, y, sfold != f, sfold == f, C)
+                               for f in range(N_FOLDS))
+        P = np.zeros((X.shape[0], K))
+        for f, p in enumerate(res):
+            P[sfold == f] = p
+        return P
 
     def fit(self, train):
         speeches, boards, off = [], [], 0
@@ -134,10 +156,11 @@ class Model:
             speeches += sp
             boards.append((np.arange(off, off + len(sp)), gl))
             off += len(sp)
-        self.vec = self._vec()
-        X = self.vec.fit_transform(speeches)
+        vecs = {ng: self._vec(ng) for ng in NGRAM_GRID}
+        Xs = {ng: v.fit_transform(speeches) for ng, v in vecs.items()}
+        X = Xs[NGRAM_GRID[-1]]
         # 1. initial global groups: constrained clustering of group documents in LSA space
-        Z = normalize(TruncatedSVD(300, random_state=SEED).fit_transform(X))
+        Z = normalize(TruncatedSVD(300, random_state=SEED).fit_transform(Xs[NGRAM_GRID[0]]))
         gassign, gmembers, bidx = discover_global_labels(boards, Z)
 
         def labels():
@@ -146,40 +169,51 @@ class Model:
                 y[m] = gassign[gi]
             return y
 
-        # 2. refinement: cross-fitted classifier log-probs (averaged with momentum)
-        #    re-assign each board's groups to distinct global groups
         nb = len(boards)
         fold = np.arange(nb) % N_FOLDS
         sfold = np.empty(len(speeches), int)
         for b in range(nb):
             sfold[boards[b][0]] = fold[b]
+        # 2. refinement of the global labels
         Pa = None
         for r in range(self.n_refine):
-            y = labels()
-            res = Parallel(N_JOBS)(delayed(_fit_predict)(X, y, sfold != f, sfold == f)
-                                   for f in range(N_FOLDS))
-            P = np.zeros((len(speeches), K))
-            for f, p in enumerate(res):
-                P[sfold == f] = p
+            if time.time() - T0 > TIME_BUDGET * 0.6:
+                self.log("time budget: stopping refinement")
+                break
+            P = self._cross_fit(X, labels(), sfold, 10.0)
             Pa = P if Pa is None else self.momentum * Pa + (1 - self.momentum) * P
+            new = gassign.copy()
             for b in range(nb):
                 gi = bidx[b]
-                gassign[gi] = board_assign(np.vstack([Pa[gmembers[g]].sum(0) for g in gi]))
-        self.X, self.y = X, labels()
-        self.clf = fit_clf(X, self.y)
+                new[gi] = board_assign(np.vstack([Pa[gmembers[g]].sum(0) for g in gi]))
+            self.log(f"refine {r}: {(new != gassign).sum()} group labels changed")
+            gassign = new
+        y = labels()
+        # 3. hyperparameter search by cross-fitted board ARI
+        best, best_score = (NGRAM_GRID[-1], 10.0), -1
+        for ng in NGRAM_GRID:
+            for C in C_GRID:
+                if time.time() - T0 > TIME_BUDGET * 0.85:
+                    break
+                P = self._cross_fit(Xs[ng], y, sfold, C)
+                score = np.mean([ari(lab, solve_board(P[idx], len(np.unique(lab))))
+                                 for idx, lab in boards])
+                self.log(f"search ngram={ng} C={C}: board ARI {score:.4f}")
+                if score > best_score:
+                    best, best_score = (ng, C), score
+        self.log(f"selected ngram={best[0]} C={best[1]}")
+        self.vec = vecs[best[0]]
+        self.clf = fit_clf(Xs[best[0]], y, best[1])
         return self
 
     def predict(self, test):
-        sps = [json.loads(s) for s in test.speeches]
-        ks = [int(k) for k in test.n_groups]
-        Xt = [self.vec.transform(sp) for sp in sps]
-        clf = self.clf
-        for it in range(self.self_train + 1):
-            labs = [solve_board(clf.predict_log_proba(x), k) for x, k in zip(Xt, ks)]
-            if it < self.self_train:
-                # transductive self-training: add pseudo-labelled test speeches (texts only)
-                clf = fit_clf(vstack([self.X] + Xt), np.concatenate([self.y] + labs))
-        return [np.unique(l, return_inverse=True)[1].tolist() for l in labs]
+        preds = []
+        for s, k in zip(test.speeches, test.n_groups):
+            # each board is predicted on its own (no information shared across test boards)
+            lp = self.clf.predict_log_proba(self.vec.transform(json.loads(s)))
+            lab = solve_board(lp, int(k))
+            preds.append(np.unique(lab, return_inverse=True)[1].tolist())
+        return preds
 
 
 def main():
@@ -191,6 +225,8 @@ def main():
     preds = model.predict(test)
     sub = pd.DataFrame({"item_id": test.item_id, "groups": [json.dumps(p) for p in preds]})
     submission_out.parent.mkdir(parents=True, exist_ok=True)
+    assert len(sub) == len(test) and all(
+        len(p) == len(json.loads(s)) for p, s in zip(preds, test.speeches))
     sub.to_csv(submission_out, index=False)
 
 
