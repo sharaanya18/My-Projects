@@ -1,21 +1,3 @@
-"""Parliamentary group partitioning of shuffled debate boards.
-
-Everything is learned inside this script from train.csv (no external data, no
-test-set adaptation; each test board is predicted on its own).
-  1. Discover the recurring groups: every (board, group) of train becomes a group
-     document; these are clustered into K global groups with the constraint that the
-     groups of one board go to distinct global groups (constrained k-means with a
-     Hungarian assignment per board).
-  2. Refine the global labels by self-consistency: a cross-fitted speech classifier
-     scores every board group and the board's groups are re-assigned (Hungarian),
-     iterated with momentum on the probabilities.
-  3. Hyperparameter search (regularisation, n-gram range) by cross-fitted board ARI;
-     a second model (MLP on low-rank text features + writing-style statistics) is
-     ensembled with the TF-IDF logistic regression, its weight chosen the same way.
-  4. Final models; each test board picks exactly n_groups global groups and
-     assigns every speech (each chosen group used >= 1 time) by max log-probability.
-Usage: python3 solution.py <public_dir> <submission_out>
-"""
 import sys, json, re, time, itertools
 from pathlib import Path
 import numpy as np
@@ -29,13 +11,13 @@ from sklearn.decomposition import TruncatedSVD
 from joblib import Parallel, delayed
 
 SEED = 0
-K = 6            # number of recurring groups (max n_groups on any board)
-N_REFINE = 20    # classifier-based refinement rounds of the global labels
-MOMENTUM = 0.5   # averaging of cross-fitted probabilities across rounds
+K = 6
+N_REFINE = 20
+MOMENTUM = 0.5
 C_GRID = (3.0, 10.0, 30.0)
 NGRAM_GRID = ((1, 1), (1, 2))
-W_GRID = (1.0, 0.8, 0.7, 0.6, 0.5)  # weight of the TF-IDF model in the ensemble
-TIME_BUDGET = 3000  # seconds; stop refinement/search and predict after this
+W_GRID = (1.0, 0.8, 0.7, 0.6, 0.5)
+TIME_BUDGET = 3000
 T0 = time.time()
 N_FOLDS = 4
 N_JOBS = 4
@@ -47,7 +29,6 @@ def clean(t):
 
 
 def board_assign(score):
-    """score: (g, K) similarity of each board-group to each cluster -> distinct clusters."""
     r, c = linear_sum_assignment(-score)
     out = np.empty(score.shape[0], int)
     out[r] = c
@@ -55,9 +36,6 @@ def board_assign(score):
 
 
 def discover_global_labels(boards, X):
-    """boards: list of (speech_idx_array, local_labels); X: speech vectors (normalized).
-    Returns (global label per board group, member speech indices per group, group ids per board)."""
-    # group documents = mean of member speech vectors
     gdocs, gboard, gmembers = [], [], []
     for b, (idx, lab) in enumerate(boards):
         for l in np.unique(lab):
@@ -72,7 +50,7 @@ def discover_global_labels(boards, X):
     best, best_obj = None, -np.inf
     rng = np.random.RandomState(SEED)
     for restart in range(10):
-        # init from a random board with K groups
+
         full = [b for b in range(len(boards)) if len(bidx[b]) == K]
         b0 = full[rng.randint(len(full))]
         C = G[bidx[b0]].copy()
@@ -104,7 +82,6 @@ def _fit_predict(X, y, tr, te, C):
 
 
 def style_features(t):
-    """Writing-style statistics of a speech (independent of TF-IDF)."""
     w = re.findall(r"\w+", t)
     sents = [x for x in re.split(r"[.!?]+", t) if x.strip()]
     ns, nw = max(len(sents), 1), max(len(w), 1)
@@ -116,8 +93,6 @@ def style_features(t):
 
 
 class DenseModel:
-    """MLP on a low-rank text representation plus style statistics."""
-
     def fit(self, X, texts, y, seed=SEED):
         self.svd = TruncatedSVD(256, random_state=seed).fit(X)
         self.sc = StandardScaler().fit(self._raw(X, texts))
@@ -145,14 +120,13 @@ def ari(a, b):
 
 
 def solve_board(logp, k):
-    """logp: (n, K) log-probs. choose k clusters, each used >=1, maximise total."""
     n, Kc = logp.shape
     k = min(k, n, Kc)
     best, best_val = None, -np.inf
     for S in itertools.combinations(range(Kc), k):
         S = list(S)
         L = logp[:, S]
-        # columns: k mandatory slots + (n-k) free slots (best of S)
+
         free = L.max(1, keepdims=True)
         M = np.hstack([L, np.repeat(free, n - k, axis=1)])
         r, c = linear_sum_assignment(-M)
@@ -166,8 +140,6 @@ def solve_board(logp, k):
 
 
 class Model:
-    """Fit on training boards; predict partitions of unseen boards."""
-
     def __init__(self, n_refine=N_REFINE, momentum=MOMENTUM, verbose=True):
         self.n_refine, self.momentum, self.verbose = n_refine, momentum, verbose
 
@@ -199,7 +171,7 @@ class Model:
         vecs = {ng: self._vec(ng) for ng in NGRAM_GRID}
         Xs = {ng: v.fit_transform(speeches) for ng, v in vecs.items()}
         X = Xs[NGRAM_GRID[-1]]
-        # 1. initial global groups: constrained clustering of group documents in LSA space
+
         Z = normalize(TruncatedSVD(300, random_state=SEED).fit_transform(Xs[NGRAM_GRID[0]]))
         gassign, gmembers, bidx = discover_global_labels(boards, Z)
 
@@ -214,7 +186,7 @@ class Model:
         sfold = np.empty(len(speeches), int)
         for b in range(nb):
             sfold[boards[b][0]] = fold[b]
-        # 2. refinement of the global labels
+
         Pa = None
         for r in range(self.n_refine):
             if time.time() - T0 > TIME_BUDGET * 0.6:
@@ -229,7 +201,7 @@ class Model:
             self.log(f"refine {r}: {(new != gassign).sum()} group labels changed")
             gassign = new
         y = labels()
-        # 3. hyperparameter search by cross-fitted board ARI
+
         def board_score(P):
             return np.mean([ari(lab, solve_board(P[idx], len(np.unique(lab))))
                             for idx, lab in boards])
@@ -245,7 +217,7 @@ class Model:
                 if score > best_score:
                     best, best_score, bestP = (ng, C), score, P
         self.log(f"selected ngram={best[0]} C={best[1]}")
-        # ensemble weight of the dense (MLP) model, also chosen by cross-fitted board ARI
+
         self.w = 1.0
         if time.time() - T0 < TIME_BUDGET * 0.85:
             res = Parallel(N_JOBS)(delayed(_fit_predict_dense)(X, speeches, y, sfold != f, sfold == f)
@@ -266,7 +238,7 @@ class Model:
     def predict(self, test):
         preds = []
         for s, k in zip(test.speeches, test.n_groups):
-            # each board is predicted on its own (no information shared across test boards)
+
             texts = json.loads(s)
             lp = self.clf.predict_log_proba(self.vec.transform(texts))
             if self.dense is not None:
