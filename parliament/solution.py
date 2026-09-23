@@ -17,7 +17,6 @@ MOMENTUM = 0.5
 C_GRID = (3.0, 10.0, 30.0)
 NGRAM_GRID = ((1, 1), (1, 2))
 W_GRID = (1.0, 0.8, 0.7, 0.6, 0.5)
-TIME_BUDGET = 3000
 T0 = time.time()
 N_FOLDS = 4
 N_JOBS = 4
@@ -191,9 +190,6 @@ class Model:
 
         Pa = None
         for r in range(self.n_refine):
-            if time.time() - T0 > TIME_BUDGET * 0.6:
-                self.log("time budget: stopping refinement")
-                break
             P = self._cross_fit(X, labels(), sfold, 10.0)
             Pa = P if Pa is None else self.momentum * Pa + (1 - self.momentum) * P
             new = gassign.copy()
@@ -211,8 +207,6 @@ class Model:
         best, best_score, bestP = (NGRAM_GRID[-1], 10.0), -1, None
         for ng in NGRAM_GRID:
             for C in C_GRID:
-                if time.time() - T0 > TIME_BUDGET * 0.75:
-                    break
                 P = self._cross_fit(Xs[ng], y, sfold, C)
                 score = board_score(P)
                 self.log(f"search ngram={ng} C={C}: board ARI {score:.4f}")
@@ -220,16 +214,14 @@ class Model:
                     best, best_score, bestP = (ng, C), score, P
         self.log(f"selected ngram={best[0]} C={best[1]}")
 
-        self.w = 1.0
-        if time.time() - T0 < TIME_BUDGET * 0.85:
-            res = Parallel(N_JOBS)(delayed(_fit_predict_dense)(X, speeches, y, sfold != f, sfold == f)
-                                   for f in range(N_FOLDS))
-            D = np.zeros((len(speeches), K))
-            for f, p in enumerate(res):
-                D[sfold == f] = p
-            ws = {w: board_score(w * bestP + (1 - w) * D) if w < 1 else best_score for w in W_GRID}
-            self.log("ensemble weights: " + ", ".join(f"{w}: {v:.4f}" for w, v in ws.items()))
-            self.w = max(ws, key=ws.get)
+        res = Parallel(N_JOBS)(delayed(_fit_predict_dense)(X, speeches, y, sfold != f, sfold == f)
+                               for f in range(N_FOLDS))
+        D = np.zeros((len(speeches), K))
+        for f, p in enumerate(res):
+            D[sfold == f] = p
+        ws = {w: board_score(w * bestP + (1 - w) * D) if w < 1 else best_score for w in W_GRID}
+        self.log("ensemble weights: " + ", ".join(f"{w}: {v:.4f}" for w, v in ws.items()))
+        self.w = max(ws, key=ws.get)
         self.vec = vecs[best[0]]
         self.clf = fit_clf(Xs[best[0]], y, best[1])
         self.dense = DenseModel().fit(X, speeches, y) if self.w < 1 else None
