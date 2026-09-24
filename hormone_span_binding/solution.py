@@ -9,8 +9,8 @@ from scipy.optimize import linear_sum_assignment
 from sklearn.model_selection import GroupKFold
 
 T0 = time.time()
-TRAIN_DEADLINE = 40 * 60
-MAX_ROUNDS = 16
+N_ROUNDS = 8
+N_WORKERS = 4
 N_FOLDS = 5
 ROLE_GATE = 0.98
 MAXLEN = 96
@@ -270,14 +270,16 @@ def score_fn(pred, true):
     raw = float(np.mean([p == t for P, T in zip(pred, true) for p, t in zip(P, T)]))
     return max(0.0, min(1.0, (raw - 1 / 24) / (1 - 1 / 24))), raw
 
-def write_submission(path, case_ids, seqs):
+def write_submission(path, case_ids, seqs, visibility):
     rows = [json.dumps({'repair_sequence': list(s)}, separators=(',', ':')) for s in seqs]
-    pd.DataFrame({'case_id': case_ids, 'answer_json': rows}).to_csv(path, index=False)
+    pd.DataFrame({'case_id': case_ids, 'answer_json': rows,
+                  'visibility': [visibility[c] for c in case_ids]}).to_csv(path, index=False)
 
-def validate_submission(path, test_ids):
+def validate_submission(path, test_ids, visibility):
     sub = pd.read_csv(path, dtype=str, keep_default_na=False)
-    assert list(sub.columns) == ['case_id', 'answer_json'], sub.columns
-    assert len(sub) == len(test_ids) and sub.case_id.is_unique and set(sub.case_id) == set(test_ids), 'case ids'
+    assert list(sub.columns) == ['case_id', 'answer_json', 'visibility'], sub.columns
+    assert sub.case_id.tolist() == list(test_ids) and sub.case_id.is_unique, 'case ids'
+    assert all(visibility[c] == v for c, v in zip(sub.case_id, sub.visibility)), 'visibility'
     valid = {f'c{i:02d}' for i in range(24)}
     for a in sub.answer_json:
         pairs = json.loads(a, object_pairs_hook=lambda kv: kv)
@@ -320,73 +322,49 @@ def _worker_init():
 
 def _fit_one(task):
     f, r = task
-    t = time.time()
     fd = _FOLDS[f]
     net = train_model(fd['Etr'], fd['vocab'], _CFG, seed=1000 * r + f)
     pv = predict(net, fd['Eva'])
     pt = predict(net, fd['Ete']) if _WANT_TEST else None
-    return f, r, pv, pt, time.time() - t
+    return f, r, pv, pt
 
-def run_cv(folds, cfg, rounds=None, deadline=None, want_test=False, workers=None):
+def run_cv(folds, cfg, rounds=N_ROUNDS, want_test=False, workers=N_WORKERS):
     global _FOLDS, _CFG, _WANT_TEST
     _FOLDS, _CFG, _WANT_TEST = folds, cfg, want_test
     import multiprocessing as mp
-    nf = len(folds); max_r = rounds if rounds is not None else MAX_ROUNDS
-    workers = workers or os.cpu_count() or 1
-    preds = [dict() for _ in folds]; counts = [0] * nf
-    done_r = collections.Counter()
-    te_sum, te_n, history = None, 0, []
-    tasks = [(f, r) for r in range(max_r) for f in range(nf)]
-    t_model, first_logged, next_round = None, False, 0
-    ctx = mp.get_context('fork')
-    with ctx.Pool(workers, initializer=_worker_init) as pool:
-        pending, ti = [], 0
-        while ti < len(tasks) or pending:
-            while ti < len(tasks) and len(pending) < workers:
-                if deadline is not None and t_model is None and ti >= workers:
-                    break
-                if deadline is not None and t_model is not None and time.time() - T0 + t_model > deadline:
-                    log(f'time guard: not starting more models ({ti} started, est. {t_model:.0f}s each)')
-                    tasks = tasks[:ti]; break
-                pending.append(pool.apply_async(_fit_one, (tasks[ti],))); ti += 1
-            if not pending:
-                break
-            while not any(p.ready() for p in pending):
-                time.sleep(0.2)
-            for p in [p for p in pending if p.ready()]:
-                pending.remove(p)
-                f, r, pv, pt, dt = p.get()
-                preds[f][r] = pv; counts[f] += 1; done_r[r] += 1
-                if pt is not None:
-                    te_sum = pt if te_sum is None else te_sum + pt; te_n += 1
-                t_model = dt if t_model is None else max(0.7 * t_model + 0.3 * dt, dt)
-                if not first_logged and deadline is not None:
-                    first_logged = True
-                    left = deadline - (time.time() - T0)
-                    k = min(max_r, int(workers * max(left, 0) // (nf * dt)) + 1)
-                    log(f'first model took {dt:.1f}s ({workers} parallel workers); {left:.0f}s left '
-                        f'-> planning about {k} models per fold ({k * nf} total)')
-            while done_r[next_round] == nf:
-                sc = oof_score(folds, preds, next_round + 1, cfg['topk'])
-                history.append((next_round + 1, sc[0], sc[1], time.time() - T0))
-                log(f'round {next_round + 1}: models/fold={counts} OOF score={sc[0]:.4f} (raw {sc[1]:.4f})')
-                next_round += 1
-    if counts and min(counts) > 0 and len(set(counts)) > 1:
-        sc = oof_score(folds, preds, max_r, cfg['topk'])
-        history.append((min(counts), sc[0], sc[1], time.time() - T0))
-        log(f'final (uneven rounds): models/fold={counts} OOF score={sc[0]:.4f} (raw {sc[1]:.4f})')
-    return dict(preds=preds, counts=counts, te_sum=te_sum, te_n=te_n, history=history)
+    nf = len(folds)
+    preds = [dict() for _ in folds]
+    te_preds, history = [], []
+    tasks = [(f, r) for r in range(rounds) for f in range(nf)]
+    with mp.get_context('fork').Pool(workers, initializer=_worker_init) as pool:
+        for f, r, pv, pt in pool.imap(_fit_one, tasks):
+            preds[f][r] = pv
+            if pt is not None:
+                te_preds.append(pt)
+            if f == nf - 1:
+                sc = oof_score(folds, preds, r + 1, cfg['topk'])
+                history.append((r + 1, sc[0], sc[1]))
+                log(f'round {r + 1}/{rounds}: OOF score={sc[0]:.4f} (raw {sc[1]:.4f})')
+    te_mean = None
+    if te_preds:
+        te_mean = te_preds[0].copy()
+        for p in te_preds[1:]:
+            te_mean += p
+        te_mean /= len(te_preds)
+    return dict(preds=preds, te_mean=te_mean, te_n=len(te_preds), history=history)
 
 def main():
     if len(sys.argv) != 3:
         sys.exit('usage: python3 solution.py PUBLIC_DIR SUBMISSION_OUT')
     pub, out = sys.argv[1], sys.argv[2]
-    log(f'cpu_count={os.cpu_count()} torch={torch.__version__}; training uses {os.cpu_count()} worker processes x 1 thread')
+    log(f'torch={torch.__version__}; fixed plan: {N_ROUNDS} seeds x {N_FOLDS} folds, {N_WORKERS} worker processes x 1 thread')
 
     te_df = pd.read_csv(os.path.join(pub, 'test.csv'))
     test_ids = te_df.case_id.tolist()
-    write_submission(out, test_ids, [[f'c{i:02d}' for i in range(4)]] * len(test_ids))
-    validate_submission(out, test_ids)
+    ss = pd.read_csv(os.path.join(pub, 'sample_submission.csv'), dtype=str, keep_default_na=False)
+    visibility = dict(zip(ss.case_id, ss.visibility))
+    write_submission(out, test_ids, [[f'c{i:02d}' for i in range(4)]] * len(test_ids), visibility)
+    validate_submission(out, test_ids, visibility)
     log(f'fallback submission written to {out}')
 
     tr_df = pd.read_csv(os.path.join(pub, 'train.csv'))
@@ -406,24 +384,21 @@ def main():
 
     folds = prepare_folds(train_cases, tr_df.validation_group.values, test_cases)
     log(f'config: {CFG}')
-    res = run_cv(folds, CFG, deadline=TRAIN_DEADLINE, want_test=True)
+    res = run_cv(folds, CFG, want_test=True)
 
     if res['history']:
-        rr, sc, raw, _ = res['history'][-1]
+        rr, sc, raw = res['history'][-1]
         log(f'FINAL out-of-fold score (GroupKFold({N_FOLDS}) by validation_group, {rr} models/fold): '
             f'{sc:.4f} (raw slot accuracy {raw:.4f})')
         if sc < 0.78:
             log('WARNING: out-of-fold score is below the 0.78 go/no-go gate; this will probably not reach 0.75 on test')
 
     if res['te_n'] > 0:
-        L = res['te_sum'] / res['te_n']
-        preds = decode(L, [c['cards'] for c in test_cases], role_full, use_roles_test, CFG['topk'])
+        preds = decode(res['te_mean'], [c['cards'] for c in test_cases], role_full, use_roles_test, CFG['topk'])
         seqs = [[c['ids'][j] for j in p] for c, p in zip(test_cases, preds)]
-        write_submission(out, test_ids, seqs)
-        validate_submission(out, test_ids)
+        write_submission(out, test_ids, seqs, visibility)
+        validate_submission(out, test_ids, visibility)
         log(f'submission written and validated: {out} ({res["te_n"]} models averaged)')
-    else:
-        log('no model finished in time; fallback submission kept')
     log(f'total runtime {time.time() - T0:.1f}s')
 
 if __name__ == '__main__':
