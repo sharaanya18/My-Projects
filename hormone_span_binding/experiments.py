@@ -4,7 +4,7 @@ Usage: python3 experiments.py PUBLIC_DIR NAME ROUNDS '{"cfg_key": value, ...}'
 Reports the out-of-fold score (GroupKFold(5) by validation_group) after each round. Never touches test.csv."""
 import json, os, sys, time
 import pandas as pd, torch
-import solution as S
+import importlib; S = importlib.import_module(os.environ.get("MOD", "solution"))
 
 pub, name, rounds, over = sys.argv[1], sys.argv[2], int(sys.argv[3]), json.loads(sys.argv[4] if len(sys.argv) > 4 else '{}')
 torch.set_num_threads(1)
