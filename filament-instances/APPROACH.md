@@ -101,7 +101,21 @@ fails, its row is left empty instead of the whole file being lost.
   constants come from the task statement (C width ≈ 6 px) or are standard defaults.
 * Wall-clock guards: training stops at 45 min and the search at 52.5 min, which leaves room for inference.
 
-## 8. Why this should generalise (and what could still go wrong)
+## 8. Checks on the real training labels (CSV files only, no images)
+
+| Check | Result |
+|---|---|
+| `rasterize_one(polygon)` vs published `train_instances.csv` | **0 mismatches / 1,582 instances** |
+| Width estimate, domain A (median, 10 to 90 %) | 16.6 px (12.3 to 36.6); the statement says 15 to 20 |
+| Width estimate, domain B (median, 10 to 90 %) | 4.0 px (2.3 to 5.5); the statement says 4 to 5 |
+| Crops with overlapping / touching filaments (at test scale) | 81 / 114 of 921 |
+| Instance step with **perfect** maps, crops rendered at 5 to 7.5 px | **0.951** official score (A 0.946, B 0.955) |
+| Same, maps 1 px too fat on every side | 0.460 |
+
+The splitting step loses only about 5 % even with perfect pixels. Width calibration is the dominant
+risk, which is why `t_m` is searched on the proxy instead of being fixed.
+
+## 9. Why this should generalise (and what could still go wrong)
 
 * It scores **0.26+** only if the model separates filaments from background edges at ~6 px and the
   width is right. The two main risks are the camera gap (C was captured in a later campaign) and the
