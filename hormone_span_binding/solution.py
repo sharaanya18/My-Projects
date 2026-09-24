@@ -33,7 +33,7 @@ MAX_ROUNDS = 16               # at most 16 seeds x 5 folds = 80 models
 N_FOLDS = 5
 ROLE_GATE = 0.98              # minimum share of training cases whose 4 answers have 4 distinct known roles
 MAXLEN = 96
-CFG = dict(d=96, h=96, dc=96, drop=0.35, wdrop=0.1, board=True, xattn=False, aux_w=0.0,
+CFG = dict(d=96, h=96, dc=96, drop=0.35, wdrop=0.1, board=True, xattn=False, aux_w=0.0, local=False, role_score=False,
            epochs=22, bs=32, lr=3e-3, wd=1e-4, col_w=0.5, clip=2.0, topk=6)
 
 TOK = re.compile(r"\[mask\]|\[hidden\]|<num>|lex_\d+|[a-z0-9]+(?:[-'][a-z0-9]+)*|[^\w\s]")
@@ -196,7 +196,7 @@ class Net(nn.Module):
         self.emb = nn.Embedding(len(vocab.w2i), d, padding_idx=0)
         self.gru = nn.GRU(d, h, batch_first=True, bidirectional=True)
         self.drop = nn.Dropout(drop)
-        self.qmlp = nn.Sequential(nn.Linear(6 * h, 2 * dc), nn.GELU(), nn.Dropout(drop), nn.Linear(2 * dc, dc))
+        self.qmlp = nn.Sequential(nn.Linear((8 if cfg['local'] else 6) * h, 2 * dc), nn.GELU(), nn.Dropout(drop), nn.Linear(2 * dc, dc))
         if cfg['xattn']:        # the 4 snippet queries of a case attend to each other
             lay = nn.TransformerEncoderLayer(d_model=dc, nhead=4, dim_feedforward=2 * dc, dropout=drop,
                                              batch_first=True, activation='gelu')
@@ -207,7 +207,7 @@ class Net(nn.Module):
         self.cwemb = nn.Embedding(len(vocab.cw2i) + 1, dc, padding_idx=0)
         if cfg['board']:        # learned pairwise compatibility with the other cards on the board
             self.A = nn.Parameter(torch.zeros(len(vocab.p2i), len(vocab.p2i)))
-        if cfg['aux_w'] > 0:
+        if cfg['aux_w'] > 0 or cfg['role_score']:
             self.rolehead = nn.Linear(dc, 4)
 
     def forward(self, b):
@@ -223,7 +223,12 @@ class Net(nn.Module):
         m = pad.unsqueeze(-1).float()
         mean = (H * m).sum(1) / m.sum(1).clamp(min=1)
         case = mean.view(B, S, -1).mean(1, keepdim=True).expand(B, S, -1).reshape(B * S, -1)
-        q = self.qmlp(self.drop(torch.cat([hm, mean, case], -1))).view(B, S, self.dc)
+        feats = [hm, mean, case]
+        if self.cfg['local']:   # mean over a +-3 token window around the mask
+            ar = torch.arange(T).unsqueeze(0)
+            win = ((ar - mpos.reshape(-1, 1)).abs() <= 3).unsqueeze(-1).float() * m
+            feats.append((H * win).sum(1) / win.sum(1).clamp(min=1))
+        q = self.qmlp(self.drop(torch.cat(feats, -1))).view(B, S, self.dc)
         if self.cfg['xattn']:
             q = q + self.snipenc(q)
         cand = self.pemb(pid) + self.cwemb(cw).sum(2)
@@ -231,7 +236,12 @@ class Net(nn.Module):
         if self.cfg['board']:
             Bm = torch.zeros(B, self.A.shape[0]); Bm.scatter_(1, pid, 1.0); Bm[:, 0] = 0
             Sc = Sc + torch.einsum('bcp,bp->bc', self.A[pid], Bm).unsqueeze(1)
-        aux = self.rolehead(q) if self.cfg['aux_w'] > 0 else None
+        aux = self.rolehead(q) if hasattr(self, 'rolehead') else None
+        if self.cfg['role_score']:  # add log P(role of card | snippet); unknown-role cards get 0
+            lr = F.log_softmax(aux, -1)                                           # (B,4,4)
+            cr = b['crole']
+            g = torch.gather(lr, 2, cr.clamp(min=0).unsqueeze(1).expand(B, S, 24))
+            Sc = Sc + g * (cr >= 0).unsqueeze(1).float()
         return Sc, aux
 
 
@@ -241,7 +251,7 @@ def loss_fn(S, aux, b, cfg):
     cols = torch.gather(S, 2, tgt.unsqueeze(1).expand(B, 4, 4))   # score of snippet s for the k-th correct card
     col = F.cross_entropy(cols.permute(0, 2, 1).reshape(B * 4, 4), torch.arange(4).repeat(B))
     loss = row + cfg['col_w'] * col
-    if aux is not None:
+    if aux is not None and cfg['aux_w'] > 0:
         rt = torch.gather(b['crole'], 1, tgt)                      # role of each snippet's answer (-1 unknown)
         if (rt >= 0).any():
             loss = loss + cfg['aux_w'] * F.cross_entropy(aux.reshape(B * 4, 4), rt.reshape(-1), ignore_index=-1)
