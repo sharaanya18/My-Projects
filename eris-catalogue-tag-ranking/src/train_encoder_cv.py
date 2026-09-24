@@ -1,9 +1,9 @@
-"""Single-fold smoke test + timing measurement for the fine-tuned encoder
-branch. This CPU dev box has no GPU, so this deliberately trains on a
-subsample for a few steps: the goal here is (a) prove the fine-tuning loop
-is correct end-to-end and (b) measure real per-step wall time to size the
-epoch/runtime budget for the actual A10G run in solution.ipynb -- not to
-reproduce the final score.
+"""Fold-0 fine-tuning run for the encoder branch, with per-epoch validation.
+This CPU dev box has no GPU, so this trains on a subsample for a capped
+number of epochs: the goal is to get a real (if noisy) read on whether the
+encoder branch beats the sparse branch's ~0.207 group-CV MAP, and to measure
+per-step wall time to size the epoch/runtime budget for the actual A10G run
+in solution.ipynb. Not the final production training config.
 """
 from __future__ import annotations
 
@@ -40,7 +40,27 @@ def make_pool_tensors(pools, answers, vocab):
     return idx, pos
 
 
-def main(subsample=2000, epochs=2, batch_size=16, max_length=48):
+@torch.no_grad()
+def evaluate(embedder, head, tok, titles_va, idx_va, ans_va, va_case_ids, pools_va, max_length, batch_size=64):
+    embedder.eval()
+    head.eval()
+    all_logits = []
+    for b in range(0, len(titles_va), batch_size):
+        chunk = titles_va[b : b + batch_size]
+        enc_in = tokenize_titles(tok, chunk, max_length=max_length)
+        title_feat = embedder(enc_in["input_ids"], enc_in["attention_mask"])
+        logits = head(title_feat, torch.tensor(idx_va[b : b + batch_size]))
+        all_logits.append(logits.numpy())
+    logits = np.concatenate(all_logits, axis=0)
+    order = np.argsort(-logits, axis=1)
+    rankings = {va_case_ids[k]: [pools_va[k][j] for j in order[k]] for k in range(len(va_case_ids))}
+    answers_d = {va_case_ids[k]: ans_va[k] for k in range(len(va_case_ids))}
+    embedder.train()
+    head.train()
+    return mean_average_precision(rankings, answers_d)
+
+
+def main(subsample=5000, epochs=10, batch_size=32, max_length=48, lr=5e-5, eval_every=2, val_n=800):
     t0 = time.time()
     cases = load_train(f"{DATA_DIR}/train.csv", f"{DATA_DIR}/train_labels.csv")
     groups = cluster_groups(cases.titles, n_clusters=24, seed=0)
@@ -49,7 +69,7 @@ def main(subsample=2000, epochs=2, batch_size=16, max_length=48):
     rng = np.random.default_rng(0)
     if subsample and len(tr_idx) > subsample:
         tr_idx = rng.choice(tr_idx, size=subsample, replace=False)
-    va_idx = va_idx[: min(500, len(va_idx))]
+    va_idx = va_idx[:val_n]
     print(f"setup {time.time()-t0:.1f}s; train={len(tr_idx)} (subsampled) val={len(va_idx)}")
 
     titles_tr = [cases.titles[i] for i in tr_idx]
@@ -71,17 +91,21 @@ def main(subsample=2000, epochs=2, batch_size=16, max_length=48):
     device = "cpu"
     embedder = EncoderTitleEmbedder(enc, out_dim=256).to(device)
     head = TagRankerHead(in_dim=256, num_tags=len(vocab) + 1, emb_dim=256, dropout=0.1).to(device)
-    # EncoderTitleEmbedder already projects to 256; feed that straight through
-    # the head's projection (in_dim=256) so the head still learns a fusion op.
-    opt = torch.optim.AdamW(list(embedder.parameters()) + list(head.parameters()), lr=2e-5)
+    opt = torch.optim.AdamW(list(embedder.parameters()) + list(head.parameters()), lr=lr, weight_decay=1e-5)
+
+    n = len(titles_tr)
+    steps_per_epoch = (n + batch_size - 1) // batch_size
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, steps_per_epoch=steps_per_epoch, epochs=epochs, pct_start=0.1)
 
     idx_t = torch.tensor(idx_tr)
     pos_t = torch.tensor(pos_tr)
-    n = len(titles_tr)
 
     step_times = []
+    best = 0.0
+    t_start = time.time()
     for ep in range(epochs):
         perm = np.random.permutation(n)
+        total_loss = 0.0
         for bstart in range(0, n, batch_size):
             bi = perm[bstart : bstart + batch_size]
             batch_titles = [titles_tr[i] for i in bi]
@@ -93,25 +117,20 @@ def main(subsample=2000, epochs=2, batch_size=16, max_length=48):
             opt.zero_grad()
             loss.backward()
             opt.step()
+            sched.step()
             step_times.append(time.time() - t1)
-            if len(step_times) % 10 == 0:
-                print(f"  step {len(step_times)} loss={loss.item():.4f} avg_step={np.mean(step_times[-10:]):.3f}s")
+            total_loss += loss.item() * len(bi)
+        msg = f"epoch {ep+1}/{epochs} loss={total_loss/n:.4f} elapsed={time.time()-t_start:.0f}s"
+        if (ep + 1) % eval_every == 0 or ep == epochs - 1:
+            score = evaluate(embedder, head, tok, titles_va, idx_va, ans_va, va_case_ids, pools_va, max_length)
+            best = max(best, score)
+            msg += f" val_MAP={score:.4f}"
+        print(msg)
 
-    print(f"median step time: {np.median(step_times):.3f}s over batch_size={batch_size}")
     per_example = np.median(step_times) / batch_size
-    print(f"~{per_example*1000:.1f} ms/example -> full 15003-row epoch would take ~{per_example*15003/60:.1f} min on this CPU")
-
-    embedder.eval()
-    head.eval()
-    with torch.no_grad():
-        enc_in = tokenize_titles(tok, titles_va, max_length=max_length)
-        title_feat = embedder(enc_in["input_ids"], enc_in["attention_mask"])
-        logits = head(title_feat, torch.tensor(idx_va))
-    order = np.argsort(-logits.numpy(), axis=1)
-    rankings = {va_case_ids[k]: [pools_va[k][j] for j in order[k]] for k in range(len(va_case_ids))}
-    answers_d = {va_case_ids[k]: ans_va[k] for k in range(len(va_case_ids))}
-    score = mean_average_precision(rankings, answers_d)
-    print(f"smoke-test val MAP (subsampled, {epochs} epoch(s), NOT the final number): {score:.4f}")
+    print(f"median step {np.median(step_times):.3f}s -> ~{per_example*1000:.1f} ms/example "
+          f"-> full 15003-row epoch would take ~{per_example*15003/60:.1f} min on this CPU")
+    print(f"BEST val MAP (subsampled to {subsample}, encoder branch only): {best:.4f}")
 
 
 if __name__ == "__main__":
