@@ -101,7 +101,7 @@ fails, its row is left empty instead of the whole file being lost.
   constants come from the task statement (C width ≈ 6 px) or are standard defaults.
 * Wall-clock guards: training stops at 45 min and the search at 52.5 min, which leaves room for inference.
 
-## 8. Checks on the real training labels (CSV files only, no images)
+## 8. Checks on the real training labels (CSV files only, no images; rerun with `tools/check_labels.py <public_dir>`)
 
 | Check | Result |
 |---|---|
