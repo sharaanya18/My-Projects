@@ -1,0 +1,5 @@
+# challenge data is not redistributed; place train/test/sample_submission here locally
+data/
+ckpt/
+working/
+__pycache__/
