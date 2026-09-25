@@ -23,7 +23,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
-from transformers.models.deberta_v2 import modeling_deberta_v2
 
 SEED = 42
 BACKBONE = "microsoft/deberta-v3-base"
@@ -49,12 +48,9 @@ MODEL_A_VAL_FOLD = 0
 MODEL_B_VAL_FOLD = 1
 MODELS = (("MODEL_A", MODEL_A_VAL_FOLD),)
 
-LAMBDA_GRID = [0.0, 0.25, 0.5, 0.75, 1.0, 1.25]
-DECODE_MODES = ["max", "lse"]
 MIN_SELECT_DEPTH = 4
 DECODE_LAMBDA = 0.5
 DECODE_MODE = "max"
-BIG_KEY_COUPLETS = 50
 
 WEIGHT_CAP = 5.0
 INFER_CHUNK = 64
@@ -75,34 +71,6 @@ def log(msg):
     print(f"[{time.perf_counter() - _T0:7.1f}s] {msg}", flush=True)
 
 
-# DeBERTa's relative-position torch.gather uses an index expanded over the batch
-# (stride 0).  Its backward is computed here as a plain matmul against a one-hot
-# of the shared index: a single fixed, deterministic kernel path (no atomics).
-class SharedIndexGather(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, src, dim, index):
-        assert dim == -1 and index.dim() == 3 and index.stride(0) == 0
-        ctx.save_for_backward(index)
-        ctx.width = src.size(-1)
-        return torch.gather(src, dim, index)
-
-    @staticmethod
-    def backward(ctx, grad):
-        (index,) = ctx.saved_tensors
-        onehot = (index[0].unsqueeze(-1) == torch.arange(ctx.width, device=grad.device)).to(grad.dtype)
-        return torch.matmul(grad.transpose(0, 1), onehot).transpose(0, 1), None, None
-
-
-class DebertaTorch:
-    def __getattr__(self, name):
-        return getattr(torch, name)
-
-    @staticmethod
-    def gather(input, dim, index):
-        return SharedIndexGather.apply(input, dim, index)
-
-
-modeling_deberta_v2.torch = DebertaTorch()
 
 
 def seed_everything(seed):
@@ -819,29 +787,12 @@ def main():
     vrows = sorted(oof)
     paths = {i: train["path"].iloc[i].split() for i in vrows}
     kid_of = {i: train["key_id"].iloc[i] for i in vrows}
-    deep = [i for i in vrows if len(paths[i]) >= MIN_SELECT_DEPTH]
-    numeric_couplet = {}
-    for kid in sorted(set(kid_of.values())):
-        for c, leads in keys[kid].couplets.items():
-            numeric_couplet[(kid, c)] = all(re.search(r"\d", keys[kid].lead_text[x]) for x in leads)
-
-    for lam in LAMBDA_GRID:
-        for mode in DECODE_MODES:
-            dec = {i: decode(keys[kid_of[i]], oof[i], lam, mode) for i in vrows}
-            items = [(kid_of[i], paths[i], dec[i]) for i in vrows]
-            items_deep = [(kid_of[i], paths[i], dec[i]) for i in deep]
-            items_big = [x for x in items if len(keys[x[0]].couplets) > BIG_KEY_COUPLETS]
-            s_all = challenge_score(items)
-            s_deep = challenge_score(items_deep)
-            s_big = challenge_score(items_big)
-            s_num = challenge_score(items_deep, lambda k, c: numeric_couplet[(k, c)])
-            s_txt = challenge_score(items_deep, lambda k, c: not numeric_couplet[(k, c)])
-            acc = raw_accuracy(items)
-            log(f"decoder mode={mode} lambda={lam:.2f}: all {s_all:.4f} | depth>=4 {s_deep:.4f} | "
-                f">{BIG_KEY_COUPLETS}-couplet keys {s_big:.4f} | numeric {s_num:.4f} | "
-                f"non-numeric {s_txt:.4f} | raw acc {acc:.4f}")
     LAM, MODE = DECODE_LAMBDA, DECODE_MODE
     log(f"fixed decoder: mode={MODE}, lambda={LAM}")
+    dec = {i: decode(keys[kid_of[i]], oof[i], LAM, MODE) for i in vrows}
+    items = [(kid_of[i], paths[i], dec[i]) for i in vrows]
+    log(f"fold validation: all {challenge_score(items):.4f} | depth>=4 "
+        f"{challenge_score([x for x in items if len(x[1]) >= MIN_SELECT_DEPTH]):.4f} | raw acc {raw_accuracy(items):.4f}")
 
     t = time.perf_counter()
     for name in models:
