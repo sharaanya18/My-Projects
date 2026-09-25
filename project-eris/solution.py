@@ -52,6 +52,8 @@ MODELS = (("MODEL_A", MODEL_A_VAL_FOLD),)
 LAMBDA_GRID = [0.0, 0.25, 0.5, 0.75, 1.0, 1.25]
 DECODE_MODES = ["max", "lse"]
 MIN_SELECT_DEPTH = 4
+DECODE_LAMBDA = 0.5
+DECODE_MODE = "max"
 BIG_KEY_COUPLETS = 50
 
 WEIGHT_CAP = 5.0
@@ -823,7 +825,6 @@ def main():
         for c, leads in keys[kid].couplets.items():
             numeric_couplet[(kid, c)] = all(re.search(r"\d", keys[kid].lead_text[x]) for x in leads)
 
-    best = None
     for lam in LAMBDA_GRID:
         for mode in DECODE_MODES:
             dec = {i: decode(keys[kid_of[i]], oof[i], lam, mode) for i in vrows}
@@ -839,10 +840,8 @@ def main():
             log(f"decoder mode={mode} lambda={lam:.2f}: all {s_all:.4f} | depth>=4 {s_deep:.4f} | "
                 f">{BIG_KEY_COUPLETS}-couplet keys {s_big:.4f} | numeric {s_num:.4f} | "
                 f"non-numeric {s_txt:.4f} | raw acc {acc:.4f}")
-            if best is None or s_deep > best[0]:
-                best = (s_deep, lam, mode)
-    _, LAM, MODE = best
-    log(f"selected decoder: mode={MODE}, lambda={LAM} (depth>=4 validation {best[0]:.4f})")
+    LAM, MODE = DECODE_LAMBDA, DECODE_MODE
+    log(f"fixed decoder: mode={MODE}, lambda={LAM}")
 
     t = time.perf_counter()
     for name in models:
