@@ -28,7 +28,6 @@ from transformers.models.deberta_v2 import modeling_deberta_v2
 SEED = 42
 BACKBONE = "microsoft/deberta-v3-base"
 BACKBONE_REVISION = "8ccc9b6f36199bec6961081d44eb72fb3f7353f3"
-DOWNLOAD_RETRIES = 4
 DEVICE = "cuda"
 AMP_DTYPE = torch.bfloat16
 
@@ -74,6 +73,9 @@ def log(msg):
     print(f"[{time.perf_counter() - _T0:7.1f}s] {msg}", flush=True)
 
 
+# DeBERTa's relative-position torch.gather uses an index expanded over the batch
+# (stride 0).  Its backward is computed here as a plain matmul against a one-hot
+# of the shared index: a single fixed, deterministic kernel path (no atomics).
 class SharedIndexGather(torch.autograd.Function):
     @staticmethod
     def forward(ctx, src, dim, index):
@@ -106,9 +108,15 @@ def seed_everything(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
+    torch.set_num_threads(1)
 
 
 _DASHES = str.maketrans({"-": "–", "—": "–", "‒": "–", "−": "–", "‐": "–", "‑": "–"})
@@ -466,10 +474,9 @@ class Encoder:
         via = self.via_ids(kid, key, c)
         s1 = {x: self.seg1(kid, x, [o for o in leads if o != x], via) for x in leads}
         s1_len = max(len(v) for v in s1.values())
-        if s1_len > MAX_LEN - 3 - 32:
-            log(f"WARNING: very long couplet {kid}:{c} ({s1_len} tokens); lead text truncated")
-            s1 = {x: v[:MAX_LEN - 3 - 32] for x, v in s1.items()}
-            s1_len = MAX_LEN - 3 - 32
+        s1_cap = MAX_LEN - 3 - 32
+        s1 = {x: v[:s1_cap] for x, v in s1.items()}
+        s1_len = min(s1_len, s1_cap)
         s2 = self.seg2(row, kid, c, MAX_LEN - 3 - s1_len)
         return [[self.cls] + s1[x] + [self.sep] + s2 + [self.sep] for x in leads]
 
@@ -498,27 +505,13 @@ class Scorer(nn.Module):
         return self.head(torch.cat([pooled, feats], dim=-1)).squeeze(-1)
 
 
-def with_retry(fn, what):
-    for attempt in range(1, DOWNLOAD_RETRIES + 1):
-        try:
-            return fn()
-        except OSError as e:
-            if attempt == DOWNLOAD_RETRIES:
-                raise
-            log(f"download of {what} failed (attempt {attempt}): {e}; retrying same revision")
-            time.sleep(15)
-
-
 def load_tokenizer():
-    return with_retry(lambda: AutoTokenizer.from_pretrained(BACKBONE, revision=BACKBONE_REVISION), "tokenizer")
+    return AutoTokenizer.from_pretrained(BACKBONE, revision=BACKBONE_REVISION)
 
 
 def load_backbone():
-    return with_retry(
-        lambda: AutoModel.from_pretrained(
-            BACKBONE, revision=BACKBONE_REVISION, hidden_dropout_prob=DROPOUT, attention_probs_dropout_prob=DROPOUT
-        ),
-        "backbone",
+    return AutoModel.from_pretrained(
+        BACKBONE, revision=BACKBONE_REVISION, hidden_dropout_prob=DROPOUT, attention_probs_dropout_prob=DROPOUT
     ).float()
 
 
@@ -535,9 +528,7 @@ def pad_batch(seqs, pad_id):
 def build_examples(df, rows, keys):
     ex = []
     for i, (kid, path) in enumerate(zip(df["key_id"], df["path"])):
-        key = keys.get(kid)
-        if key is None:
-            continue
+        key = keys[kid]
         for lab in path.split():
             c = couplet_of(lab)
             if c not in key.couplets or lab not in key.couplets[c]:
@@ -660,7 +651,7 @@ def score_row(model, enc, row, kid, key, feat_mean, feat_std):
         ids, mask = pad_batch([seqs[i] for i in idx], enc.pad)
         f = torch.tensor(feats[idx], dtype=torch.float32, device=DEVICE)
         out[idx] = model(ids.to(DEVICE), mask.to(DEVICE), f).float().cpu().numpy()
-    out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    assert np.isfinite(out).all(), f"non-finite scores for key {kid}"
     raw = dict(zip(labels, out))
     centred = {}
     for c in key.order:
@@ -760,10 +751,7 @@ def validate_submission(sub, test, keys, sample):
     assert set(sub["id"]) == set(test["id"]) == set(sample["id"])
     kid_of = dict(zip(test["id"], test["key_id"]))
     for rid, d in zip(sub["id"], sub["decisions"]):
-        key = keys.get(kid_of[rid])
-        if key is None:
-            assert d == "", rid
-            continue
+        key = keys[kid_of[rid]]
         labs = d.split(" ")
         assert d == " ".join(labs) and all(labs), rid
         cs = [couplet_of(l) for l in labs]
@@ -775,6 +763,10 @@ def validate_submission(sub, test, keys, sample):
 def main():
     assert torch.cuda.is_available(), "a CUDA GPU is required"
     seed_everything(SEED)
+    assert torch.are_deterministic_algorithms_enabled()
+    log(f"runtime plan: backbone={BACKBONE}@{BACKBONE_REVISION} seed={SEED} device={DEVICE} "
+        f"amp={AMP_DTYPE} epochs={EPOCHS} batch={COUPLETS_PER_STEP}x{GRAD_ACCUM} max_len={MAX_LEN} "
+        f"deterministic_algorithms=strict tf32=off workers=0 torch={torch.__version__}")
     os.makedirs(WORK_DIR, exist_ok=True)
 
     t = time.perf_counter()
@@ -858,11 +850,7 @@ def main():
     decisions_out = []
     for i in range(len(test)):
         kid = test["key_id"].iloc[i]
-        key = keys.get(kid)
-        if key is None:
-            log(f"WARNING: key {kid} of test row {test['id'].iloc[i]} missing from key_leads")
-            decisions_out.append("")
-            continue
+        key = keys[kid]
         per_model = [score_row(m, enc, test_rows[i], kid, key, fm, fs) for m, fm, fs in models.values()]
         avg = {x: float(np.mean([pm[x] for pm in per_model])) for x in per_model[0]}
         dec = decode(key, avg, LAM, MODE)
