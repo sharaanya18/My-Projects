@@ -9,7 +9,6 @@ import torch.nn as nn
 import torch.nn.functional as Fn
 from sklearn.model_selection import GroupKFold
 
-# Fixed, deterministic plan: no wall-clock logic, no host-derived settings, no fallbacks.
 SEED = 2024
 DEVICE = 'cuda'
 assert torch.cuda.is_available(), 'this solution is planned for the A10G GPU'
@@ -43,20 +42,17 @@ Fte, Ate, test_ids = te['frames'], te['actions'], te['ids']
 N, NT = len(Ftr), len(Fte)
 print('train', Ftr.shape, 'test', Fte.shape, 'base rate', L.mean(), flush=True)
 
-# Whole attempts are held out together, matching the unseen-episode test split.
 fold = np.zeros(N, int)
 for k, (_, va) in enumerate(GroupKFold(N_FOLDS).split(Ftr, groups=groups)):
     fold[va] = k
 
-# Span v = steps 6v+1..6v+6: identical frames v, v+1 imply zero events on exactly these steps.
 Lp = np.concatenate([L, np.zeros((N, 1), np.float32)], 1)
 Y = np.stack([Lp[:, 6 * v + 1:6 * v + 7] for v in range(4)], 1)
 VM = np.ones((4, 6), np.float32)
-VM[3, 5] = 0  # step 24 does not exist
+VM[3, 5] = 0
 
 
 def inputs(F, A):
-    """Per-span image stack: the two bounding pictures, their difference, and neighbouring context."""
     f = (F.astype(np.float32) - 120.0) / 60.0
     n = len(F)
     z = np.zeros((n, 24, 24), np.float32)
@@ -77,11 +73,6 @@ def inputs(F, A):
 
 
 class ReachNet(nn.Module):
-    """A CNN predicts per-pixel maps (player start, player end, passability, collected-gem potential).
-    The player's position distribution is propagated one step at a time with a learned, action-conditioned
-    motion kernel, forward from the start and backward from the end. The event probability at step t is the
-    expected gem potential under the step-t position posterior, so the model learns *when* inside a span a
-    gem was reached from how far it lies along the player's path."""
 
     def __init__(self):
         super().__init__()
@@ -217,7 +208,7 @@ for seed in SEEDS:
         print(f'seed {seed} fold {k} fold-score {score(L[vam], to_rows(1 / (1 + np.exp(-z)), L[trm, 0].mean())):.4f}', flush=True)
         del xs, cs, ys, vs, net, opt
 
-step0 = L[:, 0].mean()  # step 0 is never pictured before it happens; use its training rate
+step0 = L[:, 0].mean()
 print('OOF score (episode-held-out):', round(score(L, to_rows(1 / (1 + np.exp(-oof)), step0)), 4), flush=True)
 pred = np.clip(to_rows(1 / (1 + np.exp(-test_z)), step0), 0, 1)
 sub = pd.DataFrame(pred, columns=STEP_COLS)
