@@ -19,7 +19,8 @@ from transformers import AutoTokenizer, AutoModel
 T_START = time.time()
 SEED = 42
 N_THREADS = 10
-EPOCHS = 6
+EPOCHS = 4
+HEAD_EPOCHS = 12
 BS = 16
 K_SHORT = 300
 BACKBONE = 'intfloat/multilingual-e5-small'
@@ -729,7 +730,9 @@ class NeuralRanker(nn.Module):
         return (h * mm).sum(1) / mm.sum(1)
 
     def forward(self, h, m, X, Ec, cz):
-        q = self.qenc(h, m)
+        return self.score(self.qenc(h, m), X, Ec, cz)
+
+    def score(self, q, X, Ec, cz):
         qv = Fn.normalize(self.qp(q), dim=-1)
         cv = Fn.normalize(self.cp(Ec), dim=-1)
         dot = (qv[:, None, :] * cv).sum(-1)
@@ -751,10 +754,33 @@ torch.manual_seed(SEED)
 model = NeuralRanker(copy.deepcopy(backbone.encoder.layer[CUT:]), F).to(DEVICE)
 del backbone
 head_params = [p for n, p in model.named_parameters() if not n.startswith('top.')]
-opt = torch.optim.AdamW([{'params': model.top.parameters(), 'lr': 2e-5}, {'params': head_params, 'lr': 1e-3}], weight_decay=0.01)
+
+
+@torch.no_grad()
+def frozen_q(H, M, bs=64):
+    model.eval()
+    return torch.cat([model.qenc(H[b:b + bs].to(DEVICE), M[b:b + bs].to(DEVICE)).cpu() for b in range(0, len(H), bs)])
+
+
+Q0_tr, Q0_va = frozen_q(H_tr, M_tr), frozen_q(H_va, M_va)
+opt_a = torch.optim.AdamW(head_params, 3e-3, weight_decay=1e-4)
+for ep in range(HEAD_EPOCHS):
+    model.train()
+    perm = torch.randperm(len(y_tr))
+    for b in range(0, len(y_tr), 32):
+        ix = perm[b:b + 32]
+        loss = Fn.cross_entropy(model.score(Q0_tr[ix], XS_tr[ix], E_tr[ix], CZ_tr[ix]), lab_tr[ix])
+        opt_a.zero_grad()
+        loss.backward()
+        opt_a.step()
+model.eval()
+with torch.no_grad():
+    best_score = short_mrr(model.score(Q0_va, XS_va, E_va, CZ_va).numpy(), SL_va, y_va)
+best_state, best_ep = copy.deepcopy(model.state_dict()), -1
+log(f'neural head warm-up val MRR@10 {best_score:.4f}')
+opt = torch.optim.AdamW([{'params': model.top.parameters(), 'lr': 2e-5}, {'params': head_params, 'lr': 3e-4}], weight_decay=0.01)
 steps = EPOCHS * ((len(y_tr) + BS - 1) // BS)
-sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=[2e-5, 1e-3], total_steps=steps, pct_start=0.15)
-best_state, best_score, best_ep = copy.deepcopy(model.state_dict()), -1.0, -1
+sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=[2e-5, 3e-4], total_steps=steps, pct_start=0.15)
 for ep in range(EPOCHS):
     model.train()
     perm = torch.randperm(len(y_tr))
@@ -803,11 +829,11 @@ def train_feature_ranker(seed, epochs=12):
             o.step()
     m.eval()
     with torch.no_grad():
-        return m(XS_va, CZ_va).numpy() if len(val) else np.zeros((0, K_SHORT)), m(XS_te, CZ_te).numpy()
+        return m(XS_va, CZ_va).numpy(), m(XS_te, CZ_te).numpy()
 
 
 def lsm(S):
-    return torch.log_softmax(torch.tensor(S, dtype=torch.float32), 1).numpy() if len(S) else S
+    return torch.log_softmax(torch.tensor(S, dtype=torch.float32), 1).numpy()
 
 
 FS_va, FS_te = 0, 0
@@ -816,19 +842,15 @@ for sd_ in range(N_FEAT_SEEDS):
     a, b = train_feature_ranker(SEED + sd_)
     FS_va = FS_va + lsm(a) / N_FEAT_SEEDS
     FS_te = FS_te + lsm(b) / N_FEAT_SEEDS
-if len(val):
-    log(f'feature-ranker ensemble val MRR@10 {short_mrr(FS_va, SL_va, y_va):.4f}')
+log(f'feature-ranker ensemble val MRR@10 {short_mrr(FS_va, SL_va, y_va):.4f}')
 
 best_w, best_blend = 1.0, -1.0
-for w in [1.0, 0.8, 0.65, 0.5, 0.35, 0.2]:
-    sc = short_mrr(w * lsm(NS_va) + (1 - w) * FS_va, SL_va, y_va) if len(val) else 0.0
-    if len(val):
-        log(f'blend neural weight {w:.2f}: val MRR@10 {sc:.4f}')
+for w in [1.0, 0.8, 0.65, 0.5]:
+    sc = short_mrr(w * lsm(NS_va) + (1 - w) * FS_va, SL_va, y_va)
+    log(f'blend neural weight {w:.2f}: val MRR@10 {sc:.4f}')
     if sc > best_blend + 1e-9:
         best_w, best_blend = w, sc
-if len(val):
-    best_w = min(max(best_w, 0.35), 1.0)
-log(f'selected neural weight {best_w:.2f}')
+log(f'selected neural weight {best_w:.2f} val MRR@10 {best_blend:.4f}')
 S_te = best_w * lsm(NS_te) + (1 - best_w) * FS_te
 
 rows = []
