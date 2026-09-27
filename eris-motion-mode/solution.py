@@ -9,8 +9,8 @@ from sklearn.model_selection import GroupKFold
 SEED = 42
 np.random.seed(SEED)
 
-PUBLIC_DIR = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("./dataset/public")
-SUBMISSION_OUT = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("./working/submission.csv")
+PUBLIC_DIR = Path(sys.argv[1])
+SUBMISSION_OUT = Path(sys.argv[2])
 
 MODE_LABELS = ("S", "A", "B", "C", "D", "E", "F")
 HORIZON_STEPS = 10
