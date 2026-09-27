@@ -1,5 +1,12 @@
-import sys, os, re, json, math, time, copy, datetime as dt
+import os
+import sys
 from pathlib import Path
+
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["PYTHONHASHSEED"] = "0"
+
+import re, json, math, time, copy, random, datetime as dt
 import numpy as np
 import pandas as pd
 import torch
@@ -10,19 +17,23 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from transformers import AutoTokenizer, AutoModel
 
 T_START = time.time()
-TRAIN_DEADLINE = 45 * 60
 SEED = 42
+N_THREADS = 10
+EPOCHS = 6
+BS = 16
 K_SHORT = 300
 BACKBONE = 'intfloat/multilingual-e5-small'
 CUT = 8
 
-public_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path('./dataset/public')
-submission_out = Path(sys.argv[2]) if len(sys.argv) > 2 else Path('./working/submission.csv')
+public_dir = Path(sys.argv[1])
+submission_out = Path(sys.argv[2])
 
-torch.manual_seed(SEED)
+random.seed(SEED)
 np.random.seed(SEED)
-torch.set_num_threads(max(1, os.cpu_count() or 1))
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+torch.manual_seed(SEED)
+torch.set_num_threads(N_THREADS)
+torch.use_deterministic_algorithms(True)
+DEVICE = torch.device('cpu')
 
 
 def log(*a):
@@ -558,17 +569,14 @@ def mrr_at10(S, valid, y):
 letters = pd.read_csv(public_dir / 'letters.csv', dtype={'letter_id': str})
 train = pd.read_csv(public_dir / 'train.csv')
 test = pd.read_csv(public_dir / 'test.csv')
-val_path = public_dir / 'validation.csv'
-val = pd.read_csv(val_path) if val_path.exists() else train.iloc[:0].copy()
+val = pd.read_csv(public_dir / 'validation.csv')
 log('loaded', len(letters), 'letters', len(train), 'train', len(val), 'val', len(test), 'test')
 
 A = Archive(letters)
 log('archive ready')
 
-train = train[train.letter_ids.map(first_id).isin(A.idx)].reset_index(drop=True)
-val = val[val.letter_ids.map(first_id).isin(A.idx)].reset_index(drop=True) if len(val) else val
 y_tr = np.array([A.idx[first_id(s)] for s in train.letter_ids])
-y_va = np.array([A.idx[first_id(s)] for s in val.letter_ids]) if len(val) else np.zeros(0, int)
+y_va = np.array([A.idx[first_id(s)] for s in val.letter_ids])
 tr_docs = train.document_id.astype(str).values
 pop_all = np.bincount(y_tr, minlength=A.N).astype(float)
 
@@ -588,7 +596,7 @@ def build(df, loo):
 
 
 X_tr, V_tr = build(train, True)
-X_va, V_va = build(val, False) if len(val) else (np.zeros((0, A.N, X_tr.shape[2]), np.float32), np.zeros((0, A.N), bool))
+X_va, V_va = build(val, False)
 X_te, V_te = build(test, False)
 F = X_tr.shape[2]
 log('features', X_tr.shape, X_va.shape, X_te.shape)
@@ -623,12 +631,11 @@ def shortlist(X, V):
     for b in range(0, len(X), 64):
         s = lin(stdz(X[b:b + 64])).squeeze(-1).masked_fill(torch.tensor(~V[b:b + 64]), -1e4)
         out.append(torch.topk(s, min(K_SHORT, A.N), 1).indices.numpy())
-    return np.concatenate(out) if out else np.zeros((0, K_SHORT), int)
+    return np.concatenate(out)
 
 
 SL_tr, SL_va, SL_te = shortlist(X_tr, V_tr), shortlist(X_va, V_va), shortlist(X_te, V_te)
-if len(val):
-    log('stage-1 recall@%d val %.4f' % (K_SHORT, np.mean([y_va[i] in SL_va[i] for i in range(len(y_va))])))
+log('stage-1 recall@%d val %.4f' % (K_SHORT, np.mean([y_va[i] in SL_va[i] for i in range(len(y_va))])))
 for i in range(len(y_tr)):
     if y_tr[i] not in SL_tr[i]:
         SL_tr[i, -1] = y_tr[i]
@@ -636,7 +643,7 @@ lab_tr = torch.tensor([int(np.where(SL_tr[i] == y_tr[i])[0][0]) for i in range(l
 
 
 def gather(X, SL):
-    return stdz(np.take_along_axis(X, SL[:, :, None], 1)) if len(X) else torch.zeros((0, K_SHORT, F))
+    return stdz(np.take_along_axis(X, SL[:, :, None], 1))
 
 
 XS_tr, XS_va, XS_te = gather(X_tr, SL_tr), gather(X_va, SL_va), gather(X_te, SL_te)
@@ -681,8 +688,6 @@ def encode(texts, lower=False, bs=64):
         if lower:
             hs.append(o.hidden_states[CUT].half().cpu())
             ms.append(en['attention_mask'].cpu())
-    if not embs:
-        return torch.zeros((0, HID)), torch.zeros((0, 256, HID)).half(), torch.zeros((0, 256), dtype=torch.long)
     return torch.cat(embs), (torch.cat(hs) if lower else None), (torch.cat(ms) if lower else None)
 
 
@@ -695,12 +700,12 @@ log('queries encoded')
 
 
 def zero_cos(qe, SL):
-    return torch.stack([D_emb[SL[i]] @ qe[i] for i in range(len(SL))]) if len(SL) else torch.zeros((0, K_SHORT))
+    return torch.stack([D_emb[SL[i]] @ qe[i] for i in range(len(SL))])
 
 
 CZ_tr, CZ_va, CZ_te = zero_cos(qe_tr, SL_tr), zero_cos(qe_va, SL_va), zero_cos(qe_te, SL_te)
 E_tr = D_emb[torch.tensor(SL_tr)]
-E_va = D_emb[torch.tensor(SL_va)] if len(SL_va) else torch.zeros((0, K_SHORT, HID))
+E_va = D_emb[torch.tensor(SL_va)]
 E_te = D_emb[torch.tensor(SL_te)]
 
 
@@ -739,27 +744,22 @@ def predict_neural(model, H, M, XS, E, CZ, bs=64):
     with torch.no_grad():
         for b in range(0, len(XS), bs):
             out.append(model(H[b:b + bs].to(DEVICE), M[b:b + bs].to(DEVICE), XS[b:b + bs].to(DEVICE), E[b:b + bs].to(DEVICE), CZ[b:b + bs].to(DEVICE)).cpu())
-    return torch.cat(out).numpy() if out else np.zeros((0, K_SHORT))
+    return torch.cat(out).numpy()
 
 
 torch.manual_seed(SEED)
 model = NeuralRanker(copy.deepcopy(backbone.encoder.layer[CUT:]), F).to(DEVICE)
 del backbone
 head_params = [p for n, p in model.named_parameters() if not n.startswith('top.')]
-EPOCHS, BS = 6, 16
 opt = torch.optim.AdamW([{'params': model.top.parameters(), 'lr': 2e-5}, {'params': head_params, 'lr': 1e-3}], weight_decay=0.01)
 steps = EPOCHS * ((len(y_tr) + BS - 1) // BS)
 sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=[2e-5, 1e-3], total_steps=steps, pct_start=0.15)
 best_state, best_score, best_ep = copy.deepcopy(model.state_dict()), -1.0, -1
-stop = False
 for ep in range(EPOCHS):
     model.train()
     perm = torch.randperm(len(y_tr))
     tot = 0.0
     for b in range(0, len(y_tr), BS):
-        if time.time() - T_START > TRAIN_DEADLINE:
-            stop = True
-            break
         ix = perm[b:b + BS]
         s = model(H_tr[ix].to(DEVICE), M_tr[ix].to(DEVICE), XS_tr[ix].to(DEVICE), E_tr[ix].to(DEVICE), CZ_tr[ix].to(DEVICE))
         loss = Fn.cross_entropy(s, lab_tr[ix].to(DEVICE), label_smoothing=0.05)
@@ -769,12 +769,10 @@ for ep in range(EPOCHS):
         opt.step()
         sched.step()
         tot += loss.item() * len(ix)
-    score = short_mrr(predict_neural(model, H_va, M_va, XS_va, E_va, CZ_va), SL_va, y_va) if len(val) else float(ep)
+    score = short_mrr(predict_neural(model, H_va, M_va, XS_va, E_va, CZ_va), SL_va, y_va)
     log(f'neural epoch {ep} loss {tot / len(y_tr):.3f} val MRR@10 {score:.4f}')
     if score > best_score:
         best_score, best_ep, best_state = score, ep, copy.deepcopy(model.state_dict())
-    if stop:
-        break
 model.load_state_dict(best_state)
 log(f'neural ranker selected epoch {best_ep} val {best_score:.4f}')
 NS_va = predict_neural(model, H_va, M_va, XS_va, E_va, CZ_va)
