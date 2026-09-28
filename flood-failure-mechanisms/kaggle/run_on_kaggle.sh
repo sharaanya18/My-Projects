@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Run solution.py on a Kaggle GPU and download the log and submission.
-# Needs KAGGLE_USERNAME and KAGGLE_KEY in the environment.
+# Needs Kaggle credentials the CLI can read: KAGGLE_USERNAME + KAGGLE_KEY, or an
+# API token (KAGGLE_API_TOKEN or ~/.kaggle/access_token).
 # Usage: bash run_on_kaggle.sh <path/to/dataset/public> [NvidiaTeslaT4]
 set -euo pipefail
-: "${KAGGLE_USERNAME:?set KAGGLE_USERNAME}"; : "${KAGGLE_KEY:?set KAGGLE_KEY}"
+KAGGLE_USERNAME="${KAGGLE_USERNAME:-$(kaggle config view | sed -n 's/^- username: //p')}"
+: "${KAGGLE_USERNAME:?could not determine Kaggle username; check credentials}"
 DATA_DIR="$(cd "$1" && pwd)"; ACC="${2:-NvidiaTeslaT4}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DS_SLUG="flood-failure-eris-data"; K_SLUG="flood-failure-eris-solution"
