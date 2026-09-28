@@ -273,7 +273,7 @@ class ClipPrototypeClassifier(nn.Module):
     (image encoder, projection, prototypes, bias) is trained on the photos.
     """
 
-    def __init__(self):
+    def __init__(self, grid_hw):
         super().__init__()
         clip = CLIPModel.from_pretrained(CLIP_NAME, attn_implementation="eager")
         with torch.no_grad():
@@ -286,6 +286,19 @@ class ClipPrototypeClassifier(nn.Module):
             neg = text_emb(NEG_PROMPTS).unsqueeze(0).repeat(len(LABELS), 1)
         self.vision = clip.vision_model
         self.proj = clip.visual_projection
+        # Resize the 14x14 position grid to this input's patch grid ONCE, here,
+        # without gradients. Interpolating on every forward pass would put a
+        # bicubic resize in the backward pass, which has no deterministic CUDA
+        # kernel. The resized table is a trainable parameter.
+        emb = self.vision.embeddings
+        with torch.no_grad():
+            table = emb.position_embedding.weight  # (1 + 14*14, D)
+            n0 = int(round((table.shape[0] - 1) ** 0.5))
+            grid = table[1:].reshape(1, n0, n0, -1).permute(0, 3, 1, 2)
+            grid = F.interpolate(grid, size=grid_hw, mode="bicubic", align_corners=False)
+            grid = grid.permute(0, 2, 3, 1).reshape(1, grid_hw[0] * grid_hw[1], -1)
+            pos_table = torch.cat([table[:1].unsqueeze(0), grid], dim=1)
+        self.pos_embed = nn.Parameter(pos_table)
         self.pos = nn.Parameter(pos)
         self.neg = nn.Parameter(neg)
         self.bias = nn.Parameter(torch.zeros(len(LABELS)))
@@ -295,9 +308,18 @@ class ClipPrototypeClassifier(nn.Module):
     def head_parameters(self):
         return [self.pos, self.neg, self.bias]
 
+    def encode(self, x):
+        # Same computation as CLIPVisionTransformer.forward, with the fixed-size
+        # position table above instead of per-call interpolation.
+        emb = self.vision.embeddings
+        patches = emb.patch_embedding(x.to(emb.patch_embedding.weight.dtype)).flatten(2).transpose(1, 2)
+        cls = emb.class_embedding.expand(x.shape[0], 1, -1).to(patches.dtype)
+        h = self.vision.pre_layrnorm(torch.cat([cls, patches], dim=1) + self.pos_embed)
+        h = self.vision.encoder(inputs_embeds=h).last_hidden_state
+        return self.vision.post_layernorm(h[:, 0])
+
     def forward(self, x):
-        f = self.vision(pixel_values=x, interpolate_pos_encoding=True).pooler_output
-        f = F.normalize(self.proj(f), dim=-1)
+        f = F.normalize(self.proj(self.encode(x)), dim=-1)
         pos = F.normalize(self.pos, dim=-1)
         neg = F.normalize(self.neg, dim=-1)
         return self.scale * (f @ pos.T - f @ neg.T) + self.bias  # (batch, labels)
@@ -317,7 +339,10 @@ class ConvNeXtClassifier(nn.Module):
         return self.net(x)
 
 
-BUILDERS = {"convnext": ConvNeXtClassifier, "clip": ClipPrototypeClassifier}
+BUILDERS = {
+    "convnext": lambda spec: ConvNeXtClassifier(),
+    "clip": lambda spec: ClipPrototypeClassifier((spec["h"] // 16, spec["w"] // 16)),
+}
 
 
 @torch.no_grad()
@@ -350,7 +375,7 @@ def train_one(spec, train_tf, tr_idx, fold):
         worker_init_fn=seed_worker, generator=g, pin_memory=True,
     )
     torch.manual_seed(SEED + fold)
-    model = BUILDERS[spec["name"]]().to(DEVICE)
+    model = BUILDERS[spec["name"]](spec).to(DEVICE)
     head = model.head_parameters()
     head_ids = {id(p) for p in head}
     body = [p for p in model.parameters() if id(p) not in head_ids]
