@@ -119,6 +119,7 @@ LR_HEAD = 1e-3
 WEIGHT_DECAY = 0.05
 DROP_PATH = 0.1
 WARMUP_EPOCHS = 1
+EMA_DECAY = 0.99  # weight averaging smooths small-data fine-tuning; 0 disables
 NUM_WORKERS = min(8, os.cpu_count() or 2)
 USE_AMP = DEVICE == "cuda"
 
@@ -267,6 +268,7 @@ def train_one(tr_idx, fold):
         opt, lambda s: (s + 1) / warm if s < warm else 0.5 * (1 + np.cos(np.pi * (s - warm) / max(1, total - warm)))
     )
     scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
+    ema = timm.utils.ModelEmaV3(model, decay=EMA_DECAY) if EMA_DECAY > 0 else None
 
     for epoch in range(EPOCHS):
         if budget_exceeded():
@@ -287,9 +289,11 @@ def train_one(tr_idx, fold):
             scaler.step(opt)
             scaler.update()
             sched.step()
+            if ema is not None:
+                ema.update(model)
             run += loss.item()
         print(f"  fold {fold} epoch {epoch + 1}/{EPOCHS} loss {run / len(dl):.4f} | elapsed {elapsed():.0f}s", flush=True)
-    return model
+    return ema.module if ema is not None else model
 
 
 # -- Site-grouped CV: honest OOF metric + fold ensemble for test -------------------------
