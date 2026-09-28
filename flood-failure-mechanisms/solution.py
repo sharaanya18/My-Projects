@@ -5,47 +5,59 @@ CHALLENGE: flood-failure-mechanisms
 DOMAIN:    Computer Vision, multi-label image classification (4 labels)
 METRIC:    mean over labels of site-weighted average precision (w_i = 1 / n_site)
 
+Approach
+  Two image models are fine-tuned end to end on the training photographs and
+  their probabilities are averaged with fixed equal weights:
+    A. ConvNeXt-Tiny (ImageNet-22k) with a 4-way sigmoid head.
+    B. CLIP ViT-B/16 image encoder whose 4 label prototypes are INITIALISED from
+       CLIP text embeddings of each label's codebook definition, then trained
+       together with the whole image encoder. The text only sets a starting
+       point; every weight is updated by training on the labelled photographs.
+       This start helps because the labels have few positives (95-233 per
+       label) and are noisy.
+
 Compliance header (maps onto the challenge rules and the Eris guidebook)
 ------------------------------------------------------------------------
 Hardware / runtime (fixed plan)
   - Requires one CUDA GPU (graded on an Nvidia A10G) and always runs the same
-    plan: 5 folds x EPOCHS epochs, the same batch size, worker count, image size
-    and fp16 autocast. Nothing depends on wall-clock time, CPU count or device
-    detection. Elapsed time is printed for logging only and never changes what
-    is trained or predicted.
-  - The plan was sized to fit the challenge's 30-minute cap: the same script
-    measured about 17 minutes end to end on a slower Kaggle T4, and an A10G is
-    faster.
+    plan: 5 folds x 2 models x a fixed number of epochs, with the same batch
+    sizes, worker count, image sizes and fp16 autocast. Nothing depends on
+    wall-clock time, CPU count or device detection. Elapsed time is printed
+    for logging only and never changes what is trained or predicted.
+  - The plan is sized for the challenge's 30-minute cap on an A10G.
 Pretrained weights
-  - Only a general-purpose ImageNet backbone (timm "convnext_tiny.fb_in22k_ft_in1k")
-    is downloaded from the public timm / Hugging Face hub. No self-hosted or
-    previously fine-tuned weights are loaded. All fine-tuning happens in this
-    script, from the raw photographs, on every run.
+  - Only general-purpose public checkpoints are downloaded: timm
+    "convnext_tiny.fb_in22k_ft_in1k" and Hugging Face "openai/clip-vit-base-patch16".
+    No self-hosted or previously fine-tuned weights are loaded. All
+    fine-tuning happens in this script, from the raw photographs, on every run.
 Data sources
   - Reads only train.csv, train_targets.csv, test.csv, sample_submission.csv
     and the JPEGs under images/. No external datasets, inspection records,
-    coordinates, web lookups of sites, or external annotations are used.
+    coordinates, web lookups of sites, or external annotations are used. The
+    CLIP prompts below paraphrase the challenge's own label definitions.
 Training data / labels
   - Only the 841 public training photographs and their image-level labels fit
-    the model. No synthetic images are generated. No mixup or cutmix is used,
+    the models. No synthetic images are generated. No mixup or cutmix is used,
     because blending images would also blend image-level visual evidence.
 Test-set usage
   - Test images are scored one image at a time (horizontal-flip TTA only, per
     image). There is no pseudo-labelling, no test-time adaptation, no
-    calibration to the test distribution, and no pooling of predictions across
-    photographs that share a site prefix. Each prediction describes only the
-    evidence visible in that single photograph.
-  - The site prefix of an id is used only on TRAIN rows: to build grouped CV
-    folds and to weight the loss like the metric. It is never a model input.
+    calibration or rank-normalisation over the test set, and no pooling of
+    predictions across photographs that share a site prefix. Each prediction
+    describes only the evidence visible in that single photograph.
+  - The site prefix of an id is used only on TRAIN rows, to build grouped CV
+    folds. It is never a model input.
 Model selection
   - Site-grouped 5-fold CV (StratifiedGroupKFold on the site prefix) runs inside
-    this script. It reports the exact challenge metric out of fold, and the five
-    fold models are averaged for the test predictions.
+    this script. It reports the exact challenge metric out of fold for each
+    model and for the ensemble. The five fold models of each architecture are
+    averaged for the test predictions, and the two architectures are combined
+    50/50.
 Determinism
   - Seeds are fixed at 42 for python, numpy and torch, and cuDNN runs in
-    deterministic mode with torch.use_deterministic_algorithms(True). DataLoader
-    workers have fixed seeds and a fixed count, so the same inputs give the
-    same outputs on every run.
+    deterministic mode with torch.use_deterministic_algorithms(True). Attention
+    uses the eager implementation. DataLoader workers have fixed seeds and a
+    fixed count, so the same inputs give the same outputs on every run.
 """
 
 import json
@@ -71,6 +83,7 @@ from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import DataLoader, Dataset
 import timm
 import torchvision.transforms.v2 as T
+from transformers import CLIPModel, CLIPTokenizer
 
 # -- Reproducibility --------------------------------------------------------------
 SEED = 42
@@ -107,25 +120,55 @@ LABELS = [
     "structural_displacement_or_collapse",
 ]
 
+# Label prompts paraphrase the challenge's codebook definitions. They only
+# initialise model B's label prototypes, which are then trained on the photos.
+PROMPTS = {
+    "support_scour": [
+        "a photo of scour around a bridge pier foundation",
+        "a photo of eroded riverbed exposing a bridge abutment foundation",
+        "a photo of soil washed away from around a bridge support",
+    ],
+    "debris_obstruction_or_impact": [
+        "a photo of flood debris piled against a bridge",
+        "a photo of logs and trees jammed against bridge piers",
+        "a photo of debris blocking the opening under a bridge",
+    ],
+    "approach_or_embankment_washout": [
+        "a photo of a road embankment washed out by a flood",
+        "a photo of a bridge approach road collapsed and eroded",
+        "a photo of a washed out road next to a bridge",
+    ],
+    "structural_displacement_or_collapse": [
+        "a photo of a collapsed bridge",
+        "a photo of a broken bridge deck that has fallen into the river",
+        "a photo of a tilted and displaced bridge pier",
+    ],
+}
+NEG_PROMPTS = ["a photo of an intact bridge over a river", "a photo of a river", "a photo of a road"]
+
 # -- Config -----------------------------------------------------------------------
-BACKBONE = "convnext_tiny.fb_in22k_ft_in1k"  # strong small ImageNet-22k backbone
-# 3:2 landscape input. The audit found ~93% of photos are landscape and most are
-# 960x640 (3:2), with the rest 4:3 or portrait. Letterboxing keeps the
-# aspect ratio, so tilt and displacement angles are not distorted, and keeps
-# the whole frame (a random crop can cut away the only visible evidence).
-IMG_H, IMG_W = 384, 576
-CACHE_SCALE = 1.1  # cache slightly larger so random crops still cover the scene
 N_FOLDS = 5
-EPOCHS = 12
-BATCH = 16
-LR_BACKBONE = 1e-4
-LR_HEAD = 1e-3
-WEIGHT_DECAY = 0.05
-DROP_PATH = 0.1
-WARMUP_EPOCHS = 1
-SITE_WEIGHTED_LOSS = True  # weight each training site equally in the loss, like the metric
-EMA_DECAY = 0.99  # weight averaging smooths small-data fine-tuning; 0 disables
 NUM_WORKERS = 2  # fixed, not derived from the machine's CPU count
+WARMUP_EPOCHS = 1
+EMA_DECAY = 0.99  # weight averaging smooths small-data fine-tuning
+# Cache 3:2 letterboxed images once. The audit found ~93% of photos are
+# landscape, mostly 960x640 (3:2). Letterboxing keeps the aspect ratio, so tilt
+# and displacement angles are not distorted, and keeps the whole frame.
+CACHE_H, CACHE_W = 422, 633
+
+IMAGENET_MEAN, IMAGENET_STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+CLIP_MEAN, CLIP_STD = [0.4815, 0.4578, 0.4082], [0.2686, 0.2613, 0.2758]
+CLIP_NAME = "openai/clip-vit-base-patch16"
+
+MODEL_SPECS = [
+    # name, input size (3:2), epochs, batch, lr for the pretrained body / new head
+    dict(name="convnext", h=384, w=576, epochs=10, batch=16, lr_body=3e-5, lr_head=1e-3,
+         mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    # 336x512 is a multiple of the 16-px patch; position embeddings are interpolated.
+    dict(name="clip", h=336, w=512, epochs=6, batch=16, lr_body=1e-5, lr_head=2e-4,
+         mean=CLIP_MEAN, std=CLIP_STD),
+]
+ENSEMBLE_WEIGHTS = {"convnext": 0.5, "clip": 0.5}  # fixed, not tuned on test
 
 
 # -- Metric (verbatim logic from the challenge page) -------------------------------
@@ -169,36 +212,38 @@ def letterbox(path, h, w):
     return np.asarray(img, dtype=np.uint8)
 
 
-CH, CW = int(IMG_H * CACHE_SCALE), int(IMG_W * CACHE_SCALE)
-train_imgs = [letterbox(f"{DATA_DIR}/{p}", CH, CW) for p in train["image_path"]]
-test_imgs = [letterbox(f"{DATA_DIR}/{p}", CH, CW) for p in test["image_path"]]
-print(f"Images cached at {CH}x{CW} | elapsed {elapsed():.0f}s", flush=True)
+train_imgs = [letterbox(f"{DATA_DIR}/{p}", CACHE_H, CACHE_W) for p in train["image_path"]]
+test_imgs = [letterbox(f"{DATA_DIR}/{p}", CACHE_H, CACHE_W) for p in test["image_path"]]
+print(f"Images cached at {CACHE_H}x{CACHE_W} | elapsed {elapsed():.0f}s", flush=True)
 
-MEAN, STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
-# Geometric augmentation is deliberately mild. Horizontal flip is physically
-# valid. Vertical flips and large rotations are excluded because "tilted" and
-# "collapsed" are defined relative to gravity, so rotating an intact pier could
-# make it look tilted. Crops keep >= 70% of the frame so evidence survives.
-train_tf = T.Compose([
-    T.ToImage(),
-    T.RandomResizedCrop((IMG_H, IMG_W), scale=(0.7, 1.0), ratio=(1.35, 1.65), antialias=True),
-    T.RandomHorizontalFlip(),
-    T.RandomApply([T.ColorJitter(0.25, 0.25, 0.15, 0.03)], p=0.8),
-    T.RandomApply([T.GaussianBlur(3)], p=0.1),
-    T.ToDtype(torch.float32, scale=True),
-    T.Normalize(MEAN, STD),
-])
-eval_tf = T.Compose([
-    T.ToImage(),
-    T.Resize((IMG_H, IMG_W), antialias=True),
-    T.ToDtype(torch.float32, scale=True),
-    T.Normalize(MEAN, STD),
-])
+
+def make_transforms(spec):
+    # Geometric augmentation is deliberately mild. Horizontal flip is physically
+    # valid. Vertical flips and large rotations are excluded because "tilted" and
+    # "collapsed" are defined relative to gravity, so rotating an intact pier
+    # could make it look tilted. Crops keep >= 70% of the frame so evidence survives.
+    size = (spec["h"], spec["w"])
+    train_tf = T.Compose([
+        T.ToImage(),
+        T.RandomResizedCrop(size, scale=(0.7, 1.0), ratio=(1.35, 1.65), antialias=True),
+        T.RandomHorizontalFlip(),
+        T.RandomApply([T.ColorJitter(0.25, 0.25, 0.15, 0.03)], p=0.8),
+        T.RandomApply([T.GaussianBlur(3)], p=0.1),
+        T.ToDtype(torch.float32, scale=True),
+        T.Normalize(spec["mean"], spec["std"]),
+    ])
+    eval_tf = T.Compose([
+        T.ToImage(),
+        T.Resize(size, antialias=True),
+        T.ToDtype(torch.float32, scale=True),
+        T.Normalize(spec["mean"], spec["std"]),
+    ])
+    return train_tf, eval_tf
 
 
 class PhotoDS(Dataset):
-    def __init__(self, imgs, y=None, w=None, tf=None):
-        self.imgs, self.y, self.w, self.tf = imgs, y, w, tf
+    def __init__(self, imgs, y=None, tf=None):
+        self.imgs, self.y, self.tf = imgs, y, tf
 
     def __len__(self):
         return len(self.imgs)
@@ -207,7 +252,7 @@ class PhotoDS(Dataset):
         x = self.tf(self.imgs[i])
         if self.y is None:
             return x
-        return x, torch.from_numpy(self.y[i]), torch.tensor(self.w[i], dtype=torch.float32)
+        return x, torch.from_numpy(self.y[i])
 
 
 def seed_worker(worker_id):
@@ -216,25 +261,70 @@ def seed_worker(worker_id):
     random.seed(s)
 
 
-def make_model():
-    return timm.create_model(BACKBONE, pretrained=True, num_classes=len(LABELS), drop_path_rate=DROP_PATH)
+# -- Model B: CLIP image encoder + text-initialised label prototypes -----------------
+_clip_tok = CLIPTokenizer.from_pretrained(CLIP_NAME)
 
 
-def site_weights(sites):
-    # Mirror the metric: each training site contributes equal total weight, so
-    # heavily photographed sites do not dominate. Normalised to mean 1.
-    if not SITE_WEIGHTED_LOSS:
-        return np.ones(len(sites), dtype=np.float32)
-    c = Counter(sites)
-    w = np.asarray([1.0 / c[s] for s in sites], dtype=np.float32)
-    return w / w.mean()
+class ClipPrototypeClassifier(nn.Module):
+    """logit_k = s * (cos(img, pos_k) - cos(img, neg_k)) + b_k.
+
+    pos_k starts as the mean CLIP text embedding of label k's prompts, and neg_k
+    as the mean embedding of generic "intact scene" prompts. Every parameter
+    (image encoder, projection, prototypes, bias) is trained on the photos.
+    """
+
+    def __init__(self):
+        super().__init__()
+        clip = CLIPModel.from_pretrained(CLIP_NAME, attn_implementation="eager")
+        with torch.no_grad():
+            def text_emb(texts):
+                tok = _clip_tok(texts, padding=True, return_tensors="pt")
+                e = clip.text_projection(clip.text_model(**tok).pooler_output)
+                return F.normalize(F.normalize(e, dim=-1).mean(0), dim=-1)
+
+            pos = torch.stack([text_emb(PROMPTS[lab]) for lab in LABELS])
+            neg = text_emb(NEG_PROMPTS).unsqueeze(0).repeat(len(LABELS), 1)
+        self.vision = clip.vision_model
+        self.proj = clip.visual_projection
+        self.pos = nn.Parameter(pos)
+        self.neg = nn.Parameter(neg)
+        self.bias = nn.Parameter(torch.zeros(len(LABELS)))
+        self.scale = 50.0  # fixed temperature so initial logits are a few units wide
+        del clip  # the text tower is only needed for the initialisation above
+
+    def head_parameters(self):
+        return [self.pos, self.neg, self.bias]
+
+    def forward(self, x):
+        f = self.vision(pixel_values=x, interpolate_pos_encoding=True).pooler_output
+        f = F.normalize(self.proj(f), dim=-1)
+        pos = F.normalize(self.pos, dim=-1)
+        neg = F.normalize(self.neg, dim=-1)
+        return self.scale * (f @ pos.T - f @ neg.T) + self.bias  # (batch, labels)
+
+
+class ConvNeXtClassifier(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = timm.create_model(
+            "convnext_tiny.fb_in22k_ft_in1k", pretrained=True, num_classes=len(LABELS), drop_path_rate=0.1
+        )
+
+    def head_parameters(self):
+        return list(self.net.get_classifier().parameters())
+
+    def forward(self, x):
+        return self.net(x)
+
+
+BUILDERS = {"convnext": ConvNeXtClassifier, "clip": ClipPrototypeClassifier}
 
 
 @torch.no_grad()
-def predict(model, imgs):
+def predict(model, imgs, eval_tf, batch):
     # Scores each image independently. Horizontal-flip TTA touches one sample at a time.
     model.eval()
-    dl = DataLoader(PhotoDS(imgs, tf=eval_tf), batch_size=BATCH * 2, shuffle=False, num_workers=NUM_WORKERS)
+    dl = DataLoader(PhotoDS(imgs, tf=eval_tf), batch_size=batch * 2, shuffle=False, num_workers=NUM_WORKERS)
     out = []
     for x in dl:
         x = x.to(DEVICE, non_blocking=True)
@@ -244,9 +334,8 @@ def predict(model, imgs):
     return np.concatenate(out)
 
 
-def train_one(tr_idx, fold):
+def train_one(spec, train_tf, tr_idx, fold):
     y_tr = Y[tr_idx]
-    w_tr = site_weights(train["site"].values[tr_idx])
     # pos_weight is computed on this fold's training split only. It is capped
     # because AP is a ranking metric and only needs rare positives to get enough
     # gradient, not full re-balancing.
@@ -256,35 +345,35 @@ def train_one(tr_idx, fold):
     g = torch.Generator()
     g.manual_seed(SEED + fold)
     dl = DataLoader(
-        PhotoDS([train_imgs[i] for i in tr_idx], y_tr, w_tr, train_tf),
-        batch_size=BATCH, shuffle=True, drop_last=True, num_workers=NUM_WORKERS,
+        PhotoDS([train_imgs[i] for i in tr_idx], y_tr, train_tf),
+        batch_size=spec["batch"], shuffle=True, drop_last=True, num_workers=NUM_WORKERS,
         worker_init_fn=seed_worker, generator=g, pin_memory=True,
     )
     torch.manual_seed(SEED + fold)
-    model = make_model().to(DEVICE)
-    head = list(model.get_classifier().parameters())
+    model = BUILDERS[spec["name"]]().to(DEVICE)
+    head = model.head_parameters()
     head_ids = {id(p) for p in head}
     body = [p for p in model.parameters() if id(p) not in head_ids]
     opt = torch.optim.AdamW(
-        [{"params": body, "lr": LR_BACKBONE}, {"params": head, "lr": LR_HEAD}], weight_decay=WEIGHT_DECAY
+        [{"params": body, "lr": spec["lr_body"], "weight_decay": 0.05},
+         {"params": head, "lr": spec["lr_head"], "weight_decay": 0.0}]
     )
-    total = EPOCHS * len(dl)
+    total = spec["epochs"] * len(dl)
     warm = WARMUP_EPOCHS * len(dl)
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: (s + 1) / warm if s < warm else 0.5 * (1 + np.cos(np.pi * (s - warm) / max(1, total - warm)))
     )
     scaler = torch.amp.GradScaler("cuda", enabled=True)
-    ema = timm.utils.ModelEmaV3(model, decay=EMA_DECAY) if EMA_DECAY > 0 else None
+    ema = timm.utils.ModelEmaV3(model, decay=EMA_DECAY)
 
-    for epoch in range(EPOCHS):
+    for epoch in range(spec["epochs"]):
         model.train()
         run = 0.0
-        for x, y, w in dl:
-            x, y, w = x.to(DEVICE, non_blocking=True), y.to(DEVICE), w.to(DEVICE)
+        for x, y in dl:
+            x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE)
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
                 logits = model(x).float()
-            loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_weight, reduction="none")
-            loss = (loss.mean(1) * w).mean()
+            loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_weight)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -292,11 +381,11 @@ def train_one(tr_idx, fold):
             scaler.step(opt)
             scaler.update()
             sched.step()
-            if ema is not None:
-                ema.update(model)
+            ema.update(model)
             run += loss.item()
-        print(f"  fold {fold} epoch {epoch + 1}/{EPOCHS} loss {run / len(dl):.4f} | elapsed {elapsed():.0f}s", flush=True)
-    return ema.module if ema is not None else model
+        print(f"  [{spec['name']}] fold {fold} epoch {epoch + 1}/{spec['epochs']} loss {run / len(dl):.4f} "
+              f"| elapsed {elapsed():.0f}s", flush=True)
+    return ema.module
 
 
 # -- Site-grouped CV: honest OOF metric + fold ensemble for test -------------------------
@@ -308,36 +397,42 @@ folds = list(sgkf.split(np.zeros(len(train)), strat, groups=train["site"].values
 for tr_idx, va_idx in folds:
     assert not set(train["site"].values[tr_idx]) & set(train["site"].values[va_idx]), "site leak"
 
-oof = np.full(Y.shape, np.nan, dtype=np.float64)
-test_pred = np.zeros((len(test), len(LABELS)), dtype=np.float64)
-for fold, (tr_idx, va_idx) in enumerate(folds):
-    model = train_one(tr_idx, fold)
-    oof[va_idx] = predict(model, [train_imgs[i] for i in va_idx])
-    fs, _ = site_weighted_macro_ap(train["id"].values[va_idx], Y[va_idx].astype(int), oof[va_idx])
-    print(f"Fold {fold} site-weighted macro AP: {fs:.4f} | elapsed {elapsed():.0f}s", flush=True)
-    test_pred += predict(model, test_imgs)
-    del model
-    torch.cuda.empty_cache()
+ids = train["id"].values
+oof = {s["name"]: np.zeros(Y.shape, dtype=np.float64) for s in MODEL_SPECS}
+test_pred = {s["name"]: np.zeros((len(test), len(LABELS)), dtype=np.float64) for s in MODEL_SPECS}
+for spec in MODEL_SPECS:
+    train_tf, eval_tf = make_transforms(spec)
+    for fold, (tr_idx, va_idx) in enumerate(folds):
+        model = train_one(spec, train_tf, tr_idx, fold)
+        oof[spec["name"]][va_idx] = predict(model, [train_imgs[i] for i in va_idx], eval_tf, spec["batch"])
+        fs, _ = site_weighted_macro_ap(ids[va_idx], Y[va_idx].astype(int), oof[spec["name"]][va_idx])
+        print(f"[{spec['name']}] fold {fold} site-weighted macro AP: {fs:.4f} | elapsed {elapsed():.0f}s", flush=True)
+        test_pred[spec["name"]] += predict(model, test_imgs, eval_tf, spec["batch"]) / N_FOLDS
+        del model
+        torch.cuda.empty_cache()
 
-test_pred /= N_FOLDS
+oof["ensemble"] = sum(ENSEMBLE_WEIGHTS[k] * oof[k] for k in ENSEMBLE_WEIGHTS)
+final = sum(ENSEMBLE_WEIGHTS[k] * test_pred[k] for k in ENSEMBLE_WEIGHTS)
 
-cv, per_label = site_weighted_macro_ap(train["id"].values, Y.astype(int), oof)
 print()
-print(f"OOF site-weighted macro AP ({N_FOLDS} folds): {cv:.4f}")
-for lab, ap, prev in zip(LABELS, per_label, Y.mean(0)):
-    print(f"  {lab:38s} AP {ap:.4f}  (prevalence {prev:.3f})")
+for name, P in oof.items():
+    cv, per_label = site_weighted_macro_ap(ids, Y.astype(int), P)
+    fold_scores = [site_weighted_macro_ap(ids[v], Y[v].astype(int), P[v])[0] for _, v in folds]
+    print(f"[{name}] OOF site-weighted macro AP {cv:.4f} | fold mean {np.mean(fold_scores):.4f} "
+          f"| per label {np.round(per_label, 3)}")
+np.save(os.path.join(os.path.dirname(OUT_PATH) or ".", "oof_predictions.npy"), np.stack([oof[k] for k in oof]))
 
 # -- Build submission --------------------------------------------------------------
-test_pred = np.clip(test_pred, 0.0, 1.0)
+final = np.clip(final, 0.0, 1.0)
 submission = pd.DataFrame({
     "id": test["id"].values,
-    "prediction": [json.dumps({lab: round(float(p[k]), 6) for k, lab in enumerate(LABELS)}) for p in test_pred],
+    "prediction": [json.dumps({lab: round(float(p[k]), 6) for k, lab in enumerate(LABELS)}) for p in final],
 })
 
 assert len(submission) == len(test), f"row count {len(submission)} != {len(test)}"
 assert submission["id"].is_unique, "duplicate ids"
 assert set(submission["id"]) == set(sample_sub["id"]), "ids differ from sample_submission"
-assert np.isfinite(test_pred).all() and (test_pred >= 0).all() and (test_pred <= 1).all()
+assert np.isfinite(final).all() and (final >= 0).all() and (final <= 1).all()
 for s in submission["prediction"].head(3):
     assert set(json.loads(s)) == set(LABELS)
 
