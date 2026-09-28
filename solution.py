@@ -5,14 +5,16 @@ CHALLENGE: flood-failure-mechanisms
 DOMAIN:    Computer Vision, multi-label image classification (4 labels)
 METRIC:    mean over labels of site-weighted average precision (w_i = 1 / n_site)
 
-Approach: pretrained visual encoders + trained per-label heads
-----------------------------------------------------------------
+Approach: fine-tuned ConvNeXt + trained heads on pretrained encoders
+---------------------------------------------------------------------
 The training set is small (841 photos, 54 sites) and several labels have
 positives at only 14-28 sites. Site-grouped out-of-fold experiments showed
-that heavily regularised heads trained on strong general-purpose encoders
-transfer to unseen sites better than larger models, and that different
-encoders carry different mechanisms (DINOv2 -> collapse/washout,
-SigLIP/CLIP -> scour/debris), so the heads are blended.
+that (a) heavily regularised heads trained on strong general-purpose
+encoders transfer to unseen sites at least as well as end-to-end
+fine-tuning, (b) different encoders carry different mechanisms (DINOv2 ->
+collapse/washout, SigLIP/CLIP -> scour/debris), and (c) a ConvNeXt
+fine-tuned end to end on full frames is complementary to both (OOF
+correlation ~0.6), so all of them are blended.
 
   Members (backbones run in fp16 on the GPU; every head is trained here):
     P1  SigLIP-B/16-384   mean embedding of 3 tiles              -> logistic regression
@@ -24,9 +26,15 @@ SigLIP/CLIP -> scour/debris), so the heads are blended.
         joint text-image space; s, b and delta are fitted on the training
         labels with an L2 pull of delta toward 0. An unanchored probe on the
         same features overfits site noise (OOF 0.253 vs 0.277 anchored).
-  Final score = sigmoid(0.4 * z(A) + 0.6 * mean_k z(logit P_k)), where z()
-  standardises each member with the mean/std of its OUT-OF-FOLD training
-  scores, so every test photo is scored on its own.
+    F   ConvNeXt-Tiny (ImageNet-22k) fine-tuned end to end on letterboxed
+        full frames: 10 epochs, warmup + cosine, body LR 3e-5 / head LR 1e-3,
+        EMA 0.99, capped pos_weight BCE, mild colour/blur/scale augmentation,
+        horizontal-flip TTA.
+  frozen = 0.4 * z(A) + 0.6 * mean_k z(logit P_k)
+  final  = sigmoid(0.7 * z(frozen) + 0.3 * z(logit F))
+  z() standardises each member with the mean/std of its OUT-OF-FOLD training
+  scores, so every test photo is scored on its own. Weights were chosen on
+  grouped OOF and sit on a flat plateau (0.3-0.5 for F give the same AP).
 
   Views: each photo is resized so its short side equals the model's native
   size (aspect preserved, so tilt angles are not distorted), then three
@@ -44,15 +52,17 @@ Compliance header (maps onto the challenge rules and the Eris guidebook)
 ------------------------------------------------------------------------
 Hardware / runtime (fixed plan)
   - Requires one CUDA GPU (graded on an Nvidia A10G). Always the same plan:
-    4 frozen encoders, fixed views, fixed batch sizes, 5 folds of probes.
+    4 frozen encoders with fixed views, 5 folds of heads, and 5 folds x 10
+    epochs of ConvNeXt fine-tuning with fixed batch size and worker count.
     Nothing depends on wall-clock time, CPU count or device detection, and
-    there is no fallback path. Measured end to end on a Kaggle T4: ~6.5 min
-    (feature extraction dominates); an A10G is faster.
+    there is no fallback path. Measured on a Kaggle T4: ~6.5 min for the
+    frozen encoders + ~17 min for ConvNeXt; an A10G is roughly 2x faster.
 Pretrained weights
   - Only general-purpose public checkpoints from Hugging Face:
     google/siglip-base-patch16-384, google/siglip-so400m-patch14-384,
-    facebook/dinov2-base, openai/clip-vit-base-patch16. No self-hosted or
-    previously fine-tuned weights.
+    facebook/dinov2-base, openai/clip-vit-base-patch16, and timm
+    convnext_tiny.fb_in22k_ft_in1k. No self-hosted or previously fine-tuned
+    weights; all fine-tuning happens in this script on every run.
 Data sources
   - Reads only train.csv, train_targets.csv, test.csv, sample_submission.csv
     and the JPEGs under images/. No external datasets, inspection records,
@@ -60,7 +70,8 @@ Data sources
     paraphrase the challenge's own label definitions and only set the
     anchor direction of head A.
 Training data / labels
-  - Only the 841 public training photographs and their labels fit the heads.
+  - Only the 841 public training photographs and their labels fit the heads
+    and the fine-tuned ConvNeXt.
     No synthetic images, no mixup/cutmix, no external labels.
 Test-set usage
   - Each test photo is scored independently: no pseudo-labelling, no
@@ -75,7 +86,8 @@ Model selection
     per label, per fold and per member.
 Determinism
   - Fixed seeds, deterministic cuDNN/cuBLAS (torch.use_deterministic_algorithms),
-    eager attention, fixed image order and batch composition, and
+    eager attention, fixed image order, DataLoader shuffling from a seeded
+    generator with a fixed worker count and seeded workers, and
     deterministic L-BFGS solvers for every head.
 """
 
@@ -93,11 +105,15 @@ GLOBAL_START = time.time()
 import numpy as np
 import pandas as pd
 import torch
+import timm
+import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms.v2 as T
 from PIL import Image, ImageOps
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score
 from sklearn.preprocessing import StandardScaler
+from torch.utils.data import DataLoader, Dataset
 from scipy.optimize import minimize
 from transformers import AutoModel, AutoTokenizer
 
@@ -182,6 +198,7 @@ N_FOLDS = 5
 PROBE_C = 0.003
 ANCHOR_LAMBDA = 1e-3  # L2 pull of the anchored probe toward the codebook text direction
 ANCHOR_WEIGHT = 0.4  # blend weight of the anchored probe; the rest is split over probes
+FINETUNE_WEIGHT = 0.3  # weight of the fine-tuned ConvNeXt vs the frozen-encoder blend
 BATCH = 32
 
 CLIP_NORM = ([0.4815, 0.4578, 0.4082], [0.2686, 0.2613, 0.2758])
@@ -426,17 +443,146 @@ for tr_idx, va_idx in FOLDS:
 oof_logit["anchored_" + ANCHOR_MEMBER], test_logit["anchored_" + ANCHOR_MEMBER] = oof, te
 
 
+# -- Fine-tuned member: ConvNeXt-Tiny trained end to end on the photos ------------------
+# Full-frame letterboxed photos (aspect kept, whole frame visible) complement the
+# tile-based frozen heads. Recipe: short warmup, cosine decay, lower LR for the
+# pretrained body than the new head, EMA weights, capped positive weights, and
+# mild photometric / scale augmentation. Horizontal flip is the only geometric
+# flip: "tilted" and "collapsed" are defined relative to gravity.
+FT_H, FT_W = 384, 576
+FT_CACHE_H, FT_CACHE_W = 422, 633  # letterbox cache, cropped/resized to FT_H x FT_W
+FT_EPOCHS, FT_BATCH, FT_WARMUP = 10, 16, 1
+FT_LR_BODY, FT_LR_HEAD, FT_EMA = 3e-5, 1e-3, 0.99
+NUM_WORKERS = 2  # fixed, not derived from the machine
+
+
+def letterbox(img, h, w):
+    return np.asarray(ImageOps.pad(img, (w, h), method=Image.BICUBIC, color=(0, 0, 0)), dtype=np.uint8)
+
+
+FT_IMAGES = [letterbox(img, FT_CACHE_H, FT_CACHE_W) for img in IMAGES]
+ft_train_tf = T.Compose([
+    T.ToImage(),
+    T.RandomResizedCrop((FT_H, FT_W), scale=(0.7, 1.0), ratio=(1.35, 1.65), antialias=True),
+    T.RandomHorizontalFlip(),
+    T.RandomApply([T.ColorJitter(0.25, 0.25, 0.15, 0.03)], p=0.8),
+    T.RandomApply([T.GaussianBlur(3)], p=0.1),
+    T.ToDtype(torch.float32, scale=True),
+    T.Normalize(*IMAGENET_NORM),
+])
+ft_eval_tf = T.Compose([T.ToImage(), T.Resize((FT_H, FT_W), antialias=True),
+                        T.ToDtype(torch.float32, scale=True), T.Normalize(*IMAGENET_NORM)])
+
+
+class PhotoDS(Dataset):
+    def __init__(self, imgs, y=None, tf=None):
+        self.imgs, self.y, self.tf = imgs, y, tf
+
+    def __len__(self):
+        return len(self.imgs)
+
+    def __getitem__(self, i):
+        x = self.tf(self.imgs[i])
+        return x if self.y is None else (x, torch.from_numpy(self.y[i]))
+
+
+def seed_worker(worker_id):
+    s = torch.initial_seed() % 2**32
+    np.random.seed(s)
+    random.seed(s)
+
+
+@torch.no_grad()
+def ft_predict(model, idx):
+    """Mean sigmoid over the photo and its horizontal flip (per-photo TTA)."""
+    model.eval()
+    dl = DataLoader(PhotoDS([FT_IMAGES[i] for i in idx], tf=ft_eval_tf), batch_size=FT_BATCH * 2,
+                    shuffle=False, num_workers=NUM_WORKERS)
+    out = []
+    for x in dl:
+        x = x.to(DEVICE, non_blocking=True)
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            p = torch.sigmoid(model(x).float()) + torch.sigmoid(model(torch.flip(x, dims=[3])).float())
+        out.append((p / 2).cpu().numpy())
+    return np.concatenate(out)
+
+
+def ft_train(tr_idx, fold):
+    y_tr = Y[tr_idx].astype(np.float32)
+    pos = y_tr.sum(0).clip(min=1)
+    pos_weight = torch.tensor(np.sqrt((len(y_tr) - pos) / pos).clip(1, 4), dtype=torch.float32, device=DEVICE)
+    g = torch.Generator()
+    g.manual_seed(SEED + fold)
+    dl = DataLoader(PhotoDS([FT_IMAGES[i] for i in tr_idx], y_tr, ft_train_tf), batch_size=FT_BATCH,
+                    shuffle=True, drop_last=True, num_workers=NUM_WORKERS, worker_init_fn=seed_worker,
+                    generator=g, pin_memory=True)
+    torch.manual_seed(SEED + fold)
+    model = timm.create_model("convnext_tiny.fb_in22k_ft_in1k", pretrained=True, num_classes=4,
+                              drop_path_rate=0.1).to(DEVICE)
+    head = list(model.get_classifier().parameters())
+    head_ids = {id(p) for p in head}
+    body = [p for p in model.parameters() if id(p) not in head_ids]
+    opt = torch.optim.AdamW([{"params": body, "lr": FT_LR_BODY, "weight_decay": 0.05},
+                             {"params": head, "lr": FT_LR_HEAD, "weight_decay": 0.0}])
+    total, warm = FT_EPOCHS * len(dl), FT_WARMUP * len(dl)
+    sched = torch.optim.lr_scheduler.LambdaLR(
+        opt, lambda s: (s + 1) / warm if s < warm else 0.5 * (1 + np.cos(np.pi * (s - warm) / max(1, total - warm))))
+    scaler = torch.amp.GradScaler("cuda")
+    ema = timm.utils.ModelEmaV3(model, decay=FT_EMA)
+    for epoch in range(FT_EPOCHS):
+        model.train()
+        for x, y in dl:
+            x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE)
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                logits = model(x).float()
+            loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_weight)
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+            scaler.step(opt)
+            scaler.update()
+            sched.step()
+            ema.update(model)
+    return ema.module
+
+
+oof = np.zeros((N_TR, 4))
+te = np.zeros((len(test), 4))
+test_idx = np.arange(N_TR, len(IMAGES))
+for fold, (tr_idx, va_idx) in enumerate(FOLDS):
+    model = ft_train(tr_idx, fold)
+    oof[va_idx] = ft_predict(model, va_idx)
+    te += ft_predict(model, test_idx) / N_FOLDS
+    print(f"  convnext fold {fold}: macro AP {site_weighted_macro_ap(IDS[va_idx], Y[va_idx], oof[va_idx]):.4f} "
+          f"| elapsed {elapsed():.0f}s", flush=True)
+    del model
+    torch.cuda.empty_cache()
+oof_logit["convnext_ft"], test_logit["convnext_ft"] = logit(oof), logit(te)
+
 # -- Blend: standardise each member with its OOF training statistics ------------------
+def zscore(name, v):
+    return (v - STATS[name][0]) / STATS[name][1]
+
+
+def frozen_score(scores):
+    probes = np.mean([zscore(m, scores[m]) for m in PROBE_MEMBERS], 0)
+    return ANCHOR_WEIGHT * zscore("anchored_" + ANCHOR_MEMBER, scores["anchored_" + ANCHOR_MEMBER]) \
+        + (1 - ANCHOR_WEIGHT) * probes
+
+
 def blend(scores):
-    """scores: dict member -> (n,4). Standardisation uses OOF train stats only, so a
-    test photo's score never depends on other test photos."""
-    probes = np.mean([(scores[m] - STATS[m][0]) / STATS[m][1] for m in PROBE_MEMBERS], 0)
-    ak = "anchored_" + ANCHOR_MEMBER
-    anchored = (scores[ak] - STATS[ak][0]) / STATS[ak][1]
-    return 1.0 / (1.0 + np.exp(-(ANCHOR_WEIGHT * anchored + (1 - ANCHOR_WEIGHT) * probes)))
+    """scores: dict member -> (n,4). Every standardisation uses OUT-OF-FOLD train
+    statistics only, so a test photo's score never depends on other test photos."""
+    fz = frozen_score(scores)
+    fz = (fz - FROZEN_STATS[0]) / FROZEN_STATS[1]
+    z = (1 - FINETUNE_WEIGHT) * fz + FINETUNE_WEIGHT * zscore("convnext_ft", scores["convnext_ft"])
+    return 1.0 / (1.0 + np.exp(-z))
 
 
 STATS = {m: (v.mean(0), v.std(0) + 1e-9) for m, v in oof_logit.items()}
+_fz = frozen_score(oof_logit)
+FROZEN_STATS = (_fz.mean(0), _fz.std(0) + 1e-9)
 oof_final = blend(oof_logit)
 final = blend(test_logit)
 
