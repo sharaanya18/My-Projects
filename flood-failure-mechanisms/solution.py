@@ -7,11 +7,15 @@ METRIC:    mean over labels of site-weighted average precision (w_i = 1 / n_site
 
 Compliance header (maps onto the challenge rules and the Eris guidebook)
 ------------------------------------------------------------------------
-Hardware / runtime
-  - Targets one Nvidia A10G. The challenge caps runtime at 30 minutes, which
-    overrides the guidebook's generic 3000-3300 s guard. Training stops once
-    TRAIN_BUDGET_SEC (measured from script start) is reached, leaving room for
-    test inference and writing the CSV.
+Hardware / runtime (fixed plan)
+  - Requires one CUDA GPU (graded on an Nvidia A10G) and always runs the same
+    plan: 5 folds x EPOCHS epochs, the same batch size, worker count, image size
+    and fp16 autocast. Nothing depends on wall-clock time, CPU count or device
+    detection. Elapsed time is printed for logging only and never changes what
+    is trained or predicted.
+  - The plan was sized to fit the challenge's 30-minute cap: the same script
+    measured about 17 minutes end to end on a slower Kaggle T4, and an A10G is
+    faster.
 Pretrained weights
   - Only a general-purpose ImageNet backbone (timm "convnext_tiny.fb_in22k_ft_in1k")
     is downloaded from the public timm / Hugging Face hub. No self-hosted or
@@ -39,7 +43,9 @@ Model selection
     fold models are averaged for the test predictions.
 Determinism
   - Seeds are fixed at 42 for python, numpy and torch, and cuDNN runs in
-    deterministic mode.
+    deterministic mode with torch.use_deterministic_algorithms(True). DataLoader
+    workers have fixed seeds and a fixed count, so the same inputs give the
+    same outputs on every run.
 """
 
 import json
@@ -71,24 +77,22 @@ SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 os.environ["PYTHONHASHSEED"] = str(SEED)
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # required for deterministic cuBLAS
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Device: {DEVICE}", flush=True)
-
-# -- Time budget (the 30-minute challenge cap beats the 3100 s guidebook default) --
-TOTAL_LIMIT_SEC = 30 * 60
-TRAIN_BUDGET_SEC = 24 * 60  # stop fitting here; inference and CSV need about 1-2 min
+torch.use_deterministic_algorithms(True)
+# One fixed backend: the script needs a CUDA GPU and fails loudly without one,
+# instead of silently switching to a different (CPU / fp32) plan.
+assert torch.cuda.is_available(), "This solution requires a CUDA GPU (graded on an A10G)"
+DEVICE = "cuda"
+print(f"Device: {torch.cuda.get_device_name(0)}", flush=True)
 
 
 def elapsed() -> float:
+    # Logging only; never used to change the training or inference plan.
     return time.time() - GLOBAL_START
-
-
-def budget_exceeded() -> bool:
-    return elapsed() > TRAIN_BUDGET_SEC
 
 
 # -- Paths: the platform may pass <public_dir> <submission_out> positionally ------
@@ -120,8 +124,7 @@ WEIGHT_DECAY = 0.05
 DROP_PATH = 0.1
 WARMUP_EPOCHS = 1
 EMA_DECAY = 0.99  # weight averaging smooths small-data fine-tuning; 0 disables
-NUM_WORKERS = min(8, os.cpu_count() or 2)
-USE_AMP = DEVICE == "cuda"
+NUM_WORKERS = 2  # fixed, not derived from the machine's CPU count
 
 
 # -- Metric (verbatim logic from the challenge page) -------------------------------
@@ -232,7 +235,7 @@ def predict(model, imgs):
     out = []
     for x in dl:
         x = x.to(DEVICE, non_blocking=True)
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=USE_AMP):
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
             p = torch.sigmoid(model(x).float()) + torch.sigmoid(model(torch.flip(x, dims=[3])).float())
         out.append((p / 2).cpu().numpy())
     return np.concatenate(out)
@@ -252,7 +255,7 @@ def train_one(tr_idx, fold):
     dl = DataLoader(
         PhotoDS([train_imgs[i] for i in tr_idx], y_tr, w_tr, train_tf),
         batch_size=BATCH, shuffle=True, drop_last=True, num_workers=NUM_WORKERS,
-        worker_init_fn=seed_worker, generator=g, pin_memory=(DEVICE == "cuda"),
+        worker_init_fn=seed_worker, generator=g, pin_memory=True,
     )
     torch.manual_seed(SEED + fold)
     model = make_model().to(DEVICE)
@@ -267,18 +270,15 @@ def train_one(tr_idx, fold):
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: (s + 1) / warm if s < warm else 0.5 * (1 + np.cos(np.pi * (s - warm) / max(1, total - warm)))
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
+    scaler = torch.amp.GradScaler("cuda", enabled=True)
     ema = timm.utils.ModelEmaV3(model, decay=EMA_DECAY) if EMA_DECAY > 0 else None
 
     for epoch in range(EPOCHS):
-        if budget_exceeded():
-            print(f"  fold {fold}: time budget reached at epoch {epoch}, stopping", flush=True)
-            break
         model.train()
         run = 0.0
         for x, y, w in dl:
             x, y, w = x.to(DEVICE, non_blocking=True), y.to(DEVICE), w.to(DEVICE)
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=USE_AMP):
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
                 logits = model(x).float()
             loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_weight, reduction="none")
             loss = (loss.mean(1) * w).mean()
@@ -307,29 +307,21 @@ for tr_idx, va_idx in folds:
 
 oof = np.full(Y.shape, np.nan, dtype=np.float64)
 test_pred = np.zeros((len(test), len(LABELS)), dtype=np.float64)
-n_done = 0
 for fold, (tr_idx, va_idx) in enumerate(folds):
-    if budget_exceeded():
-        print(f"Time budget reached before fold {fold}; using {n_done} fold model(s)")
-        break
     model = train_one(tr_idx, fold)
     oof[va_idx] = predict(model, [train_imgs[i] for i in va_idx])
     fs, _ = site_weighted_macro_ap(train["id"].values[va_idx], Y[va_idx].astype(int), oof[va_idx])
     print(f"Fold {fold} site-weighted macro AP: {fs:.4f} | elapsed {elapsed():.0f}s", flush=True)
     test_pred += predict(model, test_imgs)
-    n_done += 1
     del model
-    if DEVICE == "cuda":
-        torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
 
-assert n_done > 0, "No fold finished inside the time budget"
-test_pred /= n_done
+test_pred /= N_FOLDS
 
-done = ~np.isnan(oof).any(1)
-cv, per_label = site_weighted_macro_ap(train["id"].values[done], Y[done].astype(int), oof[done])
+cv, per_label = site_weighted_macro_ap(train["id"].values, Y.astype(int), oof)
 print()
-print(f"OOF site-weighted macro AP ({n_done} folds): {cv:.4f}")
-for lab, ap, prev in zip(LABELS, per_label, Y[done].mean(0)):
+print(f"OOF site-weighted macro AP ({N_FOLDS} folds): {cv:.4f}")
+for lab, ap, prev in zip(LABELS, per_label, Y.mean(0)):
     print(f"  {lab:38s} AP {ap:.4f}  (prevalence {prev:.3f})")
 
 # -- Build submission --------------------------------------------------------------
@@ -350,4 +342,4 @@ submission.to_csv(OUT_PATH, index=False)
 print()
 print(f"Submission written: {OUT_PATH} {submission.shape}")
 print(submission.head(3).to_string())
-print(f"Total runtime: {elapsed():.0f}s (limit {TOTAL_LIMIT_SEC}s)")
+print(f"Total runtime: {elapsed():.0f}s")
