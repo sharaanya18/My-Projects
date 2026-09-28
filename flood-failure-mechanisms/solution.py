@@ -123,6 +123,7 @@ LR_HEAD = 1e-3
 WEIGHT_DECAY = 0.05
 DROP_PATH = 0.1
 WARMUP_EPOCHS = 1
+SITE_WEIGHTED_LOSS = True  # weight each training site equally in the loss, like the metric
 EMA_DECAY = 0.99  # weight averaging smooths small-data fine-tuning; 0 disables
 NUM_WORKERS = 2  # fixed, not derived from the machine's CPU count
 
@@ -222,6 +223,8 @@ def make_model():
 def site_weights(sites):
     # Mirror the metric: each training site contributes equal total weight, so
     # heavily photographed sites do not dominate. Normalised to mean 1.
+    if not SITE_WEIGHTED_LOSS:
+        return np.ones(len(sites), dtype=np.float32)
     c = Counter(sites)
     w = np.asarray([1.0 / c[s] for s in sites], dtype=np.float32)
     return w / w.mean()
