@@ -17,7 +17,7 @@ SOL = {sol!r}
 VAL = {val!r}
 Path("/kaggle/working/solution.py").write_text(SOL)
 Path("/kaggle/working/validate.py").write_text(VAL)
-data = next(Path(r).parent for r, _, fs in os.walk("/kaggle/input") if "paragraphs.csv" in fs)
+data = next(Path(r) for r, _, fs in os.walk("/kaggle/input") if "paragraphs.csv" in fs)
 print("data dir:", data, flush=True)
 import torch; print("cuda:", torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else "-", flush=True)
 cmd = [sys.executable, "-u", "validate.py", str(data), "/kaggle/working/cv_result.json", "--cfg", {cfg!r}, "--cluster-seeds", {seeds!r}]
