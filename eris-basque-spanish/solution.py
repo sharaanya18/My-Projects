@@ -58,6 +58,7 @@ CFG = dict(
     seed=42,
     eval_batch=64,
     threads=4,
+    amp=True,                # fp16 autocast + GradScaler (same code path on T4 validation and A10G)
 )
 
 
@@ -113,7 +114,7 @@ def embed(model, tok, texts, device, cfg=CFG):
     """Mean-pooled, L2-normalised embeddings for a list of raw texts (grad flows if enabled)."""
     batch = tok([cfg["prefix"] + t for t in texts], padding=True, truncation=True,
                 max_length=cfg["max_len"], return_tensors="pt").to(device)
-    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+    with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=cfg["amp"]):
         h = model(**batch).last_hidden_state
     m = batch["attention_mask"].unsqueeze(-1).to(h.dtype)
     return F.normalize(((h * m).sum(1) / m.sum(1)).float(), dim=-1)
@@ -157,6 +158,7 @@ def fine_tune(model, tok, galleries, texts, device, cfg=CFG, log=print):
     warm = max(1, int(cfg["warmup_frac"] * total))
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: (s + 1) / warm if s < warm else max(0.0, (total - s) / max(1, total - warm)))
+    scaler = torch.amp.GradScaler("cuda", enabled=cfg["amp"])
     p0 = next(model.parameters()).detach().clone()
     step = 0
     for ep in range(cfg["epochs"]):
@@ -170,9 +172,11 @@ def fine_tune(model, tok, galleries, texts, device, cfg=CFG, log=print):
             target = torch.tensor([pos[q[2]] for q in qs], device=device)
             loss = F.cross_entropy(qe @ ce.T / cfg["temperature"], target)
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
             sched.step()
             if step == 0:  # live invariant: the backbone really moved after the first update
                 assert not torch.equal(p0, next(model.parameters()).detach().cpu().to(p0.device)), "no update"

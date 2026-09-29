@@ -4,7 +4,7 @@ import torch, pandas as pd
 import solution as S
 
 pub = sys.argv[1]
-cfg = {**S.CFG, "epochs": 1, "max_len": 48, "queries_per_step": 4, "eval_batch": 16}
+cfg = {**S.CFG, "epochs": 1, "max_len": 48, "queries_per_step": 4, "eval_batch": 16, "amp": False}
 texts, train, test = S.load_tables(pub)
 g_tr = S.build_galleries(train, True)
 g_te = S.build_galleries(test, False)
