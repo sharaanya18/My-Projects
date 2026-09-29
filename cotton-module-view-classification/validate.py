@@ -28,6 +28,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 import timm
 from sklearn.model_selection import StratifiedKFold
 
@@ -41,11 +42,25 @@ IMG_H, IMG_W = 144, 256
 MEAN = [0.485, 0.456, 0.406]
 STD = [0.229, 0.224, 0.225]
 
+
+class RandomNightSim:
+    def __init__(self, p=0.15, gamma_range=(1.8, 4.5)):
+        self.p = p
+        self.gamma_range = gamma_range
+
+    def __call__(self, img):
+        if random.random() < self.p:
+            img = TF.adjust_gamma(img, random.uniform(*self.gamma_range))
+        return img
+
+
 train_tf = T.Compose([
     T.RandomResizedCrop((IMG_H, IMG_W), scale=(0.75, 1.0), ratio=(1.6, 1.9)),
     T.RandomHorizontalFlip(p=0.5),
     T.RandomRotation(8),
-    T.ColorJitter(brightness=0.35, contrast=0.35, saturation=0.25, hue=0.04),
+    T.ColorJitter(brightness=0.35, contrast=0.35, saturation=0.25, hue=0.15),
+    T.RandomGrayscale(p=0.1),
+    RandomNightSim(p=0.15),
     T.RandomApply([T.GaussianBlur(3, sigma=(0.1, 1.5))], p=0.2),
     T.ToTensor(),
     T.Normalize(MEAN, STD),
