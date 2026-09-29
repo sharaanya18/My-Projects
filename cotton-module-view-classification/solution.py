@@ -1,31 +1,3 @@
-"""
-solution.py -- cotton-module view-geometry classifier (background / end_view / side_view)
-
-CHALLENGE:  Project Eris cotton-module view classification
-DOMAIN:     Computer Vision (image classification, 3 classes)
-METRIC:     0.70 * macro_f1 + 0.15 * end_view_recall(class 1) + 0.15 * side_view_precision(class 2)
-
-Design summary (see accompanying README for the full write-up):
-  - The 570-row holdout is one complete operational family absent from training, so the
-    real risk is domain shift (lighting, camera, distance), not in-distribution accuracy.
-    A quick empirical probe (clustering train images by color/lighting and holding one
-    cluster out) showed an ~0.12 point drop vs. a random split -- so this script leans on
-    strong photometric/geometric augmentation and a 5-fold ensemble rather than chasing
-    the highest possible in-fold CV score.
-  - end_view is the rare class (~9% of train) but is explicitly rewarded on recall, and
-    side_view is the majority class (~59%) but is explicitly rewarded on precision, so
-    decision thresholds are tuned directly against the competition's own metric formula
-    using only out-of-fold training predictions (never the test set).
-  - Training uses a FIXED schedule (5 folds x 22 epochs, no wall-clock-based early exit).
-    A GPU dry run of this exact pipeline showed ~12s/epoch, so the full fixed schedule
-    finishes in ~20-25 minutes -- comfortably inside the time cap without ever needing to
-    branch on elapsed time. Deciding how much work to do (which fold/epoch/config to keep)
-    based on measured wall-clock time makes a script's output depend on how fast the
-    machine happens to run it, which is a non-deterministic-execution violation; early
-    stopping here is instead keyed on validation score, which is fixed given fixed seeds
-    and data regardless of hardware speed.
-"""
-
 import os
 import sys
 import random
@@ -44,9 +16,6 @@ import torchvision.transforms as T
 import timm
 from sklearn.model_selection import StratifiedKFold
 
-# ---------------------------------------------------------------------------
-# Reproducibility
-# ---------------------------------------------------------------------------
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
@@ -59,18 +28,8 @@ if torch.cuda.is_available():
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Device: {DEVICE}")
 
-# ---------------------------------------------------------------------------
-# GLOBAL_START is used only for elapsed-time logging below -- never for control
-# flow. Branching training/inference behavior on measured wall-clock time would
-# make the script's output depend on hardware speed, which fails the platform's
-# deterministic-execution check (see module docstring).
-# ---------------------------------------------------------------------------
 GLOBAL_START = time.time()
 
-# ---------------------------------------------------------------------------
-# Contract: python3 solution.py <public_dir> <submission_out>
-# (falls back to the challenge's documented default paths for local testing)
-# ---------------------------------------------------------------------------
 PUBLIC_DIR = sys.argv[1] if len(sys.argv) > 1 else "./dataset/public"
 SUBMISSION_OUT = sys.argv[2] if len(sys.argv) > 2 else "./working/submission.csv"
 os.makedirs(os.path.dirname(SUBMISSION_OUT) or ".", exist_ok=True)
@@ -84,13 +43,11 @@ print(f"Train: {train.shape}, Test: {test.shape}")
 print("Class balance:", train["target"].value_counts().sort_index().to_dict())
 
 N_CLASSES = 3
-IMG_H, IMG_W = 144, 256  # native resolution of the provided JPEGs
+IMG_H, IMG_W = 144, 256
 
 MEAN = [0.485, 0.456, 0.406]
 STD = [0.229, 0.224, 0.225]
 
-# Photometric + mild geometric augmentation to fight the family-shift gap
-# (glare, night capture, overexposure, distance) rather than pure in-fold accuracy.
 train_tf = T.Compose([
     T.RandomResizedCrop((IMG_H, IMG_W), scale=(0.75, 1.0), ratio=(1.6, 1.9)),
     T.RandomHorizontalFlip(p=0.5),
@@ -167,21 +124,13 @@ def macro_f1_and_costs(y_true, y_pred):
 
 
 def apply_bias_and_argmax(probs, bias):
-    # bias: multiplicative boost per class applied to softmax probabilities before argmax.
-    # Tuned only against OOF *training* predictions -- never against the test set,
-    # so this stays a training-time decision rule, not test-time calibration.
     return np.argmax(probs * np.array(bias)[None, :], axis=1)
 
 
 def search_best_bias(oof_probs, y_true):
-    # Kept deliberately modest: end_view has only ~226 examples train-wide, so a wide
-    # search range can latch onto OOF sampling noise (verified on a tiny debug subset,
-    # where an unconstrained grid picked a 2.1x boost off just 19 examples). Sanity-check
-    # the resulting class distribution against train's via the free CSV check before
-    # trusting this on a real submission.
     best_score, best_bias = -1.0, (1.0, 1.0, 1.0)
-    for b1 in np.arange(0.9, 1.81, 0.05):     # boost end_view (recall-heavy, rare class)
-        for b2 in np.arange(0.85, 1.21, 0.05):  # tune side_view (precision-heavy, majority class)
+    for b1 in np.arange(0.9, 1.81, 0.05):
+        for b2 in np.arange(0.85, 1.21, 0.05):
             bias = (1.0, b1, b2)
             preds = apply_bias_and_argmax(oof_probs, bias)
             score, *_ = macro_f1_and_costs(y_true, preds)
@@ -190,10 +139,6 @@ def search_best_bias(oof_probs, y_true):
     return best_bias, best_score
 
 
-# ---------------------------------------------------------------------------
-# 5-fold stratified CV: each fold's model contributes to both the OOF estimate
-# (for threshold tuning) and the final test-set ensemble.
-# ---------------------------------------------------------------------------
 N_FOLDS = 5
 EPOCHS_PER_FOLD = 22
 PATIENCE = 5
@@ -212,8 +157,6 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(train, train["target"])):
     tr_ds = ModuleImageDataset(tr_df, PUBLIC_DIR, train_tf)
     va_ds = ModuleImageDataset(va_df, PUBLIC_DIR, eval_tf)
 
-    # Oversample the rare end_view class so each epoch sees a more balanced mix,
-    # instead of leaving the model to default to the majority side_view class.
     class_counts = tr_df["target"].value_counts().reindex([0, 1, 2]).values
     sample_weights = tr_df["target"].map(lambda c: 1.0 / class_counts[c]).values
     sampler = WeightedRandomSampler(sample_weights, num_samples=len(tr_df), replacement=True)
@@ -269,19 +212,12 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(train, train["target"])):
 assert folds_run > 0, "No fold finished training -- time budget too tight for even one fold."
 test_probs = test_probs_sum / folds_run
 
-# ---------------------------------------------------------------------------
-# Tune the decision rule against the metric's own recall/precision trade-off,
-# using only out-of-fold TRAIN predictions (no test-set visibility at all).
-# ---------------------------------------------------------------------------
-oof_mask = oof_probs.sum(axis=1) > 0  # folds that actually ran cover these rows
+oof_mask = oof_probs.sum(axis=1) > 0
 best_bias, best_oof_score = search_best_bias(oof_probs[oof_mask], train["target"].values[oof_mask])
 print(f"Best bias (class0, class1, class2) = {best_bias} | OOF score = {best_oof_score:.4f}")
 
 final_preds = apply_bias_and_argmax(test_probs, best_bias)
 
-# ---------------------------------------------------------------------------
-# Submission
-# ---------------------------------------------------------------------------
 submission = pd.DataFrame({"id": test["id"], "prediction": final_preds.astype(int)})
 
 assert len(submission) == len(test), f"Row count mismatch: {len(submission)} vs {len(test)}"
