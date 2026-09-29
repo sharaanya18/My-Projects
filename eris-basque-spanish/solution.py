@@ -178,9 +178,9 @@ def fine_tune(model, tok, galleries, texts, device, cfg=CFG, log=print):
             scaler.step(opt)
             scaler.update()
             sched.step()
-            if step == 0:  # live invariant: the backbone really moved after the first update
-                assert not torch.equal(p0, next(model.parameters()).detach().cpu().to(p0.device)), "no update"
             run, n, step = run + loss.item(), n + 1, step + 1
+        if ep == 0:  # live invariant: the backbone really moved (GradScaler skips a few early steps)
+            assert not torch.equal(p0, next(model.parameters()).detach().clone()), "no update"
         log(f"epoch {ep + 1}/{cfg['epochs']} mean train loss {run / n:.4f}")
     return model
 
