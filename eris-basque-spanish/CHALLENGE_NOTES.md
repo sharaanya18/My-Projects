@@ -2,8 +2,8 @@
 
 ## Status
 ```
-STATUS: PRE-GPU. solution.py written and CPU-smoke-tested only. Nothing has been fine-tuned or
-        measured on a GPU yet. CFG constants in solution.py are PROVISIONAL defaults, not tuned.
+STATUS: first GPU (Kaggle T4) measurement: held-out-cluster fold 0 frozen 0.2694 -> tuned 0.4120.
+        Full 5-fold run in progress. CFG constants are still PROVISIONAL defaults, not tuned.
 PUBLIC_SCORE: none submitted
 ```
 
@@ -55,4 +55,4 @@ PUBLIC_SCORE: none submitted
 ## Experiment log (fill from GPU runs; one variable per experiment)
 | id | change | cluster-CV tuned MRR (mean, sd) | frozen MRR same folds | note |
 |----|--------|-------------------------------|-----------------------|------|
-| -  | (none run yet) | | | |
+| e1 | provisional CFG (e5-base, 4 ep, lr 2e-5, max_len 192, fp16, T4), fold 0 only (crashed OOM at fold 1; leak fixed) | 0.4120 (1 fold, 873 queries, 11 galleries) | 0.2694 | single fold; sd unknown; NOT the private score |

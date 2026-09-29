@@ -12,6 +12,7 @@ Usage: python validate.py <public_dir> <out_json> [--cfg '{"epochs":2}'] [--fold
 Prints one compact SUMMARY table so a GPU round trip is a single paste-back.
 """
 import argparse
+import gc
 import json
 import sys
 import numpy as np
@@ -87,6 +88,7 @@ def main():
             rows.append(dict(cluster_seed=seed, fold=f, n_val_galleries=len(val_g), n_val_queries=len(ans), frozen=m0, tuned=m1))
             print(f"seed {seed} fold {f}: val galleries {len(val_g)} queries {len(ans)} frozen {m0:.4f} tuned {m1:.4f}", flush=True)
             del model
+            gc.collect()  # optimizer/scheduler form reference cycles; free them or the next fold OOMs
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
