@@ -33,6 +33,7 @@ from pathlib import Path
 # Must be set before CUDA initialises (deterministic cuBLAS).
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"  # allocator fragmentation only; no numerical effect
 
 import numpy as np
 import pandas as pd
@@ -58,6 +59,7 @@ CFG = dict(
     seed=42,
     eval_batch=64,
     threads=4,
+    grad_checkpoint=True,    # recompute activations in backward: same maths, ~3x less activation memory
     amp=True,                # fp16 autocast + GradScaler (same code path on T4 validation and A10G)
 )
 
@@ -107,6 +109,8 @@ def load_model(device, cfg=CFG):
     model = AutoModel.from_pretrained(cfg["model"], revision=cfg["revision"], attn_implementation="eager")
     assert model.config.model_type == "xlm-roberta", model.config.model_type
     torch.manual_seed(cfg["seed"])  # re-seed after load (no new heads here, kept for safety)
+    if cfg["grad_checkpoint"]:  # only active in train mode; the largest gallery (16 queries + ~60 candidates) needs it
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     return tok, model.to(device)
 
 
