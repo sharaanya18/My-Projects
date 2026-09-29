@@ -41,6 +41,7 @@ def main():
     ap.add_argument("--k", type=int, default=12)
     ap.add_argument("--cluster-seeds", default="0")
     ap.add_argument("--frozen-only", action="store_true")
+    ap.add_argument("--only-folds", default="", help="comma list of fold indices to run (default: all)")
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
     cfg = {**S.CFG, **json.loads(a.cfg)}
@@ -65,6 +66,8 @@ def main():
     for seed in [int(s) for s in a.cluster_seeds.split(",")]:
         fold_of = cluster_folds(gid, gv, a.folds, a.k, seed)
         for f in range(a.folds):
+            if a.only_folds and f not in [int(x) for x in a.only_folds.split(",")]:
+                continue
             val_g = {g: gals[g] for g in gid if fold_of[g] == f}
             tr_g = {g: gals[g] for g in gid if fold_of[g] != f}
             assert not set(val_g) & set(tr_g)

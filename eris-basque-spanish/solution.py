@@ -5,7 +5,8 @@ Run:  python3 solution.py <public_dir> <submission_out>
 
 COMPLIANCE HEADER (maps to the challenge's own Rules section)
 - Hardware: one CUDA GPU (A10G class) is required; the script raises if none is present.
-  There is no CPU fallback and no branching on hardware or on wall-clock time.
+  There is no CPU fallback (a missing GPU makes model loading fail) and no branching on hardware
+  or on wall-clock time.
 - Pretrained weights: one public multilingual encoder loaded from the Hugging Face hub at a pinned
   commit SHA. No self-hosted or previously fine-tuned weights, no GitHub installs, no external APIs.
 - Training data: ONLY the rows of train.csv joined to train_labels.csv (Spanish query paragraph ->
@@ -208,9 +209,7 @@ def main():
         timing.write(f"{time.time():.1f} {msg}\n")
         timing.flush()
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU required (no CPU fallback by design)")
-    device = torch.device("cuda")
+    device = torch.device("cuda")  # no fallback: without a GPU, model.to(device) fails loudly
     set_determinism(CFG["seed"], CFG["threads"])
 
     texts, train, test = load_tables(public_dir)
