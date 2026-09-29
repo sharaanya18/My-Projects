@@ -178,6 +178,16 @@ def search_best_bias(oof_probs, y_true):
     return best_bias, best_score
 
 
+def nested_bias_score(oof_probs, y_true, row_folds, n_folds):
+    nested_preds = np.zeros(len(y_true), dtype=int)
+    for f in range(n_folds):
+        out_mask = row_folds == f
+        in_mask = ~out_mask
+        bias_f, _ = search_best_bias(oof_probs[in_mask], y_true[in_mask])
+        nested_preds[out_mask] = apply_bias_and_argmax(oof_probs[out_mask], bias_f)
+    return macro_f1_and_costs(y_true, nested_preds)
+
+
 N_FOLDS = 5
 N_CLUSTERS = 10
 EPOCHS_PER_FOLD = 22
@@ -255,10 +265,25 @@ assert folds_run > 0, "No fold finished training -- time budget too tight for ev
 test_probs = test_probs_sum / folds_run
 
 oof_mask = oof_probs.sum(axis=1) > 0
-best_bias, best_oof_score = search_best_bias(oof_probs[oof_mask], train["target"].values[oof_mask])
-print(f"Best bias (class0, class1, class2) = {best_bias} | OOF score = {best_oof_score:.4f}")
+oof_p = oof_probs[oof_mask]
+oof_y = train["target"].values[oof_mask]
+oof_folds = row_folds[oof_mask]
 
-final_preds = apply_bias_and_argmax(test_probs, best_bias)
+plain_score, *_ = macro_f1_and_costs(oof_y, apply_bias_and_argmax(oof_p, (1.0, 1.0, 1.0)))
+pooled_bias, pooled_score = search_best_bias(oof_p, oof_y)
+nested_score, *_ = nested_bias_score(oof_p, oof_y, oof_folds, N_FOLDS)
+print(f"Plain argmax OOF score = {plain_score:.4f}")
+print(f"Pooled-fit bias {pooled_bias} OOF score = {pooled_score:.4f}")
+print(f"Nested cross-fitted bias OOF score = {nested_score:.4f}")
+
+if nested_score > plain_score:
+    deployed_bias = pooled_bias
+    print("Nested validation supports the bias correction; deploying pooled-fit bias.")
+else:
+    deployed_bias = (1.0, 1.0, 1.0)
+    print("Nested validation does not support the bias correction; deploying plain argmax.")
+
+final_preds = apply_bias_and_argmax(test_probs, deployed_bias)
 
 submission = pd.DataFrame({"id": test["id"], "prediction": final_preds.astype(int)})
 
