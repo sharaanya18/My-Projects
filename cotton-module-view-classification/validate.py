@@ -30,7 +30,7 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 import timm
-from sklearn.model_selection import StratifiedKFold
+from sklearn.cluster import KMeans
 
 SEED = 42
 random.seed(SEED)
@@ -100,6 +100,31 @@ def macro_f1_and_costs(y_true, y_pred):
     return score, macro_f1, end_recall, side_prec
 
 
+def describe_image(path):
+    im = Image.open(path).convert("RGB").resize((32, 18))
+    arr = np.asarray(im).astype(np.float32) / 255.0
+    means = arr.mean(axis=(0, 1))
+    stds = arr.std(axis=(0, 1))
+    hist = []
+    for c in range(3):
+        h, _ = np.histogram(arr[:, :, c], bins=4, range=(0, 1))
+        hist.extend(h / h.sum())
+    return np.concatenate([means, stds, hist])
+
+
+def build_cluster_folds(df, root, n_clusters, n_folds, seed):
+    feats = np.stack([describe_image(f"{root}/{p}") for p in df["image_path"]])
+    labels = KMeans(n_clusters=n_clusters, random_state=seed, n_init=10).fit_predict(feats)
+    sizes = pd.Series(labels).value_counts().sort_values(ascending=False)
+    fold_loads = [0] * n_folds
+    fold_of_cluster = {}
+    for cluster_id, size in sizes.items():
+        t = int(np.argmin(fold_loads))
+        fold_of_cluster[cluster_id] = t
+        fold_loads[t] += size
+    return np.array([fold_of_cluster[c] for c in labels])
+
+
 @torch.no_grad()
 def predict_proba(model, loader):
     model.eval()
@@ -127,11 +152,13 @@ def main():
     )
     print(f"train={train.shape} folds={args.folds} epochs={args.epochs} device={DEVICE}")
 
-    skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=SEED)
+    row_folds = build_cluster_folds(train, args.public_dir, 10, args.folds, SEED)
     oof_probs = np.zeros((len(train), 3))
     t0 = time.time()
 
-    for fold, (tr_idx, va_idx) in enumerate(skf.split(train, train["target"])):
+    for fold in range(args.folds):
+        tr_idx = np.where(row_folds != fold)[0]
+        va_idx = np.where(row_folds == fold)[0]
         tr_df, va_df = train.iloc[tr_idx], train.iloc[va_idx]
         tr_ds = ModuleImageDataset(tr_df, args.public_dir, train_tf)
         va_ds = ModuleImageDataset(va_df, args.public_dir, eval_tf)

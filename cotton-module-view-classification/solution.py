@@ -15,7 +15,7 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 import timm
-from sklearn.model_selection import StratifiedKFold
+from sklearn.cluster import KMeans
 
 SEED = 42
 random.seed(SEED)
@@ -115,6 +115,31 @@ def predict_proba(model, loader, tta=True):
     return np.concatenate(all_probs, axis=0)
 
 
+def describe_image(path):
+    im = Image.open(path).convert("RGB").resize((32, 18))
+    arr = np.asarray(im).astype(np.float32) / 255.0
+    means = arr.mean(axis=(0, 1))
+    stds = arr.std(axis=(0, 1))
+    hist = []
+    for c in range(3):
+        h, _ = np.histogram(arr[:, :, c], bins=4, range=(0, 1))
+        hist.extend(h / h.sum())
+    return np.concatenate([means, stds, hist])
+
+
+def build_cluster_folds(df, root, n_clusters, n_folds, seed):
+    feats = np.stack([describe_image(f"{root}/{p}") for p in df["image_path"]])
+    labels = KMeans(n_clusters=n_clusters, random_state=seed, n_init=10).fit_predict(feats)
+    sizes = pd.Series(labels).value_counts().sort_values(ascending=False)
+    fold_loads = [0] * n_folds
+    fold_of_cluster = {}
+    for cluster_id, size in sizes.items():
+        t = int(np.argmin(fold_loads))
+        fold_of_cluster[cluster_id] = t
+        fold_loads[t] += size
+    return np.array([fold_of_cluster[c] for c in labels])
+
+
 def macro_f1_and_costs(y_true, y_pred):
     f1s = []
     for c in range(3):
@@ -154,11 +179,12 @@ def search_best_bias(oof_probs, y_true):
 
 
 N_FOLDS = 5
+N_CLUSTERS = 10
 EPOCHS_PER_FOLD = 22
 PATIENCE = 5
 BATCH_SIZE = 32
 
-skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+row_folds = build_cluster_folds(train, PUBLIC_DIR, N_CLUSTERS, N_FOLDS, SEED)
 oof_probs = np.zeros((len(train), N_CLASSES))
 test_probs_sum = np.zeros((len(test), N_CLASSES))
 folds_run = 0
@@ -166,7 +192,9 @@ folds_run = 0
 test_ds = ModuleImageDataset(test.assign(target=-1), PUBLIC_DIR, eval_tf)
 test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
 
-for fold, (tr_idx, va_idx) in enumerate(skf.split(train, train["target"])):
+for fold in range(N_FOLDS):
+    tr_idx = np.where(row_folds != fold)[0]
+    va_idx = np.where(row_folds == fold)[0]
     tr_df, va_df = train.iloc[tr_idx], train.iloc[va_idx]
     tr_ds = ModuleImageDataset(tr_df, PUBLIC_DIR, train_tf)
     va_ds = ModuleImageDataset(va_df, PUBLIC_DIR, eval_tf)
