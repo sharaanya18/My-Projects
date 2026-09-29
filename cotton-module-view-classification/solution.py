@@ -16,6 +16,14 @@ Design summary (see accompanying README for the full write-up):
     side_view is the majority class (~59%) but is explicitly rewarded on precision, so
     decision thresholds are tuned directly against the competition's own metric formula
     using only out-of-fold training predictions (never the test set).
+  - Training uses a FIXED schedule (5 folds x 22 epochs, no wall-clock-based early exit).
+    A GPU dry run of this exact pipeline showed ~12s/epoch, so the full fixed schedule
+    finishes in ~20-25 minutes -- comfortably inside the time cap without ever needing to
+    branch on elapsed time. Deciding how much work to do (which fold/epoch/config to keep)
+    based on measured wall-clock time makes a script's output depend on how fast the
+    machine happens to run it, which is a non-deterministic-execution violation; early
+    stopping here is instead keyed on validation score, which is fixed given fixed seeds
+    and data regardless of hardware speed.
 """
 
 import os
@@ -52,15 +60,12 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Device: {DEVICE}")
 
 # ---------------------------------------------------------------------------
-# Time budget -- hard stop at ~52 min, leaving headroom for inference + write
+# GLOBAL_START is used only for elapsed-time logging below -- never for control
+# flow. Branching training/inference behavior on measured wall-clock time would
+# make the script's output depend on hardware speed, which fails the platform's
+# deterministic-execution check (see module docstring).
 # ---------------------------------------------------------------------------
 GLOBAL_START = time.time()
-TRAIN_BUDGET_SEC = 3100
-
-
-def budget_exceeded() -> bool:
-    return (time.time() - GLOBAL_START) > TRAIN_BUDGET_SEC
-
 
 # ---------------------------------------------------------------------------
 # Contract: python3 solution.py <public_dir> <submission_out>
@@ -203,10 +208,6 @@ test_ds = ModuleImageDataset(test.assign(target=-1), PUBLIC_DIR, eval_tf)
 test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
 
 for fold, (tr_idx, va_idx) in enumerate(skf.split(train, train["target"])):
-    if budget_exceeded():
-        print(f"Time budget reached before fold {fold}. Stopping CV early.")
-        break
-
     tr_df, va_df = train.iloc[tr_idx], train.iloc[va_idx]
     tr_ds = ModuleImageDataset(tr_df, PUBLIC_DIR, train_tf)
     va_ds = ModuleImageDataset(va_df, PUBLIC_DIR, eval_tf)
@@ -228,10 +229,6 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(train, train["target"])):
     best_score, best_state, no_improve = -1.0, None, 0
 
     for epoch in range(EPOCHS_PER_FOLD):
-        if budget_exceeded():
-            print(f"Time budget reached mid-fold {fold}. Using best checkpoint so far.")
-            break
-
         model.train()
         for xb, yb in tr_loader:
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)
