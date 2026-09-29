@@ -87,23 +87,56 @@ listed as allowed (one-sample-at-a-time, no test-set visibility).
 
 **Compliance** — real training/fine-tuning happens inside the script every
 run (no cached artifacts, no self-hosted weights), fixed seeds throughout,
-relative I/O paths, a 3100s time guard with graceful early stop, and a
-shape/uniqueness assertion before writing the submission. No external data,
-no synthetic images, no test-distribution calibration, no tabular-on-raw-
-pixels shortcut.
+relative I/O paths, and a shape/uniqueness assertion before writing the
+submission. No external data, no synthetic images, no test-distribution
+calibration, no tabular-on-raw-pixels shortcut. Note: training uses a fixed
+schedule (5 folds × 22 epochs, early stopping keyed on validation score only)
+rather than a wall-clock time guard — see Section 4 for why.
 
-## 4. Evidence this clears 0.75
+## 4. Evidence this clears 0.75 (measured, not projected)
 
 A deliberately tiny/fast proof-of-concept (480 images, half resolution, 4
-epochs, CPU, simple augmentation, *no* ensembling or threshold tuning) already
-scored **0.80** on a random in-distribution split. The full design adds
-5-fold ensembling, 22 epochs at native resolution, stronger domain-targeted
-augmentation, and metric-aware threshold tuning — but the ~0.12-point
-cross-family gap measured in Section 2 means the honest expectation on the
-true holdout is closer to **0.70–0.82** than a flat "add 0.05 to the smoke
-test." The design choices above (smaller backbone, heavier photometric
-augmentation, ensembling, OOF-only tuning) are specifically the ones that move
-the needle on the family-shift number, not the in-distribution one.
+epochs, CPU) scored 0.80 on a random in-distribution split, which motivated
+building the full pipeline. That full pipeline was then **actually run on a
+Kaggle GPU** (T4/P100) against the real 2,430/570 split, twice:
+
+| Run | Total runtime | Per-fold best scores | OOF score (bias-tuned) |
+|---|---|---|---|
+| 1st (had wall-clock guard, never triggered) | 741s (~12.4 min) | 0.829 / 0.818 / 0.785 / 0.816 / 0.786 | **0.8088** |
+| 2nd (guard removed, fully deterministic) | 775s (~12.9 min) | identical | **0.8088** |
+
+The two runs producing bit-identical per-fold scores, chosen bias
+`(1.0, 1.25, 1.05)`, and OOF score confirms the fix (removing wall-clock
+branching, described below) didn't change behavior — it was dead code that
+never fired, since the full schedule finishes in ~13 minutes against a
+90-minute cap.
+
+**0.8088 is in-distribution OOF, not the true held-out-family score** — the
+~0.12-point cross-family gap measured in Section 2 still applies, so the
+honest range for the real holdout is roughly **0.68–0.81**, comfortably
+straddling the 0.75 baseline rather than guaranteed above it. One more signal
+worth watching: the model's predicted test-set distribution (4.6% background
+/ 10.4% end_view / 85.1% side_view) is quite different from train's (31.7% /
+9.3% / 59.0%). That could be the unseen family genuinely looking different
+(fewer glare/background frames, more side-on shots), or the model
+over-committing to the majority class under distribution shift — there's no
+way to tell without ground truth, so treat it as an open risk rather than a
+red flag to "fix."
+
+### A real compliance bug caught along the way
+
+The initial version used a wall-clock time budget (`if elapsed() > BUDGET:
+break`) to cut training short if it ran long — standard advice in a lot of
+ML-competition boilerplate. Watching Project Eris's own pre-submission
+checker reject an unrelated solution for exactly this pattern
+("Deterministic Execution: your solution changes its training plan based on
+runtime conditions") made clear this script had the same latent bug: which
+fold/epoch gets kept would depend on how fast the GPU happened to run that
+day, which isn't reproducible. Since the measured runtime (~13 min) has huge
+margin against the cap, the fix was simply to remove the time-based branches
+entirely and rely only on a fixed schedule plus validation-score-based early
+stopping (deterministic given fixed seeds/data, independent of hardware
+speed).
 
 ## 5. Files
 
