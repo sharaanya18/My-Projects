@@ -2,8 +2,8 @@
 
 ## Status
 ```
-STATUS: first GPU (Kaggle T4) measurement: held-out-cluster fold 0 frozen 0.2694 -> tuned 0.4120.
-        Full 5-fold run in progress. CFG constants are still PROVISIONAL defaults, not tuned.
+STATUS: baseline recipe measured on 5 held-out-cluster folds (Kaggle T4): frozen 0.2530 -> tuned 0.3979.
+        Below the 0.5 target on held-out data. CFG constants are still PROVISIONAL, not tuned.
 PUBLIC_SCORE: none submitted
 ```
 
@@ -49,10 +49,10 @@ PUBLIC_SCORE: none submitted
   This overrides CLAUDE.md's time-guard template. compliance_scan.py will warn "NO TIME GUARD":
   expected, intentional.
 - Positional sys.argv, no CPU fallback, no import fallback, pinned HF revision, eager attention,
-  TF32 off, deterministic algorithms on. GPU determinism is UNTESTED (no GPU yet): run twice, diff.
+  TF32 off, deterministic algorithms on. On the T4 the deterministic flags raised no errors; bit-exact reproducibility across two runs is NOT yet verified (run twice, diff).
 - Nothing is fitted on test text (Q2): no TF-IDF, no test-side normalisation.
 
 ## Experiment log (fill from GPU runs; one variable per experiment)
 | id | change | cluster-CV tuned MRR (mean, sd) | frozen MRR same folds | note |
 |----|--------|-------------------------------|-----------------------|------|
-| e1 | provisional CFG (e5-base, 4 ep, lr 2e-5, max_len 192, fp16, T4), fold 0 only (crashed OOM at fold 1; leak fixed) | 0.4120 (1 fold, 873 queries, 11 galleries) | 0.2694 | single fold; sd unknown; NOT the private score |
+| e1 | provisional CFG: e5-base, 4 ep, lr 2e-5, max_len 192, 16 q/step, fp16 + grad-checkpoint, Kaggle T4, 5 held-out-cluster folds (seed 0) | **0.3979 (sd 0.0116)**; folds 0.412/0.395/0.391/0.410/0.381 | 0.2530 (sd 0.0092) | +0.145 on every fold. Below the 0.5 target. NOT the private score. ~13 min/fold on T4 |

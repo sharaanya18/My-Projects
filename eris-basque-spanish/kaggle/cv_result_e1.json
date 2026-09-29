@@ -1,0 +1,62 @@
+{
+ "cfg": {
+  "model": "intfloat/multilingual-e5-base",
+  "revision": "d128750597153bb5987e10b1c3493a34e5a4502a",
+  "prefix": "query: ",
+  "max_len": 192,
+  "epochs": 4,
+  "lr": 2e-05,
+  "weight_decay": 0.01,
+  "warmup_frac": 0.1,
+  "queries_per_step": 16,
+  "temperature": 0.05,
+  "grad_clip": 1.0,
+  "seed": 42,
+  "eval_batch": 64,
+  "threads": 4,
+  "grad_checkpoint": true,
+  "amp": true
+ },
+ "rows": [
+  {
+   "cluster_seed": 0,
+   "fold": 0,
+   "n_val_galleries": 11,
+   "n_val_queries": 873,
+   "frozen": 0.26941745341371615,
+   "tuned": 0.412034659140439
+  },
+  {
+   "cluster_seed": 0,
+   "fold": 1,
+   "n_val_galleries": 10,
+   "n_val_queries": 793,
+   "frozen": 0.25664304283664763,
+   "tuned": 0.39477407311190443
+  },
+  {
+   "cluster_seed": 0,
+   "fold": 2,
+   "n_val_galleries": 10,
+   "n_val_queries": 904,
+   "frozen": 0.2468324823823669,
+   "tuned": 0.3912987030833474
+  },
+  {
+   "cluster_seed": 0,
+   "fold": 3,
+   "n_val_galleries": 10,
+   "n_val_queries": 843,
+   "frozen": 0.2478708387588891,
+   "tuned": 0.4100917055621444
+  },
+  {
+   "cluster_seed": 0,
+   "fold": 4,
+   "n_val_galleries": 11,
+   "n_val_queries": 874,
+   "frozen": 0.24429053186890243,
+   "tuned": 0.38139806945444743
+  }
+ ]
+}
