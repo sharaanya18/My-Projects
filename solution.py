@@ -319,8 +319,11 @@ def train_fold(fit_idx, val_idx, seed, tag):
                 d = min(EMA_DECAY, (1 + ep * steps_per_epoch + bi) / (10 + ep * steps_per_epoch + bi))
                 for pe, pm in zip(ema.parameters(), model.parameters()):
                     pe.mul_(d).add_(pm.detach(), alpha=1 - d)
-                for be, bm in zip(ema.buffers(), model.buffers()):
-                    be.copy_(bm)
+                for be, bm in zip(ema.buffers(), model.buffers()):   # BN statistics are averaged too, so they
+                    if be.is_floating_point():                       # stay consistent with the averaged weights
+                        be.mul_(d).add_(bm, alpha=1 - d)
+                    else:
+                        be.copy_(bm)
             tot += loss.item()
         msg = f"[{tag}] epoch {ep + 1}/{EPOCHS} train_loss {tot / steps_per_epoch:.4f}"
         if ep + 1 >= FIRST_EVAL_EPOCH:
