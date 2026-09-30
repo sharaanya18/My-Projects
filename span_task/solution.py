@@ -1,4 +1,4 @@
-import csv, json, math, os, random, re, sys, time
+import csv, json, math, os, pickle, random, re, sys, time
 from collections import Counter, defaultdict
 import numpy as np
 
@@ -379,6 +379,9 @@ def main():
     Btr = [None] * len(train)
     Bte = [None] * len(target)
     ENC_BUDGET = float(os.environ.get("ENC_BUDGET", 1500))
+    CKPT = os.environ.get("CKPT_DIR")
+    if CKPT:
+        os.makedirs(CKPT, exist_ok=True)
     try:
         enc = BiEnc()
         groups = [r["group_id"] for r in train]
@@ -388,19 +391,31 @@ def main():
         for f in range(K):
             if time.time() - T_START > 3000:
                 raise RuntimeError("time guard: skipping remaining encoder folds")
-            tri = [r for r, fo in zip(train, folds) if fo != f]
             hold = [i for i, fo in enumerate(folds) if fo == f]
-            enc.fit(tri, per_fold, seed=f)
-            sc = enc.score([train[i] for i in hold])
-            for i, s in zip(hold, sc):
-                Btr[i], bi_names = bi_columns(s)
+            ck = os.path.join(CKPT, f"fold{f}.pkl") if CKPT else None
+            if ck and os.path.exists(ck):
+                res = pickle.load(open(ck, "rb"))
+            else:
+                tri = [r for r, fo in zip(train, folds) if fo != f]
+                enc.fit(tri, per_fold, seed=f)
+                res = [bi_columns(s) for s in enc.score([train[i] for i in hold])]
+                if ck:
+                    pickle.dump(res, open(ck, "wb"))
+            for i, (B, bi_names) in zip(hold, res):
+                Btr[i] = B
             log(f"encoder fold {f+1}/{K} done")
         if time.time() - T_START > 3400:
             raise RuntimeError("time guard: skipping final encoder")
-        enc.fit(train, per_fold * 1.5, seed=99)
-        sc = enc.score(target)
-        for i, s in enumerate(sc):
-            Bte[i], bi_names = bi_columns(s)
+        ck = os.path.join(CKPT, "final.pkl") if CKPT else None
+        if ck and os.path.exists(ck):
+            res = pickle.load(open(ck, "rb"))
+        else:
+            enc.fit(train, per_fold * 1.5, seed=99)
+            res = [bi_columns(s) for s in enc.score(target)]
+            if ck:
+                pickle.dump(res, open(ck, "wb"))
+        for i, (B, bi_names) in enumerate(res):
+            Bte[i] = B
         log("encoder features done")
     except Exception as e:
         log("encoder stage unavailable, falling back to tabular features only:", repr(e)[:200])
