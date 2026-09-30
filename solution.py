@@ -18,14 +18,38 @@ is therefore driven by week-disjoint validation (validation_folds.json).
     target (~ absolute error, the metric). AdamW, one-cycle schedule, EMA weights, dihedral /
     brightness / shift augmentation.
   * From the OOF predictions the script itself chooses (a) the epoch whose weights are used and
-    (b) a shrinkage calibration  pred = c + a * (raw - mean_raw)  (a in [0, 1.5], c the L1-optimal
+    (b) a shrinkage calibration  pred = c + a * (raw - mean_raw)  (a in [0.25, 1], c the L1-optimal
     shift), i.e. it learns how much of the model's spread transfers to unseen weeks.
   * Test prediction = mean over the fold models of their epoch-chosen predictions (each averaged
     over two dihedral views of the single row), then the calibration map. No test statistic is
     ever computed or used; each test row is predicted from its own pixels only.
   * Fixed seeds, fixed epoch counts, CPU only, fixed thread count: no branch depends on wall-clock
     time, hardware or file presence.
+
+COMPLIANCE SUMMARY (one line per rule of the task)
+  Hardware ............ CPU only; 10 threads fixed in the code (a --threads argument is accepted and ignored).
+  Pretrained weights .. none. Every weight starts from PyTorch's random initialisation and is trained here.
+  External data ....... none. Only train.csv, test.csv, train_images.npy, test_images.npy and
+                        validation_folds.json from the public directory are read.
+  Fitted state ........ CNN weights, the feature scaler, the grey-level thresholds (percentiles of the
+                        training pixels), the target mean/std, the chosen epoch and the calibration slope/shift
+                        are all computed in this script from the training rows. Nothing is loaded from disk
+                        except the released data; no checkpoint is written or read.
+  Design constants .... epochs, learning rate, width, dropout, augmentation strength are fixed constants of
+                        the recipe, identical on every run.
+  Model selection ..... the epoch and the calibration are picked from out-of-fold predictions on TRAINING weeks
+                        only; the choice is a deterministic function of the data, never of elapsed time.
+  Test rows ........... used only for plain per-row inference after all fitting is finished: each row is
+                        predicted from its own pixels. No statistic is computed over the test rows, no
+                        test-time adaptation, no pseudo-labelling, no grouping of similar test rows.
+  Not attempted ....... dating a row, identifying a snowflake, matching images to any outside collection,
+                        using row order or identifiers (identifiers are only copied into the output).
+  Predictor ........... a trained network; there is no rule engine. Hand-made statistics are only extra
+                        inputs to the network.
+  Determinism ......... fixed seeds per fold, torch deterministic mode, fixed thread count, no time-based or
+                        hardware-based branch. Two runs give identical output.
 """
+import argparse
 import json
 import os
 import random
@@ -70,8 +94,19 @@ torch.use_deterministic_algorithms(True)   # CPU-only, fixed plan: no backend / 
 print(f"cpu threads={N_THREADS}", flush=True)
 
 # --------------------------------------------------------------------------- paths / data
-public_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("./dataset/public")
-out_path = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("./working/submission.csv")
+parser = argparse.ArgumentParser()
+parser.add_argument("public_dir", nargs="?", default="./dataset/public")
+parser.add_argument("submission_out", nargs="?", default="./working/submission.csv")
+parser.add_argument("--data-dir", dest="data_dir", default=None)
+parser.add_argument("--output", dest="output", default=None)
+parser.add_argument("--threads", dest="threads", default=None)      # accepted for compatibility; the plan is fixed
+args, _unknown = parser.parse_known_args()
+public_dir = Path(args.data_dir or args.public_dir)
+out_path = Path(args.output or args.submission_out)
+
+for _f in ("train.csv", "test.csv", "sample_submission.csv", "train_images.npy", "test_images.npy", "validation_folds.json"):
+    if not (public_dir / _f).exists():
+        raise FileNotFoundError(f"required input missing: {public_dir / _f}")
 
 train = pd.read_csv(public_dir / "train.csv")
 test = pd.read_csv(public_dir / "test.csv")
@@ -247,8 +282,9 @@ def predict(model, X, Fh, bs=256):
 
 
 def train_fold(fit_idx, val_idx, seed, tag):
-    """Train on fit_idx; after every epoch from FIRST_EVAL_EPOCH on, predict the held-out weeks and the
-    test rows with the EMA weights. Returns {epoch: (val_pred, test_pred)}."""
+    """Train on fit_idx; after every epoch from FIRST_EVAL_EPOCH on, predict the held-out TRAINING weeks with
+    the EMA weights and keep a snapshot of those weights. The test rows are not touched here.
+    Returns {epoch: (val_pred, ema_state_dict)}."""
     set_seed(seed)
     model = SnowNet().to(memory_format=torch.channels_last)
     ema = SnowNet().to(memory_format=torch.channels_last)
@@ -288,7 +324,7 @@ def train_fold(fit_idx, val_idx, seed, tag):
         msg = f"[{tag}] epoch {ep + 1}/{EPOCHS} train_loss {tot / steps_per_epoch:.4f}"
         if ep + 1 >= FIRST_EVAL_EPOCH:
             pv = predict(ema, Xtr[val_idx], Ftr[val_idx])
-            out[ep + 1] = (pv, predict(ema, Xte, Fte))
+            out[ep + 1] = (pv, {k: v.clone() for k, v in ema.state_dict().items()})
             msg += f" | held-out-weeks MAE {np.abs(np.clip(pv, Y_LO, Y_HI) - ytr[val_idx]).mean():.3f}" \
                    f" (constant {np.abs(Y_MEDIAN - ytr[val_idx]).mean():.3f})"
         print(msg, flush=True)
@@ -297,14 +333,14 @@ def train_fold(fit_idx, val_idx, seed, tag):
 
 # One model per week-fold -> out-of-fold predictions for every training row of the folds that were run.
 oof = {ep: np.full(len(train), np.nan) for ep in range(FIRST_EVAL_EPOCH, EPOCHS + 1)}
-test_raw = {ep: [] for ep in oof}
+snapshots = {ep: [] for ep in oof}          # EMA weights per epoch, one entry per fold model
 for fi, fname in enumerate(RUN_FOLDS):
     val_idx = np.where(folds == fname)[0]
     fit_idx = np.where(folds != fname)[0]
     res = train_fold(fit_idx, val_idx, SEED + fi, f"fold {fname}")
-    for ep, (pv, pt) in res.items():
+    for ep, (pv, state) in res.items():
         oof[ep][val_idx] = pv
-        test_raw[ep].append(pt)
+        snapshots[ep].append(state)
 
 have = ~np.isnan(oof[EPOCHS])
 y_have = ytr[have]
@@ -323,8 +359,8 @@ print(f"chosen epoch {best_ep}", flush=True)
 # (b) shrinkage calibration fitted on the OOF predictions: pred = c + a * (raw - mean_raw)
 raw = oof[best_ep][have]
 raw_mean = raw.mean()
-best = (np.inf, 0.0, Y_MEDIAN)
-for a in np.linspace(0.0, 1.5, 31):
+best = (np.inf, 1.0, Y_MEDIAN)
+for a in np.linspace(0.25, 1.0, 16):        # shrink only; never collapses to a constant
     c = np.median(y_have - a * (raw - raw_mean))                 # L1-optimal shift for this slope
     m = np.abs(np.clip(c + a * (raw - raw_mean), Y_LO, Y_HI) - y_have).mean()
     if m < best[0]:
@@ -340,12 +376,29 @@ for fname in RUN_FOLDS:
     print(f"  {fname}: MAE {e_f:.3f} constant {b_f:.3f} score {1 - e_f / b_f:+.3f}", flush=True)
 
 # --------------------------------------------------------------------------- submission
-pred = np.clip(CAL_C + CAL_A * (np.mean(test_raw[best_ep], axis=0) - raw_mean), Y_LO, Y_HI)
-submission = pd.DataFrame({"id": test["id"], "temperature_c": np.round(pred, 2)})
+# Only now are the test rows used, and only for plain per-row inference: each fold model (at the epoch chosen
+# above from training weeks alone) predicts every test row from that row's own pixels; the predictions are
+# averaged over the fold models and passed through the calibration map fitted above.
+test_raw = []
+for state in snapshots[best_ep]:
+    net = SnowNet().to(memory_format=torch.channels_last)
+    net.load_state_dict(state)
+    test_raw.append(predict(net, Xte, Fte))
+pred = np.clip(CAL_C + CAL_A * (np.mean(test_raw, axis=0) - raw_mean), Y_LO, Y_HI)
+sample = pd.read_csv(public_dir / "sample_submission.csv")
+assert list(sample.columns) == ["id", "temperature_c"], "unexpected sample_submission columns"
+pred_by_id = dict(zip(test["id"], np.round(pred, 2)))
+assert set(pred_by_id) == set(sample["id"]) and len(pred_by_id) == len(sample), "id mismatch with sample_submission"
+submission = pd.DataFrame({"id": sample["id"], "temperature_c": [pred_by_id[i] for i in sample["id"]]})
 
 assert len(submission) == len(test), "row count mismatch"
 assert submission["id"].is_unique and set(submission["id"]) == set(test["id"]), "id mismatch"
 assert np.isfinite(submission["temperature_c"]).all(), "non-finite prediction"
 out_path.parent.mkdir(parents=True, exist_ok=True)
 submission.to_csv(out_path, index=False)
-print(f"wrote {out_path} {submission.shape}; mean {pred.mean():.2f} std {pred.std():.2f}", flush=True)
+
+check = pd.read_csv(out_path, keep_default_na=False)          # reload the written file and validate it
+assert list(check.columns) == ["id", "temperature_c"] and len(check) == len(test)
+assert (check["temperature_c"].astype(str).str.len() > 0).all()
+assert np.isfinite(check["temperature_c"].astype(float)).all()
+print(f"wrote {out_path} {check.shape}; mean {pred.mean():.2f} std {pred.std():.2f}", flush=True)
