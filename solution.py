@@ -17,7 +17,8 @@ Approach (everything is fitted inside this script, from the released training ro
     scored on it (reports the pooled-style score against the training-median baseline).
     Model B is trained on every training row. The submission is the mean of A and B,
     each averaged over dihedral test-time augmentation of a single row (no use of other test rows).
-  * Fixed seeds, fixed epoch counts, no wall-clock-dependent branching.
+  * Fixed seeds, fixed epoch counts, CPU only, fixed thread count: no branch depends on wall-clock time,
+    hardware or file presence.
 """
 import json
 import os
@@ -43,7 +44,7 @@ WEIGHT_DECAY = 2e-2
 EMA_DECAY = 0.998
 WIDTHS = (16, 16, 32, 64, 96)   # stem, stage1, stage2, stage3, stage4 channels
 HOLDOUT_FOLD = "f0"
-N_THREADS = max(1, min(10, os.cpu_count() or 1))
+N_THREADS = 10          # fixed (the graded machine has 10 cores); never derived from the host at runtime
 
 
 def set_seed(seed):
@@ -55,8 +56,8 @@ def set_seed(seed):
 set_seed(SEED)
 os.environ["PYTHONHASHSEED"] = str(SEED)
 torch.set_num_threads(N_THREADS)
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"device={DEVICE} threads={N_THREADS}", flush=True)
+torch.use_deterministic_algorithms(True)   # CPU-only, fixed plan: no backend / device / worker-dependent branches
+print(f"cpu threads={N_THREADS}", flush=True)
 
 # --------------------------------------------------------------------------- paths / data
 public_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("./dataset/public")
@@ -82,12 +83,8 @@ Y_MEDIAN = float(np.median(ytr))          # reference value of the metric (-4.8 
 Y_LO, Y_HI = float(ytr.min()), float(ytr.max())
 Y_MEAN, Y_STD = float(ytr.mean()), float(ytr.std())
 
-fold_path = public_dir / "validation_folds.json"
-if fold_path.exists():
-    fold_of = json.load(open(fold_path))["fold_of"]
-    folds = train["id"].map(fold_of).to_numpy()
-else:  # graceful fallback: contiguous blocks (row order is uninformative, so this is only a sanity split)
-    folds = np.where(np.arange(len(train)) % 5 == 0, HOLDOUT_FOLD, "other")
+fold_of = json.load(open(public_dir / "validation_folds.json"))["fold_of"]   # week-disjoint folds shipped with the data
+folds = train["id"].map(fold_of).to_numpy()
 is_hold = folds == HOLDOUT_FOLD
 
 
@@ -101,7 +98,7 @@ def hand_features(X):
     rr = np.sqrt(yy ** 2 + xx ** 2)
     for s in range(0, len(X), 1024):
         v = X[s:s + 1024].astype(np.float32) / 255.0             # (b,3,80,80)
-        m = v > 0.05
+        m = v > 0.02
         area = m.sum((2, 3)).astype(np.float32)
         area_safe = np.maximum(area, 1.0)
         tot = v.sum((2, 3))
@@ -127,7 +124,7 @@ def hand_features(X):
         # rows/cols spanned by the flake (bounding extent)
         rows = m.any(3).sum(2).astype(np.float32)
         cols = m.any(2).sum(2).astype(np.float32)
-        hi = (v > 0.6).sum((2, 3)).astype(np.float32) / area_safe  # fraction of very bright pixels
+        hi = (v > 0.4).sum((2, 3)).astype(np.float32) / area_safe  # fraction of very bright pixels
         feats = [np.log1p(area), tot / 100.0, mean_on, sq, v.max((2, 3)), rmax, rmean, np.log1p(border),
                  grad, np.log(l1 + 1.0), np.log(l2 + 1.0), np.log(elong), rows, cols, hi,
                  area / np.maximum(rows * cols, 1.0)]           # fill ratio of the bounding box
