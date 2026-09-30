@@ -375,6 +375,14 @@ for fname in RUN_FOLDS:
     e_f, b_f = np.abs(cal_oof[mk] - ytr[mk]).mean(), np.abs(Y_MEDIAN - ytr[mk]).mean()
     print(f"  {fname}: MAE {e_f:.3f} constant {b_f:.3f} score {1 - e_f / b_f:+.3f}", flush=True)
 
+# Diagnostic (printed only): does the raw model rank flakes correctly inside a fold (correlation), and how large
+# is the fold-level offset between its mean prediction and the true mean (bias)? A large bias with a positive
+# correlation means the signal is real but drowned by week-to-week level shifts.
+for fname in RUN_FOLDS:
+    mk = folds == fname
+    r = np.corrcoef(oof[best_ep][mk], ytr[mk])[0, 1]
+    print(f"  {fname}: raw corr {r:+.3f}, bias (mean pred - mean true) {oof[best_ep][mk].mean() - ytr[mk].mean():+.2f} C", flush=True)
+
 # --------------------------------------------------------------------------- submission
 # Only now are the test rows used, and only for plain per-row inference: each fold model (at the epoch chosen
 # above from training weeks alone) predicts every test row from that row's own pixels; the predictions are
