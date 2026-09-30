@@ -4,21 +4,27 @@ How Cold Was It -- predict air temperature (deg C) from three views of a falling
 Run:  python3 solution.py <public_dir> <submission_out>
       (defaults: ./dataset/public  ./working/submission.csv)
 
-Approach (everything is fitted inside this script, from the released training rows only):
-  * A small CNN trained FROM SCRATCH. One conv encoder is shared by the three views; the
-    three pooled embeddings are concatenated in camera order (so each camera keeps its own
-    slot) and fed to an MLP head.
-  * A handful of hand-computed per-view statistics (size, brightness, edge energy, border
-    contact, ...) are standardised and fed into the same head as extra inputs. They are only
-    an additional input to the CNN, never a stand-alone predictor.
-  * L1 loss (the metric is a mean absolute error), AdamW + one-cycle schedule, EMA weights,
-    flip / right-angle-rotation / brightness / small-shift augmentation.
-  * Week-disjoint validation: model A is trained without fold f0 of validation_folds.json and
-    scored on it (reports the pooled-style score against the training-median baseline).
-    Model B is trained on every training row. The submission is the mean of A and B,
-    each averaged over dihedral test-time augmentation of a single row (no use of other test rows).
-  * Fixed seeds, fixed epoch counts, CPU only, fixed thread count: no branch depends on wall-clock time,
-    hardware or file presence.
+Everything fitted here is fitted inside this script from the released training rows only.
+
+Why this design: flakes of one week share their weather, so a model can score well on its own
+training weeks by recognising week-specific quirks and still fail on new weeks. Everything below
+is therefore driven by week-disjoint validation (validation_folds.json).
+
+  * A small CNN trained FROM SCRATCH; one conv encoder shared by the three views, the three pooled
+    embeddings concatenated in camera order and passed to an MLP head. (Optionally a few per-view
+    size/brightness statistics enter the same head as extra inputs, never as a stand-alone predictor.)
+  * One model per week-fold (each trained without that fold's weeks) -> honest out-of-fold (OOF)
+    predictions for every training row. Loss: smooth-L1 with a tiny beta on the standardised
+    target (~ absolute error, the metric). AdamW, one-cycle schedule, EMA weights, dihedral /
+    brightness / shift augmentation.
+  * From the OOF predictions the script itself chooses (a) the epoch whose weights are used and
+    (b) a shrinkage calibration  pred = c + a * (raw - mean_raw)  (a in [0, 1.5], c the L1-optimal
+    shift), i.e. it learns how much of the model's spread transfers to unseen weeks.
+  * Test prediction = mean over the fold models of their epoch-chosen predictions (each averaged
+    over two dihedral views of the single row), then the calibration map. No test statistic is
+    ever computed or used; each test row is predicted from its own pixels only.
+  * Fixed seeds, fixed epoch counts, CPU only, fixed thread count: no branch depends on wall-clock
+    time, hardware or file presence.
 """
 import json
 import os
@@ -37,13 +43,17 @@ import torch.nn.functional as F
 
 # --------------------------------------------------------------------------- config
 SEED = 42
-EPOCHS = 16            # epochs per model (fixed; sized so both models finish well inside 1.5 h on CPU)
+EPOCHS = 8             # epochs per fold model (fixed); the epoch actually used is chosen from OOF predictions
+FIRST_EVAL_EPOCH = 3   # epochs 1-2 are warm-up noise; candidates for selection start here
 BATCH = 128
 LR = 2e-3
-WEIGHT_DECAY = 2e-2
+WEIGHT_DECAY = 5e-2
+DROPOUT = 0.4
 EMA_DECAY = 0.998
+USE_HAND = True        # feed the per-view statistics to the head as extra inputs
 WIDTHS = (16, 16, 32, 64, 96)   # stem, stage1, stage2, stage3, stage4 channels
-HOLDOUT_FOLD = "f0"
+RUN_FOLDS = ("f0", "f1", "f2", "f3", "f4")
+TTA_OPS = (0, 5)       # dihedral ops averaged per row at inference
 N_THREADS = 10          # fixed (the graded machine has 10 cores); never derived from the host at runtime
 
 
@@ -85,10 +95,17 @@ Y_MEAN, Y_STD = float(ytr.mean()), float(ytr.std())
 
 fold_of = json.load(open(public_dir / "validation_folds.json"))["fold_of"]   # week-disjoint folds shipped with the data
 folds = train["id"].map(fold_of).to_numpy()
-is_hold = folds == HOLDOUT_FOLD
 
 
 # --------------------------------------------------------------------------- hand-made per-view features
+# Grey-level thresholds are derived from the training pixels themselves (not typed in by hand):
+# 'lit' = above the 5th percentile of non-zero training pixels, 'bright' = above their 90th percentile.
+_nz = Xtr[::10].ravel()
+_nz = _nz[_nz > 0]
+LIT_THR, BRIGHT_THR = (np.percentile(_nz, [5, 90]) / 255.0).astype(np.float32)
+del _nz
+print(f"lit threshold {LIT_THR:.3f}, bright threshold {BRIGHT_THR:.3f}", flush=True)
+
 def hand_features(X):
     """Per-view size / brightness / texture statistics, (n, 3*K) float32. Computed row by row in chunks."""
     out = []
@@ -98,7 +115,7 @@ def hand_features(X):
     rr = np.sqrt(yy ** 2 + xx ** 2)
     for s in range(0, len(X), 1024):
         v = X[s:s + 1024].astype(np.float32) / 255.0             # (b,3,80,80)
-        m = v > 0.02
+        m = v > LIT_THR
         area = m.sum((2, 3)).astype(np.float32)
         area_safe = np.maximum(area, 1.0)
         tot = v.sum((2, 3))
@@ -124,16 +141,21 @@ def hand_features(X):
         # rows/cols spanned by the flake (bounding extent)
         rows = m.any(3).sum(2).astype(np.float32)
         cols = m.any(2).sum(2).astype(np.float32)
-        hi = (v > 0.4).sum((2, 3)).astype(np.float32) / area_safe  # fraction of very bright pixels
+        hi = (v > BRIGHT_THR).sum((2, 3)).astype(np.float32) / area_safe  # fraction of very bright pixels
         feats = [np.log1p(area), tot / 100.0, mean_on, sq, v.max((2, 3)), rmax, rmean, np.log1p(border),
-                 grad, np.log(l1 + 1.0), np.log(l2 + 1.0), np.log(elong), rows, cols, hi,
+                 grad, np.log(l1 + 1.0), np.log(l2 + 1.0), np.log1p(elong), rows, cols, hi,
                  area / np.maximum(rows * cols, 1.0)]           # fill ratio of the bounding box
         out.append(np.concatenate([f for f in feats], axis=1).astype(np.float32))
     return np.concatenate(out, axis=0)
 
 
-Ftr = hand_features(Xtr)
-Fte = hand_features(Xte)
+if USE_HAND:
+    Ftr = hand_features(Xtr)
+    Fte = hand_features(Xte)
+else:
+    Ftr = np.zeros((len(Xtr), 0), np.float32)
+    Fte = np.zeros((len(Xte), 0), np.float32)
+assert np.isfinite(Ftr).all() and np.isfinite(Fte).all(), "non-finite hand features"
 F_MU, F_SD = Ftr.mean(0), Ftr.std(0) + 1e-6                        # scaler fitted on training rows only
 Ftr = np.clip((Ftr - F_MU) / F_SD, -6, 6).astype(np.float32)
 Fte = np.clip((Fte - F_MU) / F_SD, -6, 6).astype(np.float32)
@@ -171,7 +193,7 @@ class SnowNet(nn.Module):
         self.enc = Encoder()
         d = self.enc.out_dim
         self.head = nn.Sequential(
-            nn.Linear(3 * d + N_HAND, 256), nn.BatchNorm1d(256), nn.ReLU(inplace=True), nn.Dropout(0.25),
+            nn.Linear(3 * d + N_HAND, 256), nn.BatchNorm1d(256), nn.ReLU(inplace=True), nn.Dropout(DROPOUT),
             nn.Linear(256, 64), nn.ReLU(inplace=True), nn.Linear(64, 1))
 
     def forward(self, x, h):                       # x: (b,3,80,80) float, h: (b,N_HAND)
@@ -210,21 +232,23 @@ def to_float(xb):
 
 
 @torch.no_grad()
-def predict(model, X, Fh, tta=4, bs=256):
-    """Row-wise prediction (deg C); averaged over `tta` dihedral variants of each row."""
+def predict(model, X, Fh, bs=256):
+    """Row-wise raw prediction in deg C, averaged over the dihedral views in TTA_OPS of each row."""
     model.eval()
     res = np.zeros(len(X), dtype=np.float64)
     for s in range(0, len(X), bs):
         xb = to_float(X[s:s + bs])
         hb = torch.from_numpy(Fh[s:s + bs])
         p = 0
-        for k in range(tta):
+        for k in TTA_OPS:
             p = p + model(dihedral(xb, k), hb)
-        res[s:s + bs] = (p / tta).numpy()
-    return np.clip(res * Y_STD + Y_MEAN, Y_LO, Y_HI)
+        res[s:s + bs] = (p / len(TTA_OPS)).numpy()
+    return res * Y_STD + Y_MEAN
 
 
-def train_model(idx, seed, tag, X_val=None, F_val=None, y_val=None):
+def train_fold(fit_idx, val_idx, seed, tag):
+    """Train on fit_idx; after every epoch from FIRST_EVAL_EPOCH on, predict the held-out weeks and the
+    test rows with the EMA weights. Returns {epoch: (val_pred, test_pred)}."""
     set_seed(seed)
     model = SnowNet().to(memory_format=torch.channels_last)
     ema = SnowNet().to(memory_format=torch.channels_last)
@@ -232,18 +256,21 @@ def train_model(idx, seed, tag, X_val=None, F_val=None, y_val=None):
     for p in ema.parameters():
         p.requires_grad_(False)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    steps_per_epoch = len(idx) // BATCH
+    steps_per_epoch = len(fit_idx) // BATCH
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=LR, total_steps=EPOCHS * steps_per_epoch, pct_start=0.25)
     yn = ((ytr - Y_MEAN) / Y_STD).astype(np.float32)
     rng = np.random.RandomState(seed)
+    out = {}
     for ep in range(EPOCHS):
         model.train()
-        perm = rng.permutation(idx)
+        perm = rng.permutation(fit_idx)
         tot = 0.0
         for bi in range(steps_per_epoch):
             bidx = np.sort(perm[bi * BATCH:(bi + 1) * BATCH])
             xb = augment(to_float(Xtr[bidx]))
-            hb = torch.from_numpy(Ftr[bidx]) + 0.05 * torch.randn(len(bidx), N_HAND)
+            hb = torch.from_numpy(Ftr[bidx])
+            if N_HAND:
+                hb = hb + 0.1 * torch.randn(len(bidx), N_HAND)
             yb = torch.from_numpy(yn[bidx])
             loss = F.smooth_l1_loss(model(xb, hb), yb, beta=0.05)   # ~ L1, matches the MAE metric
             opt.zero_grad(set_to_none=True)
@@ -251,7 +278,7 @@ def train_model(idx, seed, tag, X_val=None, F_val=None, y_val=None):
             nn.utils.clip_grad_norm_(model.parameters(), 2.0)
             opt.step()
             sched.step()
-            with torch.no_grad():                                    # EMA of weights (and BN buffers)
+            with torch.no_grad():                                    # EMA of weights (BN buffers copied)
                 d = min(EMA_DECAY, (1 + ep * steps_per_epoch + bi) / (10 + ep * steps_per_epoch + bi))
                 for pe, pm in zip(ema.parameters(), model.parameters()):
                     pe.mul_(d).add_(pm.detach(), alpha=1 - d)
@@ -259,29 +286,61 @@ def train_model(idx, seed, tag, X_val=None, F_val=None, y_val=None):
                     be.copy_(bm)
             tot += loss.item()
         msg = f"[{tag}] epoch {ep + 1}/{EPOCHS} train_loss {tot / steps_per_epoch:.4f}"
-        if X_val is not None and (ep % 4 == 3 or ep == EPOCHS - 1):
-            pv = predict(ema, X_val, F_val, tta=1)
-            msg += f" | holdout MAE {np.abs(pv - y_val).mean():.3f}"
+        if ep + 1 >= FIRST_EVAL_EPOCH:
+            pv = predict(ema, Xtr[val_idx], Ftr[val_idx])
+            out[ep + 1] = (pv, predict(ema, Xte, Fte))
+            msg += f" | held-out-weeks MAE {np.abs(np.clip(pv, Y_LO, Y_HI) - ytr[val_idx]).mean():.3f}" \
+                   f" (constant {np.abs(Y_MEDIAN - ytr[val_idx]).mean():.3f})"
         print(msg, flush=True)
-    return ema
+    return out
 
 
-all_idx = np.arange(len(train))
-hold_idx = all_idx[is_hold]
-fit_idx = all_idx[~is_hold]
+# One model per week-fold -> out-of-fold predictions for every training row of the folds that were run.
+oof = {ep: np.full(len(train), np.nan) for ep in range(FIRST_EVAL_EPOCH, EPOCHS + 1)}
+test_raw = {ep: [] for ep in oof}
+for fi, fname in enumerate(RUN_FOLDS):
+    val_idx = np.where(folds == fname)[0]
+    fit_idx = np.where(folds != fname)[0]
+    res = train_fold(fit_idx, val_idx, SEED + fi, f"fold {fname}")
+    for ep, (pv, pt) in res.items():
+        oof[ep][val_idx] = pv
+        test_raw[ep].append(pt)
 
-# Model A: trained without the held-out weeks -> honest week-disjoint estimate of the score.
-model_a = train_model(fit_idx, SEED, "A", Xtr[hold_idx], Ftr[hold_idx], ytr[hold_idx])
-pa_hold = predict(model_a, Xtr[hold_idx], Ftr[hold_idx])
-e = np.abs(pa_hold - ytr[hold_idx]).mean()
-b = np.abs(Y_MEDIAN - ytr[hold_idx]).mean()
-print(f"holdout fold {HOLDOUT_FOLD}: MAE {e:.3f}  baseline MAE {b:.3f}  score {max(0.0, 1 - e / b):.3f}", flush=True)
+have = ~np.isnan(oof[EPOCHS])
+y_have = ytr[have]
+base_mae = np.abs(Y_MEDIAN - y_have).mean()
 
-# Model B: trained on every training row, different seed.
-model_b = train_model(all_idx, SEED + 1, "B")
+# (a) choose the epoch from the OOF predictions (data-driven choice made inside the script)
+print("epoch  pooled OOF MAE  raw score", flush=True)
+best_ep, best_mae = None, np.inf
+for ep in sorted(oof):
+    m = np.abs(np.clip(oof[ep][have], Y_LO, Y_HI) - y_have).mean()
+    print(f"{ep:5d}  {m:14.3f}  {1 - m / base_mae:+.3f}", flush=True)
+    if m < best_mae:
+        best_ep, best_mae = ep, m
+print(f"chosen epoch {best_ep}", flush=True)
+
+# (b) shrinkage calibration fitted on the OOF predictions: pred = c + a * (raw - mean_raw)
+raw = oof[best_ep][have]
+raw_mean = raw.mean()
+best = (np.inf, 0.0, Y_MEDIAN)
+for a in np.linspace(0.0, 1.5, 31):
+    c = np.median(y_have - a * (raw - raw_mean))                 # L1-optimal shift for this slope
+    m = np.abs(np.clip(c + a * (raw - raw_mean), Y_LO, Y_HI) - y_have).mean()
+    if m < best[0]:
+        best = (m, a, c)
+cal_mae, CAL_A, CAL_C = best
+print(f"calibration: slope a={CAL_A:.2f} shift c={CAL_C:.2f}; OOF MAE {cal_mae:.3f} vs constant {base_mae:.3f} "
+      f"-> OOF score {1 - cal_mae / base_mae:+.3f} (calibration is fitted on these same OOF rows, so slightly optimistic)", flush=True)
+# per-fold view of the calibrated OOF score (weeks differ a lot, so show the spread)
+cal_oof = np.clip(CAL_C + CAL_A * (oof[best_ep] - raw_mean), Y_LO, Y_HI)
+for fname in RUN_FOLDS:
+    mk = folds == fname
+    e_f, b_f = np.abs(cal_oof[mk] - ytr[mk]).mean(), np.abs(Y_MEDIAN - ytr[mk]).mean()
+    print(f"  {fname}: MAE {e_f:.3f} constant {b_f:.3f} score {1 - e_f / b_f:+.3f}", flush=True)
 
 # --------------------------------------------------------------------------- submission
-pred = 0.5 * predict(model_a, Xte, Fte) + 0.5 * predict(model_b, Xte, Fte)
+pred = np.clip(CAL_C + CAL_A * (np.mean(test_raw[best_ep], axis=0) - raw_mean), Y_LO, Y_HI)
 submission = pd.DataFrame({"id": test["id"], "temperature_c": np.round(pred, 2)})
 
 assert len(submission) == len(test), "row count mismatch"
