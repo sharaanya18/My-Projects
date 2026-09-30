@@ -1,23 +1,3 @@
-#!/usr/bin/env python3
-"""Grounding scholarly notes in a journal transcription (span extraction).
-
-Usage:  python3 solution.py <public_dir> <submission_out> [--dev]
-
-Pipeline (everything is trained inside this script, from the supplied CSVs only):
-  1. Token-level hand-crafted features: fuzzy lexical overlap between note and source token,
-     token shape, neighbourhood aggregates (all computed per query, no test-set statistics).
-  2. A pretrained multilingual sentence encoder (Hugging Face, general-purpose weights) is
-     FINE-TUNED contrastively on (note, gold span) pairs with same-page hard negatives.
-     Its note<->window similarities are stacked into the tabular model.  To keep the stacked
-     feature honest, training rows receive OUT-OF-FOLD scores (journal-grouped folds); rows to
-     predict receive scores from an encoder fine-tuned on all training rows.
-  3. A gradient-boosted token classifier (sklearn HistGradientBoosting) predicts P(token in span).
-     Number of boosting rounds and the decoder scale are selected in-script by journal-grouped CV.
-  4. An expected-F1 decoder picks the contiguous token range with the best expected overlap-F1.
-
---dev : train on train.csv, score validation.csv (prints F1) instead of writing a test submission.
-If the encoder weights cannot be loaded (e.g. no network), the script falls back to the tabular model.
-"""
 import csv, json, math, os, random, re, sys, time
 from collections import Counter, defaultdict
 import numpy as np
@@ -34,7 +14,6 @@ def log(*a):
     print(f"[{time.time()-T_START:6.0f}s]", *a, flush=True)
 
 
-# ------------------------------------------------------------------ data
 def load(path):
     rows = list(csv.DictReader(open(path, encoding="utf-8", newline="")))
     for r in rows:
@@ -63,7 +42,6 @@ def cprefix(a, b):
     return n
 
 
-# ------------------------------------------------------------------ hand features
 def note_info(note):
     quoted = set()
     for m in re.finditer(r"[„“”‚‘’'\"»«›‹]([^„“”‚‘’'\"»«›‹]{1,60})[„“”‚‘’'\"»«›‹]", note):
@@ -184,7 +162,6 @@ def token_labels(toks, spans):
     return y
 
 
-# ------------------------------------------------------------------ metric + decoder
 def f1(src, pred, gold):
     def nz(spans):
         return {k for a, b in spans for k in range(a, b) if not src[k].isspace()}
@@ -193,7 +170,6 @@ def f1(src, pred, gold):
 
 
 def decode(toks, p, scale=1.0, maxlen=60):
-    """Contiguous token range maximising 2*E[overlap] / (|range| + E|gold|)."""
     n = len(toks)
     w = np.array([len(t[2]) for t in toks], dtype=np.float64)
     cw = np.concatenate([[0], np.cumsum(w)])
@@ -209,7 +185,6 @@ def decode(toks, p, scale=1.0, maxlen=60):
     return [(toks[bi][0], toks[bj][1])]
 
 
-# ------------------------------------------------------------------ contrastive encoder
 ENC_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 WSIZES = (1, 3, 6)
 
@@ -299,7 +274,6 @@ class BiEnc:
         self.cache = {}
 
     def score(self, rows):
-        """Per row: dict w -> cosine(note, word-window of size w centred on each \\w token)."""
         srcs = {}
         for r in rows:
             s = r["source_text"]
@@ -327,7 +301,6 @@ class BiEnc:
 
 
 def bi_columns(sc):
-    """Turn raw window similarities of one row into feature columns."""
     n = len(sc[WSIZES[0]])
     cols, names = [], []
 
@@ -355,7 +328,6 @@ def bi_columns(sc):
     return np.stack(cols, 1).astype(np.float32), names
 
 
-# ------------------------------------------------------------------ pipeline
 def hand_matrix(rows, idf):
     Xs, metas, names = [], [], None
     for r in rows:
@@ -373,7 +345,7 @@ def group_folds(groups, k):
     ug = sorted(set(groups), key=lambda g: -sum(1 for x in groups if x == g))
     fold_of = {}
     load_ = [0] * k
-    for g in ug:  # greedy balance by row count
+    for g in ug:
         j = int(np.argmin(load_))
         fold_of[g] = j
         load_[j] += sum(1 for x in groups if x == g)
@@ -402,7 +374,7 @@ def main():
     tr_ok = [i for i, m in enumerate(mtr) if m is not None]
     te_ok = [i for i, m in enumerate(mte) if m is not None]
 
-    # ---- stacked encoder features
+
     bi_names = []
     Btr = [None] * len(train)
     Bte = [None] * len(target)
@@ -430,7 +402,7 @@ def main():
         for i, s in enumerate(sc):
             Bte[i], bi_names = bi_columns(s)
         log("encoder features done")
-    except Exception as e:  # no weights / no network / time guard -> tabular only
+    except Exception as e:
         log("encoder stage unavailable, falling back to tabular features only:", repr(e)[:200])
         Btr = [None] * len(train)
         Bte = [None] * len(target)
@@ -460,7 +432,7 @@ def main():
                                               min_samples_leaf=100, l2_regularization=5.0, max_bins=64,
                                               early_stopping=False, random_state=SEED)
 
-    # ---- in-script model selection: journal-grouped CV over rounds and decoder scale
+
     ITERS = (100, 200, 300, 450)
     SCALES = (0.4, 0.7, 1.0, 1.5)
     tr_groups = np.array([train[i]["group_id"] for i in row_of])
@@ -492,9 +464,9 @@ def main():
     final = make(iters).fit(Xtr[:, keep], ytr)
     pte = final.predict_proba(Xte[:, keep])[:, 1]
 
-    # ---- predictions
+
     L_of = [len(r["source_text"]) for r in target]
-    pred = [[(0, max(1, L_of[i]))] for i in range(len(target))]  # fallback (empty-token sources)
+    pred = [[(0, max(1, L_of[i]))] for i in range(len(target))]
     pos = 0
     for k, i in enumerate(te_ok):
         n = len(Xte_parts[k])
