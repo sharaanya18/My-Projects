@@ -1,55 +1,3 @@
-"""
-How Cold Was It -- predict air temperature (deg C) from three views of a falling snowflake.
-
-Run:  python3 solution.py <public_dir> <submission_out>
-      (defaults: ./dataset/public  ./working/submission.csv)
-
-Everything fitted here is fitted inside this script from the released training rows only.
-
-Why this design: flakes of one week share their weather, so a model can score well on its own
-training weeks by recognising week-specific quirks and still fail on new weeks. Everything below
-is therefore driven by week-disjoint validation (validation_folds.json).
-
-  * A small CNN trained FROM SCRATCH; one conv encoder shared by the three views, the three pooled
-    embeddings concatenated in camera order and passed to an MLP head. (Optionally a few per-view
-    size/brightness statistics enter the same head as extra inputs, never as a stand-alone predictor.)
-  * One model per week-fold (each trained without that fold's weeks) -> honest out-of-fold (OOF)
-    predictions for every training row. Loss: smooth-L1 with a tiny beta on the standardised
-    target (~ absolute error, the metric). AdamW, one-cycle schedule, EMA weights, dihedral /
-    brightness / shift augmentation.
-  * The raw prediction of a row is the mean over the EMA weights of the last three epochs (a fixed
-    snapshot average). From the OOF predictions the script itself fits a shrinkage calibration  pred = c + a * (raw - mean_raw)  (a in [0.25, 1], c the L1-optimal
-    shift), i.e. it learns how much of the model's spread transfers to unseen weeks.
-  * Test prediction = mean over the fold models (and their last three epochs) of the raw predictions (each averaged
-    over two dihedral views of the single row), then the calibration map. No test statistic is
-    ever computed or used; each test row is predicted from its own pixels only.
-  * Fixed seeds, fixed epoch counts, CPU only, fixed thread count: no branch depends on wall-clock
-    time, hardware or file presence.
-
-COMPLIANCE SUMMARY (one line per rule of the task)
-  Hardware ............ CPU only; 10 threads fixed in the code (a --threads argument is accepted and ignored).
-  Pretrained weights .. none. Every weight starts from PyTorch's random initialisation and is trained here.
-  External data ....... none. Only train.csv, test.csv, train_images.npy, test_images.npy and
-                        validation_folds.json from the public directory are read.
-  Fitted state ........ CNN weights, the feature scaler, the grey-level thresholds (percentiles of the
-                        training pixels), the target mean/std and the calibration slope/shift
-                        are all computed in this script from the training rows. Nothing is loaded from disk
-                        except the released data; no checkpoint is written or read.
-  Design constants .... epochs, learning rate, width, dropout, augmentation strength are fixed constants of
-                        the recipe, identical on every run.
-  Model selection ..... none by score: the last three epochs are averaged (fixed recipe). Only the calibration
-                        slope/shift is fitted, on out-of-fold predictions of TRAINING weeks; it is a deterministic
-                        function of the data, never of elapsed time.
-  Test rows ........... used only for plain per-row inference after all fitting is finished: each row is
-                        predicted from its own pixels. No statistic is computed over the test rows, no
-                        test-time adaptation, no pseudo-labelling, no grouping of similar test rows.
-  Not attempted ....... dating a row, identifying a snowflake, matching images to any outside collection,
-                        using row order or identifiers (identifiers are only copied into the output).
-  Predictor ........... a trained network; there is no rule engine. Hand-made statistics are only extra
-                        inputs to the network.
-  Determinism ......... fixed seeds per fold, torch deterministic mode, fixed thread count, no time-based or
-                        hardware-based branch. Two runs give identical output.
-"""
 import argparse
 import json
 import os
@@ -66,20 +14,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --------------------------------------------------------------------------- config
 SEED = 42
-EPOCHS = 8             # epochs per fold model (fixed)
-FIRST_EVAL_EPOCH = 6   # EMA weights of the last three epochs (6, 7, 8) are averaged; earlier epochs are noisy
+EPOCHS = 8
+FIRST_EVAL_EPOCH = 6
 BATCH = 128
 LR = 2e-3
 WEIGHT_DECAY = 5e-2
 DROPOUT = 0.4
 EMA_DECAY = 0.998
-USE_HAND = True        # feed the per-view statistics to the head as extra inputs
-WIDTHS = (16, 16, 32, 64, 96)   # stem, stage1, stage2, stage3, stage4 channels
+USE_HAND = True
+WIDTHS = (16, 16, 32, 64, 96)
 RUN_FOLDS = ("f0", "f1", "f2", "f3", "f4")
-TTA_OPS = (0, 5)       # dihedral ops averaged per row at inference
-N_THREADS = 10          # fixed (the graded machine has 10 cores); never derived from the host at runtime
+TTA_OPS = (0, 5)
+N_THREADS = 10
 
 
 def set_seed(seed):
@@ -91,16 +38,15 @@ def set_seed(seed):
 set_seed(SEED)
 os.environ["PYTHONHASHSEED"] = str(SEED)
 torch.set_num_threads(N_THREADS)
-torch.use_deterministic_algorithms(True)   # CPU-only, fixed plan: no backend / device / worker-dependent branches
+torch.use_deterministic_algorithms(True)
 print(f"cpu threads={N_THREADS}", flush=True)
 
-# --------------------------------------------------------------------------- paths / data
 parser = argparse.ArgumentParser()
 parser.add_argument("public_dir", nargs="?", default="./dataset/public")
 parser.add_argument("submission_out", nargs="?", default="./working/submission.csv")
 parser.add_argument("--data-dir", dest="data_dir", default=None)
 parser.add_argument("--output", dest="output", default=None)
-parser.add_argument("--threads", dest="threads", default=None)      # accepted for compatibility; the plan is fixed
+parser.add_argument("--threads", dest="threads", default=None)
 args, _unknown = parser.parse_known_args()
 public_dir = Path(args.data_dir or args.public_dir)
 out_path = Path(args.output or args.submission_out)
@@ -114,7 +60,6 @@ test = pd.read_csv(public_dir / "test.csv")
 
 
 def load_views(df, fname):
-    """Rows of `df` -> uint8 array (n, 3, 80, 80) using the `evidence` column (file.npy:row)."""
     arr = np.load(public_dir / fname, mmap_mode="r")
     rows = df["evidence"].str.split(":").str[1].astype(int).to_numpy()
     return np.ascontiguousarray(arr[rows])
@@ -125,17 +70,14 @@ Xte = load_views(test, "test_images.npy")
 ytr = train["temperature_c"].to_numpy(dtype=np.float64)
 print(f"train {Xtr.shape} test {Xte.shape}", flush=True)
 
-Y_MEDIAN = float(np.median(ytr))          # reference value of the metric (-4.8 on the released data)
+Y_MEDIAN = float(np.median(ytr))
 Y_LO, Y_HI = float(ytr.min()), float(ytr.max())
 Y_MEAN, Y_STD = float(ytr.mean()), float(ytr.std())
 
-fold_of = json.load(open(public_dir / "validation_folds.json"))["fold_of"]   # week-disjoint folds shipped with the data
+fold_of = json.load(open(public_dir / "validation_folds.json"))["fold_of"]
 folds = train["id"].map(fold_of).to_numpy()
 
 
-# --------------------------------------------------------------------------- hand-made per-view features
-# Grey-level thresholds are derived from the training pixels themselves (not typed in by hand):
-# 'lit' = above the 5th percentile of non-zero training pixels, 'bright' = above their 90th percentile.
 _nz = Xtr[::10].ravel()
 _nz = _nz[_nz > 0]
 LIT_THR, BRIGHT_THR = (np.percentile(_nz, [5, 90]) / 255.0).astype(np.float32)
@@ -143,14 +85,13 @@ del _nz
 print(f"lit threshold {LIT_THR:.3f}, bright threshold {BRIGHT_THR:.3f}", flush=True)
 
 def hand_features(X):
-    """Per-view size / brightness / texture statistics, (n, 3*K) float32. Computed row by row in chunks."""
     out = []
     yy, xx = np.mgrid[0:80, 0:80].astype(np.float32)
     yy -= 39.5
     xx -= 39.5
     rr = np.sqrt(yy ** 2 + xx ** 2)
     for s in range(0, len(X), 1024):
-        v = X[s:s + 1024].astype(np.float32) / 255.0             # (b,3,80,80)
+        v = X[s:s + 1024].astype(np.float32) / 255.0
         m = v > LIT_THR
         area = m.sum((2, 3)).astype(np.float32)
         area_safe = np.maximum(area, 1.0)
@@ -162,8 +103,7 @@ def hand_features(X):
         border = (m[:, :, 0, :].sum(2) + m[:, :, -1, :].sum(2) + m[:, :, :, 0].sum(2) + m[:, :, :, -1].sum(2)).astype(np.float32)
         gx = np.abs(np.diff(v, axis=3)).sum((2, 3))
         gy = np.abs(np.diff(v, axis=2)).sum((2, 3))
-        grad = (gx + gy) / area_safe                              # edge energy per lit pixel
-        # second moments of the lit region (elongation: needles/columns vs plates)
+        grad = (gx + gy) / area_safe
         cy = (m * yy).sum((2, 3)) / area_safe
         cx = (m * xx).sum((2, 3)) / area_safe
         syy = (m * (yy - cy[..., None, None]) ** 2).sum((2, 3)) / area_safe
@@ -174,13 +114,12 @@ def hand_features(X):
         disc = np.sqrt(np.maximum(tr ** 2 / 4 - det, 0))
         l1, l2 = tr / 2 + disc, np.maximum(tr / 2 - disc, 1e-3)
         elong = np.sqrt(l1 / l2)
-        # rows/cols spanned by the flake (bounding extent)
         rows = m.any(3).sum(2).astype(np.float32)
         cols = m.any(2).sum(2).astype(np.float32)
-        hi = (v > BRIGHT_THR).sum((2, 3)).astype(np.float32) / area_safe  # fraction of very bright pixels
+        hi = (v > BRIGHT_THR).sum((2, 3)).astype(np.float32) / area_safe
         feats = [np.log1p(area), tot / 100.0, mean_on, sq, v.max((2, 3)), rmax, rmean, np.log1p(border),
                  grad, np.log(l1 + 1.0), np.log(l2 + 1.0), np.log1p(elong), rows, cols, hi,
-                 area / np.maximum(rows * cols, 1.0)]           # fill ratio of the bounding box
+                 area / np.maximum(rows * cols, 1.0)]
         out.append(np.concatenate([f for f in feats], axis=1).astype(np.float32))
     return np.concatenate(out, axis=0)
 
@@ -192,29 +131,27 @@ else:
     Ftr = np.zeros((len(Xtr), 0), np.float32)
     Fte = np.zeros((len(Xte), 0), np.float32)
 assert np.isfinite(Ftr).all() and np.isfinite(Fte).all(), "non-finite hand features"
-F_MU, F_SD = Ftr.mean(0), Ftr.std(0) + 1e-6                        # scaler fitted on training rows only
+F_MU, F_SD = Ftr.mean(0), Ftr.std(0) + 1e-6
 Ftr = np.clip((Ftr - F_MU) / F_SD, -6, 6).astype(np.float32)
 Fte = np.clip((Fte - F_MU) / F_SD, -6, 6).astype(np.float32)
 N_HAND = Ftr.shape[1]
 print(f"hand features: {N_HAND}", flush=True)
 
 
-# --------------------------------------------------------------------------- model
 def conv_bn(i, o, s=1):
     return nn.Sequential(nn.Conv2d(i, o, 3, s, 1, bias=False), nn.BatchNorm2d(o), nn.ReLU(inplace=True))
 
 
 class Encoder(nn.Module):
-    """Shared per-view CNN; avg+max pooled embedding."""
 
     def __init__(self, w=WIDTHS):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(1, w[0], 5, 2, 2, bias=False), nn.BatchNorm2d(w[0]), nn.ReLU(inplace=True),   # 40x40
+            nn.Conv2d(1, w[0], 5, 2, 2, bias=False), nn.BatchNorm2d(w[0]), nn.ReLU(inplace=True),
             conv_bn(w[0], w[1]),
-            conv_bn(w[1], w[2], 2), conv_bn(w[2], w[2]),                                            # 20x20
-            conv_bn(w[2], w[3], 2), conv_bn(w[3], w[3]),                                            # 10x10
-            conv_bn(w[3], w[4], 2),                                                                 # 5x5
+            conv_bn(w[1], w[2], 2), conv_bn(w[2], w[2]),
+            conv_bn(w[2], w[3], 2), conv_bn(w[3], w[3]),
+            conv_bn(w[3], w[4], 2),
         )
         self.out_dim = 2 * w[4]
 
@@ -232,23 +169,20 @@ class SnowNet(nn.Module):
             nn.Linear(3 * d + N_HAND, 256), nn.BatchNorm1d(256), nn.ReLU(inplace=True), nn.Dropout(DROPOUT),
             nn.Linear(256, 64), nn.ReLU(inplace=True), nn.Linear(64, 1))
 
-    def forward(self, x, h):                       # x: (b,3,80,80) float, h: (b,N_HAND)
+    def forward(self, x, h):
         b = x.shape[0]
         z = self.enc(x.reshape(b * 3, 1, 80, 80).contiguous(memory_format=torch.channels_last))
-        z = z.reshape(b, -1)                       # camera order preserved in the concat
+        z = z.reshape(b, -1)
         return self.head(torch.cat([z, h], 1)).squeeze(1)
 
 
-# --------------------------------------------------------------------------- augmentation (train only)
 def dihedral(x, k):
-    """x (b,3,H,W); k in 0..7: rotation by 90*(k%4) with optional horizontal flip."""
     if k >= 4:
         x = x.flip(3)
     return torch.rot90(x, k % 4, (2, 3))
 
 
 def augment(x):
-    """Independent random dihedral op per (sample, view), brightness scaling, small shift."""
     b = x.shape[0]
     ops = torch.randint(0, 8, (b, 3))
     out = torch.empty_like(x)
@@ -262,14 +196,12 @@ def augment(x):
     return out.clamp_(0, 1.5)
 
 
-# --------------------------------------------------------------------------- train / predict
 def to_float(xb):
     return torch.from_numpy(xb).float().div_(255.0)
 
 
 @torch.no_grad()
 def predict(model, X, Fh, bs=256):
-    """Row-wise raw prediction in deg C, averaged over the dihedral views in TTA_OPS of each row."""
     model.eval()
     res = np.zeros(len(X), dtype=np.float64)
     for s in range(0, len(X), bs):
@@ -283,9 +215,6 @@ def predict(model, X, Fh, bs=256):
 
 
 def train_fold(fit_idx, val_idx, seed, tag):
-    """Train on fit_idx; after every epoch from FIRST_EVAL_EPOCH on, predict the held-out TRAINING weeks with
-    the EMA weights and keep a snapshot of those weights. The test rows are not touched here.
-    Returns {epoch: (val_pred, ema_state_dict)}."""
     set_seed(seed)
     model = SnowNet().to(memory_format=torch.channels_last)
     ema = SnowNet().to(memory_format=torch.channels_last)
@@ -309,18 +238,18 @@ def train_fold(fit_idx, val_idx, seed, tag):
             if N_HAND:
                 hb = hb + 0.1 * torch.randn(len(bidx), N_HAND)
             yb = torch.from_numpy(yn[bidx])
-            loss = F.smooth_l1_loss(model(xb, hb), yb, beta=0.05)   # ~ L1, matches the MAE metric
+            loss = F.smooth_l1_loss(model(xb, hb), yb, beta=0.05)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 2.0)
             opt.step()
             sched.step()
-            with torch.no_grad():                                    # EMA of weights (BN buffers copied)
+            with torch.no_grad():
                 d = min(EMA_DECAY, (1 + ep * steps_per_epoch + bi) / (10 + ep * steps_per_epoch + bi))
                 for pe, pm in zip(ema.parameters(), model.parameters()):
                     pe.mul_(d).add_(pm.detach(), alpha=1 - d)
-                for be, bm in zip(ema.buffers(), model.buffers()):   # BN statistics are averaged too, so they
-                    if be.is_floating_point():                       # stay consistent with the averaged weights
+                for be, bm in zip(ema.buffers(), model.buffers()):
+                    if be.is_floating_point():
                         be.mul_(d).add_(bm, alpha=1 - d)
                     else:
                         be.copy_(bm)
@@ -335,9 +264,8 @@ def train_fold(fit_idx, val_idx, seed, tag):
     return out
 
 
-# One model per week-fold -> out-of-fold predictions for every training row of the folds that were run.
 oof = {ep: np.full(len(train), np.nan) for ep in range(FIRST_EVAL_EPOCH, EPOCHS + 1)}
-snapshots = {ep: [] for ep in oof}          # EMA weights per epoch, one entry per fold model
+snapshots = {ep: [] for ep in oof}
 for fi, fname in enumerate(RUN_FOLDS):
     val_idx = np.where(folds == fname)[0]
     fit_idx = np.where(folds != fname)[0]
@@ -350,8 +278,6 @@ have = ~np.isnan(oof[EPOCHS])
 y_have = ytr[have]
 base_mae = np.abs(Y_MEDIAN - y_have).mean()
 
-# (a) snapshot average: the raw prediction of a row is the mean over the last three epochs' EMA weights.
-# This is a fixed recipe (no epoch is picked by score), which removes selection noise: single epochs swing a lot.
 print("epoch  pooled OOF MAE  raw score", flush=True)
 for ep in sorted(oof):
     m = np.abs(np.clip(oof[ep][have], Y_LO, Y_HI) - y_have).mean()
@@ -360,37 +286,28 @@ oof_final = np.mean([oof[ep] for ep in sorted(oof)], axis=0)
 m = np.abs(np.clip(oof_final[have], Y_LO, Y_HI) - y_have).mean()
 print(f"  avg  {m:14.3f}  {1 - m / base_mae:+.3f}   <- used", flush=True)
 
-# (b) shrinkage calibration fitted on the OOF predictions: pred = c + a * (raw - mean_raw)
 raw = oof_final[have]
 raw_mean = raw.mean()
 best = (np.inf, 1.0, Y_MEDIAN)
-for a in np.linspace(0.25, 1.0, 16):        # shrink only; never collapses to a constant
-    c = np.median(y_have - a * (raw - raw_mean))                 # L1-optimal shift for this slope
+for a in np.linspace(0.25, 1.0, 16):
+    c = np.median(y_have - a * (raw - raw_mean))
     m = np.abs(np.clip(c + a * (raw - raw_mean), Y_LO, Y_HI) - y_have).mean()
     if m < best[0]:
         best = (m, a, c)
 cal_mae, CAL_A, CAL_C = best
 print(f"calibration: slope a={CAL_A:.2f} shift c={CAL_C:.2f}; OOF MAE {cal_mae:.3f} vs constant {base_mae:.3f} "
       f"-> OOF score {1 - cal_mae / base_mae:+.3f} (calibration is fitted on these same OOF rows, so slightly optimistic)", flush=True)
-# per-fold view of the calibrated OOF score (weeks differ a lot, so show the spread)
 cal_oof = np.clip(CAL_C + CAL_A * (oof_final - raw_mean), Y_LO, Y_HI)
 for fname in RUN_FOLDS:
     mk = folds == fname
     e_f, b_f = np.abs(cal_oof[mk] - ytr[mk]).mean(), np.abs(Y_MEDIAN - ytr[mk]).mean()
     print(f"  {fname}: MAE {e_f:.3f} constant {b_f:.3f} score {1 - e_f / b_f:+.3f}", flush=True)
 
-# Diagnostic (printed only): does the raw model rank flakes correctly inside a fold (correlation), and how large
-# is the fold-level offset between its mean prediction and the true mean (bias)? A large bias with a positive
-# correlation means the signal is real but drowned by week-to-week level shifts.
 for fname in RUN_FOLDS:
     mk = folds == fname
     r = np.corrcoef(oof_final[mk], ytr[mk])[0, 1]
     print(f"  {fname}: raw corr {r:+.3f}, bias (mean pred - mean true) {oof_final[mk].mean() - ytr[mk].mean():+.2f} C", flush=True)
 
-# --------------------------------------------------------------------------- submission
-# Only now are the test rows used, and only for plain per-row inference: every fold model, at each of its last
-# three epochs, predicts every test row from that row's own pixels; the predictions are averaged over models and
-# epochs and passed through the calibration map fitted above on training weeks.
 test_raw = []
 for ep in sorted(snapshots):
     for state in snapshots[ep]:
@@ -410,7 +327,7 @@ assert np.isfinite(submission["temperature_c"]).all(), "non-finite prediction"
 out_path.parent.mkdir(parents=True, exist_ok=True)
 submission.to_csv(out_path, index=False)
 
-check = pd.read_csv(out_path, keep_default_na=False)          # reload the written file and validate it
+check = pd.read_csv(out_path, keep_default_na=False)
 assert list(check.columns) == ["id", "temperature_c"] and len(check) == len(test)
 assert (check["temperature_c"].astype(str).str.len() > 0).all()
 assert np.isfinite(check["temperature_c"].astype(float)).all()
