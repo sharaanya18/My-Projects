@@ -51,6 +51,14 @@ def note_units(note):
                 tri=[" ".join(ws[i:i + 3]) for i in range(0, max(1, len(ws) - 2))][:80] or [note])
 
 
+def smooth(v, wd):
+    c = np.concatenate([[0.0], np.cumsum(v)])
+    n = len(v)
+    lo = np.maximum(np.arange(n) - wd, 0)
+    hi = np.minimum(np.arange(n) + wd + 1, n)
+    return (c[hi] - c[lo]) / (hi - lo)
+
+
 def emb_features(emb, rows, log=print):
     """Returns per-row dict name -> array over the row's \\w tokens."""
     # collect all texts
@@ -93,7 +101,7 @@ def emb_features(emb, rows, log=print):
         for key in ("e1_word_max", "e3_tri_max", "e3_whole_max", "e3_sent_max"):
             v = feats[key]
             for wd in (2, 5):
-                k = np.convolve(v, np.ones(2 * wd + 1) / (2 * wd + 1), mode="same")
+                k = smooth(v, wd)
                 feats[f"{key}_sm{wd}"] = k
         out.append(feats)
     return out
