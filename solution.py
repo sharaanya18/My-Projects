@@ -17,10 +17,10 @@ is therefore driven by week-disjoint validation (validation_folds.json).
     predictions for every training row. Loss: smooth-L1 with a tiny beta on the standardised
     target (~ absolute error, the metric). AdamW, one-cycle schedule, EMA weights, dihedral /
     brightness / shift augmentation.
-  * From the OOF predictions the script itself chooses (a) the epoch whose weights are used and
-    (b) a shrinkage calibration  pred = c + a * (raw - mean_raw)  (a in [0.25, 1], c the L1-optimal
+  * The raw prediction of a row is the mean over the EMA weights of the last three epochs (a fixed
+    snapshot average). From the OOF predictions the script itself fits a shrinkage calibration  pred = c + a * (raw - mean_raw)  (a in [0.25, 1], c the L1-optimal
     shift), i.e. it learns how much of the model's spread transfers to unseen weeks.
-  * Test prediction = mean over the fold models of their epoch-chosen predictions (each averaged
+  * Test prediction = mean over the fold models (and their last three epochs) of the raw predictions (each averaged
     over two dihedral views of the single row), then the calibration map. No test statistic is
     ever computed or used; each test row is predicted from its own pixels only.
   * Fixed seeds, fixed epoch counts, CPU only, fixed thread count: no branch depends on wall-clock
@@ -32,13 +32,14 @@ COMPLIANCE SUMMARY (one line per rule of the task)
   External data ....... none. Only train.csv, test.csv, train_images.npy, test_images.npy and
                         validation_folds.json from the public directory are read.
   Fitted state ........ CNN weights, the feature scaler, the grey-level thresholds (percentiles of the
-                        training pixels), the target mean/std, the chosen epoch and the calibration slope/shift
+                        training pixels), the target mean/std and the calibration slope/shift
                         are all computed in this script from the training rows. Nothing is loaded from disk
                         except the released data; no checkpoint is written or read.
   Design constants .... epochs, learning rate, width, dropout, augmentation strength are fixed constants of
                         the recipe, identical on every run.
-  Model selection ..... the epoch and the calibration are picked from out-of-fold predictions on TRAINING weeks
-                        only; the choice is a deterministic function of the data, never of elapsed time.
+  Model selection ..... none by score: the last three epochs are averaged (fixed recipe). Only the calibration
+                        slope/shift is fitted, on out-of-fold predictions of TRAINING weeks; it is a deterministic
+                        function of the data, never of elapsed time.
   Test rows ........... used only for plain per-row inference after all fitting is finished: each row is
                         predicted from its own pixels. No statistic is computed over the test rows, no
                         test-time adaptation, no pseudo-labelling, no grouping of similar test rows.
@@ -67,8 +68,8 @@ import torch.nn.functional as F
 
 # --------------------------------------------------------------------------- config
 SEED = 42
-EPOCHS = 8             # epochs per fold model (fixed); the epoch actually used is chosen from OOF predictions
-FIRST_EVAL_EPOCH = 3   # epochs 1-2 are warm-up noise; candidates for selection start here
+EPOCHS = 8             # epochs per fold model (fixed)
+FIRST_EVAL_EPOCH = 6   # EMA weights of the last three epochs (6, 7, 8) are averaged; earlier epochs are noisy
 BATCH = 128
 LR = 2e-3
 WEIGHT_DECAY = 5e-2
@@ -346,18 +347,18 @@ have = ~np.isnan(oof[EPOCHS])
 y_have = ytr[have]
 base_mae = np.abs(Y_MEDIAN - y_have).mean()
 
-# (a) choose the epoch from the OOF predictions (data-driven choice made inside the script)
+# (a) snapshot average: the raw prediction of a row is the mean over the last three epochs' EMA weights.
+# This is a fixed recipe (no epoch is picked by score), which removes selection noise: single epochs swing a lot.
 print("epoch  pooled OOF MAE  raw score", flush=True)
-best_ep, best_mae = None, np.inf
 for ep in sorted(oof):
     m = np.abs(np.clip(oof[ep][have], Y_LO, Y_HI) - y_have).mean()
     print(f"{ep:5d}  {m:14.3f}  {1 - m / base_mae:+.3f}", flush=True)
-    if m < best_mae:
-        best_ep, best_mae = ep, m
-print(f"chosen epoch {best_ep}", flush=True)
+oof_final = np.mean([oof[ep] for ep in sorted(oof)], axis=0)
+m = np.abs(np.clip(oof_final[have], Y_LO, Y_HI) - y_have).mean()
+print(f"  avg  {m:14.3f}  {1 - m / base_mae:+.3f}   <- used", flush=True)
 
 # (b) shrinkage calibration fitted on the OOF predictions: pred = c + a * (raw - mean_raw)
-raw = oof[best_ep][have]
+raw = oof_final[have]
 raw_mean = raw.mean()
 best = (np.inf, 1.0, Y_MEDIAN)
 for a in np.linspace(0.25, 1.0, 16):        # shrink only; never collapses to a constant
@@ -369,7 +370,7 @@ cal_mae, CAL_A, CAL_C = best
 print(f"calibration: slope a={CAL_A:.2f} shift c={CAL_C:.2f}; OOF MAE {cal_mae:.3f} vs constant {base_mae:.3f} "
       f"-> OOF score {1 - cal_mae / base_mae:+.3f} (calibration is fitted on these same OOF rows, so slightly optimistic)", flush=True)
 # per-fold view of the calibrated OOF score (weeks differ a lot, so show the spread)
-cal_oof = np.clip(CAL_C + CAL_A * (oof[best_ep] - raw_mean), Y_LO, Y_HI)
+cal_oof = np.clip(CAL_C + CAL_A * (oof_final - raw_mean), Y_LO, Y_HI)
 for fname in RUN_FOLDS:
     mk = folds == fname
     e_f, b_f = np.abs(cal_oof[mk] - ytr[mk]).mean(), np.abs(Y_MEDIAN - ytr[mk]).mean()
@@ -380,18 +381,19 @@ for fname in RUN_FOLDS:
 # correlation means the signal is real but drowned by week-to-week level shifts.
 for fname in RUN_FOLDS:
     mk = folds == fname
-    r = np.corrcoef(oof[best_ep][mk], ytr[mk])[0, 1]
-    print(f"  {fname}: raw corr {r:+.3f}, bias (mean pred - mean true) {oof[best_ep][mk].mean() - ytr[mk].mean():+.2f} C", flush=True)
+    r = np.corrcoef(oof_final[mk], ytr[mk])[0, 1]
+    print(f"  {fname}: raw corr {r:+.3f}, bias (mean pred - mean true) {oof_final[mk].mean() - ytr[mk].mean():+.2f} C", flush=True)
 
 # --------------------------------------------------------------------------- submission
-# Only now are the test rows used, and only for plain per-row inference: each fold model (at the epoch chosen
+# Only now are the test rows used, and only for plain per-row inference: each fold model (last three epochs
 # above from training weeks alone) predicts every test row from that row's own pixels; the predictions are
 # averaged over the fold models and passed through the calibration map fitted above.
 test_raw = []
-for state in snapshots[best_ep]:
-    net = SnowNet().to(memory_format=torch.channels_last)
-    net.load_state_dict(state)
-    test_raw.append(predict(net, Xte, Fte))
+for ep in sorted(snapshots):
+    for state in snapshots[ep]:
+        net = SnowNet().to(memory_format=torch.channels_last)
+        net.load_state_dict(state)
+        test_raw.append(predict(net, Xte, Fte))
 pred = np.clip(CAL_C + CAL_A * (np.mean(test_raw, axis=0) - raw_mean), Y_LO, Y_HI)
 sample = pd.read_csv(public_dir / "sample_submission.csv")
 assert list(sample.columns) == ["id", "temperature_c"], "unexpected sample_submission columns"
