@@ -385,9 +385,9 @@ for fname in RUN_FOLDS:
     print(f"  {fname}: raw corr {r:+.3f}, bias (mean pred - mean true) {oof_final[mk].mean() - ytr[mk].mean():+.2f} C", flush=True)
 
 # --------------------------------------------------------------------------- submission
-# Only now are the test rows used, and only for plain per-row inference: each fold model (last three epochs
-# above from training weeks alone) predicts every test row from that row's own pixels; the predictions are
-# averaged over the fold models and passed through the calibration map fitted above.
+# Only now are the test rows used, and only for plain per-row inference: every fold model, at each of its last
+# three epochs, predicts every test row from that row's own pixels; the predictions are averaged over models and
+# epochs and passed through the calibration map fitted above on training weeks.
 test_raw = []
 for ep in sorted(snapshots):
     for state in snapshots[ep]:
