@@ -9,8 +9,7 @@ Approach
      local harmony around each frame, against the bass note and from the melody note;
    - a chord/key branch: learned templates over the combined pitch classes of both staves, seen
      from each of the 12 possible roots and pooled over roots. It judges whether the two staves
-     form coherent chords and a coherent key, not just good intervals. One model type follows
-     these root-relative chord features through time (harmonic progressions) before pooling;
+     form coherent chords and a coherent key, not just good intervals;
    - per-staff activity and register curves.
 3. A neural pair scorer (dilated temporal convolutions + attention pooling) embeds each pair.
    Batch reasoning inside the network, using only the batch's own parts:
@@ -21,8 +20,8 @@ Approach
    negatives from another batch of the same piece), each true lower must pick its upper, plus a
    Sinkhorn (soft one-to-one assignment) term. Augmentation: register transposition, identical
    time shifts, time stretching, octave displacement of the lower staff, note dropout.
-5. Models of two types are trained on composer-grouped folds (test composers never appear in
-   training); held-out accuracy is reported. Test scores are averaged over time-shift
+5. One model is trained per composer-grouped fold (test composers never appear in training);
+   held-out accuracy is reported. Test scores are averaged over time-shift
    augmentation, normalised per batch (row + column log-softmax) and summed over all models.
    A final analogy refinement, whose strength and threshold are tuned on the out-of-fold scores,
    is applied, and each batch is decoded with the Hungarian algorithm so every lower part is used
@@ -53,7 +52,6 @@ ARGS, _ = parser.parse_known_args()   # ignore any extra platform arguments
 SEED = 42
 DEVICE = torch.device("cuda")
 N_FOLDS = 5
-MODEL_TYPES = [True, False]          # temporal chord branch on / off: both types are always trained
 EPOCHS = 15
 LR = 1e-3
 WEIGHT_DECAY = 0.05
@@ -270,17 +268,13 @@ class AxialLayer(nn.Module):
 
 
 class PairScorer(nn.Module):
-    def __init__(self, temporal_chord, d=D_MODEL, p=DROPOUT):
+    def __init__(self, d=D_MODEL, p=DROPOUT):
         super().__init__()
-        self.temporal_chord = temporal_chord
         self.inp = nn.Sequential(nn.Dropout(0.1), nn.Linear(C_IN + 2 * CHORD_DIM, d), nn.GELU(), nn.Dropout(p), nn.Linear(d, d))
         # chord/key templates over the combined pitch classes of both staves (summed per staff, then non-linear)
         self.chord_u = nn.Linear(N_CHROMA_U * 12, CHORD_DIM)
         self.chord_l = nn.Linear(N_CHROMA_L * 12, CHORD_DIM, bias=False)
         self.chord_mlp = nn.Sequential(nn.GELU(), nn.Linear(CHORD_DIM, CHORD_DIM), nn.GELU())
-        if temporal_chord:   # harmonic progressions: temporal convolutions per root, shared over roots
-            self.chord_time = nn.ModuleList([nn.Conv1d(CHORD_DIM, CHORD_DIM, 3, padding=dl, dilation=dl) for dl in (1, 2, 4)])
-            self.chord_norm = nn.ModuleList([nn.GroupNorm(1, CHORD_DIM) for _ in range(3)])
         self.blocks = nn.ModuleList([ConvBlock(d, dl, p) for dl in (1, 2, 4, 8)])
         self.att = nn.Linear(d, 1)
         self.proj = nn.Sequential(nn.LayerNorm(2 * d), nn.Linear(2 * d, d))
@@ -294,13 +288,6 @@ class PairScorer(nn.Module):
         nu, nl = x.shape[:2]
         vu, vl = chord
         c = self.chord_mlp(self.chord_u(vu)[:, None] + self.chord_l(vl)[None])   # [nu, nl, T, 12 roots, CHORD_DIM]
-        if self.temporal_chord:
-            # eighth-note steps (reshape/expand only, deterministic on GPU)
-            z = c.permute(0, 1, 3, 4, 2).reshape(nu * nl * 12, CHORD_DIM, T // 2, 2).mean(-1)
-            for conv, norm in zip(self.chord_time, self.chord_norm):
-                z = z + conv(F.gelu(norm(z)))
-            z = z[..., None].expand(*z.shape, 2).reshape(nu * nl * 12, CHORD_DIM, T)
-            c = c + z.reshape(nu, nl, 12, CHORD_DIM, T).permute(0, 1, 4, 2, 3)
         x = torch.cat([x, c.amax(3), c.mean(3)], -1)                              # pooled over roots
         h = self.inp(x.reshape(nu * nl, T, -1))
         for blk in self.blocks:
@@ -404,10 +391,10 @@ def forward(model, ru, rl, reg_shift=0.0):
     return model(pair_features(ru, rl, reg_shift), chord_inputs(ru, rl), analogy_inputs(ru, rl))
 
 
-def train_model(train_ids, B, onehots, siblings, temporal_chord, seed):
+def train_model(train_ids, B, onehots, siblings, seed):
     torch.manual_seed(seed)
     g = torch.Generator().manual_seed(seed)
-    model = PairScorer(temporal_chord).to(DEVICE)
+    model = PairScorer().to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), LR, weight_decay=WEIGHT_DECAY)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, LR, total_steps=EPOCHS * len(train_ids), pct_start=0.1)
     for _ in range(EPOCHS):
@@ -496,18 +483,17 @@ def main():
         for b in va:
             oof_score[b] = 0
             fold_of[b] = f
-        for m, temporal in enumerate(MODEL_TYPES):
-            model = train_model(tr, B, onehots, siblings, temporal, SEED + 100 * f + m)
-            for b, S in score_batches(model, B, va).items():
-                oof_score[b] = oof_score[b] + S
-            for b, S in score_batches(model, TB, test_ids).items():
-                test_score[b] = test_score[b] + S
-            del model
+        model = train_model(tr, B, onehots, siblings, SEED + f)
+        for b, S in score_batches(model, B, va).items():
+            oof_score[b] = oof_score[b] + S
+        for b, S in score_batches(model, TB, test_ids).items():
+            test_score[b] = test_score[b] + S
+        del model
         hits = []
         for b in va:
             choice = assign(oof_score[b])
             hits += [B[b]["L"][j] == truth[u] for u, j in zip(B[b]["U"], choice)]
-        print(f"fold {f}: held-out composers {sorted(set(composer[va_idx]))}  ensemble accuracy {np.mean(hits):.4f}", flush=True)
+        print(f"fold {f}: held-out composers {sorted(set(composer[va_idx]))}  accuracy {np.mean(hits):.4f}", flush=True)
 
     # analogy refinement: weight and threshold chosen on out-of-fold scores (reported nested, chosen on all for test)
     sims = batch_similarities(B, ids)
