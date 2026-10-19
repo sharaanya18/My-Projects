@@ -1,32 +1,3 @@
-"""Piano staff pairing: for every test batch, give each upper-staff part its own lower-staff part.
-
-Approach
---------
-1. Every part becomes two piano rolls on a fixed time grid (sounding notes, note onsets).
-2. Pair inputs (all transposition-invariant):
-   - frame-by-frame histograms of the intervals between the notes of the two staves (12 interval
-     classes x 3 register spans), also against the lower staff one beat earlier/later, against the
-     local harmony around each frame, against the bass note and from the melody note;
-   - a chord/key branch: learned templates over the combined pitch classes of both staves, seen
-     from each of the 12 possible roots and pooled over roots. It judges whether the two staves
-     form coherent chords and a coherent key, not just good intervals;
-   - per-staff activity and register curves.
-3. A neural pair scorer (dilated temporal convolutions + attention pooling) embeds each pair.
-   Batch reasoning inside the network, using only the batch's own parts:
-   - analogy: pairs (a, x) and (b, y) exchange messages when upper b is upper a transposed by k
-     and lower y is lower x transposed by the same k (sequences and transposed repeats);
-   - axial attention over the competing pairs of each row (lowers) and column (uppers).
-4. Training is listwise per batch: each upper must pick its lower among all candidates (extra
-   negatives from another batch of the same piece), each true lower must pick its upper, plus a
-   Sinkhorn (soft one-to-one assignment) term. Augmentation: register transposition, identical
-   time shifts, time stretching, octave displacement of the lower staff, note dropout.
-5. One model is trained per composer-grouped fold (test composers never appear in training);
-   held-out accuracy is reported. Test scores are averaged over time-shift
-   augmentation, normalised per batch (row + column log-softmax) and summed over all models.
-   A final analogy refinement, whose strength and threshold are tuned on the out-of-fold scores,
-   is applied, and each batch is decoded with the Hungarian algorithm so every lower part is used
-   at most once. Each test batch is decoded from its own parts only.
-"""
 import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
@@ -42,12 +13,11 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from sklearn.model_selection import GroupKFold
 
-# ----------------------------------------------------------------------------- configuration
 parser = argparse.ArgumentParser()
 parser.add_argument("--data-dir", default="./dataset/public/")
 parser.add_argument("--output", default="./working/submission.csv")
 parser.add_argument("--threads", type=int, default=4)
-ARGS, _ = parser.parse_known_args()   # ignore any extra platform arguments
+ARGS, _ = parser.parse_known_args()
 
 SEED = 42
 DEVICE = torch.device("cuda")
@@ -62,8 +32,8 @@ STRETCH_PROB = 0.5
 OCTAVE_PROB = 0.3
 CHORD_DIM = 64
 SINKHORN_WEIGHT = 1.0
-ANALOGY_THRESHOLD = 0.4              # in-network analogy links need this much transposed overlap
-TTA_SHIFTS = (0, -2, 2)              # identical time shifts of both staves at prediction time
+ANALOGY_THRESHOLD = 0.4
+TTA_SHIFTS = (0, -2, 2)
 REFINE_GRID = [(w, thr) for w in (0.0, 4.0, 8.0, 16.0) for thr in (0.3, 0.4, 0.5)]
 
 random.seed(SEED)
@@ -78,15 +48,14 @@ torch.set_num_threads(ARGS.threads)
 DATA = Path(ARGS.data_dir)
 OUT = Path(ARGS.output)
 
-# ----------------------------------------------------------------------------- representation
-TICKS = 1536                 # a passage is four quarter notes of 384 ticks
-RES = 48                     # grid step in ticks
+TICKS = 1536
+RES = 48
 T = TICKS // RES
-BEAT = 384 // RES            # frames per quarter note
-PLO, P = 21, 88              # piano keyboard A0..C8
-KLO, KHI = -12, 60           # upper-minus-lower intervals that are histogrammed
+BEAT = 384 // RES
+PLO, P = 21, 88
+KLO, KHI = -12, 60
 K = KHI - KLO
-WIN = 4                      # half-width (frames) of the local-harmony window
+WIN = 4
 
 _k = np.arange(KLO, KHI)
 _span = np.where(_k < 12, 0, np.where(_k < 24, 1, 2))
@@ -98,7 +67,6 @@ C_IN = N_PAIR_TYPES * 36 + 2 * NH
 
 
 def part_rolls(starts, lengths, pitches):
-    """[2, T, P] rolls: sounding notes and onsets. Out-of-range values are clipped."""
     roll = np.zeros((2, T, P), np.float32)
     for st, ln, p in zip(starts, lengths, pitches):
         st = int(min(max(st, 0), TICKS - 1))
@@ -112,7 +80,6 @@ def part_rolls(starts, lengths, pitches):
 
 
 def load_batches(notes, upper_table):
-    """One entry per batch: upper ids (from the id table), lower ids (from the note file), rolls."""
     by_part = {pid: g for pid, g in notes.groupby("part_id", sort=False)}
     lowers = notes[notes.staff == "lower"].groupby("batch_id").part_id.unique()
     empty = np.zeros((2, T, P), np.float32)
@@ -136,7 +103,6 @@ FOLD_MAT = FOLD_MAT.to(DEVICE)
 
 
 def shifted(x):
-    # x [n, T, P] -> [n, T, K, P] with out[..., k, p] = x[..., p + k + KLO] (zero outside the keyboard)
     return F.pad(x, (-KLO, KHI)).unfold(2, P, 1)[:, :, :K, :]
 
 
@@ -145,7 +111,6 @@ def window_max(x):
 
 
 def beat_shift(x, beats):
-    """Move [n, T, ...] by whole beats along time (zero fill): positive = later."""
     s = beats * BEAT
     if s > 0:
         return F.pad(x, (0, 0, s, 0))[:, :T]
@@ -153,7 +118,6 @@ def beat_shift(x, beats):
 
 
 def extreme_note(s, lowest):
-    """One-hot of the lowest (bass) or highest (melody) sounding key per frame."""
     idx = torch.arange(P, dtype=torch.float32, device=s.device)
     fill = torch.full_like(idx, 999.0 if lowest else -1.0)
     e = torch.where(s > 0, idx, fill)
@@ -172,7 +136,6 @@ def staff_curves(s, o):
 
 
 def pair_features(ru, rl, reg_shift=0.0):
-    """ru [nu,2,T,P], rl [nl,2,T,P] -> [nu, nl, T, C_IN]"""
     us, uo, ls, lo = ru[:, 0], ru[:, 1], rl[:, 0], rl[:, 1]
     Us, Uo, Uw = shifted(us), shifted(uo), shifted(window_max(us))
     pairs = [(Us, ls), (Uo, lo), (Uo, ls), (Us, lo), (Us, window_max(ls)), (Uw, ls),
@@ -187,17 +150,15 @@ def pair_features(ru, rl, reg_shift=0.0):
     return torch.cat([X, hu[:, None].expand(nu, nl, T, NH), hl[None].expand(nu, nl, T, NH)], -1)
 
 
-# Chord / key coherence inputs: the pitch classes of both staves seen from each of the 12 possible roots.
 TO_PC = torch.zeros(P, 12)
 TO_PC[torch.arange(P), (torch.arange(P) + PLO) % 12] = 1.0
 TO_PC = TO_PC.to(DEVICE)
-ROOTS = ((torch.arange(12)[:, None] + torch.arange(12)[None]) % 12).to(DEVICE)   # ROOTS[r, k] = (r + k) % 12
-N_CHROMA_U = 6     # sounding, onsets, local window, whole passage, melody note, batch key
-N_CHROMA_L = 8     # sounding, onsets, local window, whole passage, bass note, one beat earlier/later, batch key
+ROOTS = ((torch.arange(12)[:, None] + torch.arange(12)[None]) % 12).to(DEVICE)
+N_CHROMA_U = 6
+N_CHROMA_L = 8
 
 
 def chord_inputs(ru, rl):
-    """Root-relative views [n, T, 12, channels*12]; templates applied to them are transposition-invariant."""
     def base(s, o, lowest):
         cs = (s @ TO_PC).clamp(max=1)
         co = (o @ TO_PC).clamp(max=1)
@@ -206,7 +167,7 @@ def chord_inputs(ru, rl):
         cp = (cp / cp.amax(-1, keepdim=True).clamp(min=1)).expand_as(cs)
         return [cs, co, cw, cp, extreme_note(s, lowest) @ TO_PC]
     us, ls = ru[:, 0], rl[:, 0]
-    key = (us.sum((0, 1)) + ls.sum((0, 1))) @ TO_PC          # pitch-class profile of the whole batch
+    key = (us.sum((0, 1)) + ls.sum((0, 1))) @ TO_PC
     key = key / key.max().clamp(min=1)
     lpc = (ls @ TO_PC).clamp(max=1)
     cu = torch.stack(base(us, ru[:, 1], False) + [key.expand(us.shape[0], T, 12)], 2)
@@ -218,7 +179,6 @@ def chord_inputs(ru, rl):
 
 
 def transposition_similarity(onsets):
-    """[m, T, P] onsets -> [m, m, 12]: best normalised overlap of part a transposed by k (mod 12) with part b."""
     m = onsets.shape[0]
     nrm = onsets.sum((1, 2)).clamp(min=1)
     den = torch.sqrt(nrm[:, None] * nrm[None])
@@ -234,7 +194,6 @@ def analogy_inputs(ru, rl, threshold=ANALOGY_THRESHOLD):
     return torch.where(su >= threshold, su, torch.zeros_like(su)), torch.where(sl >= threshold, sl, torch.zeros_like(sl))
 
 
-# ----------------------------------------------------------------------------- model
 class ConvBlock(nn.Module):
     def __init__(self, d, dilation, p):
         super().__init__()
@@ -248,7 +207,6 @@ class ConvBlock(nn.Module):
 
 
 class AxialLayer(nn.Module):
-    """Self-attention along dim 1 (plain matmuls, deterministic on GPU)."""
     def __init__(self, d, p, heads=4):
         super().__init__()
         self.h = heads
@@ -271,7 +229,6 @@ class PairScorer(nn.Module):
     def __init__(self, d=D_MODEL, p=DROPOUT):
         super().__init__()
         self.inp = nn.Sequential(nn.Dropout(0.1), nn.Linear(C_IN + 2 * CHORD_DIM, d), nn.GELU(), nn.Dropout(p), nn.Linear(d, d))
-        # chord/key templates over the combined pitch classes of both staves (summed per staff, then non-linear)
         self.chord_u = nn.Linear(N_CHROMA_U * 12, CHORD_DIM)
         self.chord_l = nn.Linear(N_CHROMA_L * 12, CHORD_DIM, bias=False)
         self.chord_mlp = nn.Sequential(nn.GELU(), nn.Linear(CHORD_DIM, CHORD_DIM), nn.GELU())
@@ -287,26 +244,25 @@ class PairScorer(nn.Module):
     def forward(self, x, chord, analogy):
         nu, nl = x.shape[:2]
         vu, vl = chord
-        c = self.chord_mlp(self.chord_u(vu)[:, None] + self.chord_l(vl)[None])   # [nu, nl, T, 12 roots, CHORD_DIM]
-        x = torch.cat([x, c.amax(3), c.mean(3)], -1)                              # pooled over roots
+        c = self.chord_mlp(self.chord_u(vu)[:, None] + self.chord_l(vl)[None])
+        x = torch.cat([x, c.amax(3), c.mean(3)], -1)
         h = self.inp(x.reshape(nu * nl, T, -1))
         for blk in self.blocks:
             h = blk(h)
         a = torch.softmax(self.att(h), 1)
         e = self.proj(torch.cat([(a * h).sum(1), h.amax(1)], -1)).reshape(nu, nl, -1)
-        # analogy: pair (a,x) hears pairs (b,y) with b ~ a and y ~ x under the same transposition
         su, sl = analogy
         rel = torch.einsum("abk,xyk->axby", su, sl)
         strength = rel.sum((2, 3))[..., None]
         msg = torch.einsum("axby,byd->axd", rel, self.analogy_norm(e)) / (strength + 1)
         e = e + self.analogy_msg(torch.cat([msg, torch.log1p(strength)], -1))
         for row_layer, col_layer in self.axial:
-            e = row_layer(e)                                   # compare candidate lowers of an upper
-            e = col_layer(e.transpose(0, 1)).transpose(0, 1)   # compare candidate uppers of a lower
+            e = row_layer(e)
+            e = col_layer(e.transpose(0, 1)).transpose(0, 1)
         S = self.head(e).squeeze(-1)
         base = normalised(S)
         N = base
-        for _ in range(2):                                     # analogous pairs support each other
+        for _ in range(2):
             N = base + self.analogy_weight * torch.einsum("axby,by->ax", rel, torch.softmax(N, 1))
         return N
 
@@ -316,7 +272,6 @@ def normalised(S):
 
 
 def sinkhorn_log_assignment(S, iters=10):
-    """Soft one-to-one assignment: each upper row sums to one, a dustbin row takes the spare lowers."""
     nu, nl = S.shape
     Z = torch.cat([S, torch.zeros(1, nl, device=S.device)], 0)
     log_r = torch.cat([torch.zeros(nu, device=S.device), torch.full((1,), float(max(nl - nu, 1)), device=S.device).log()])
@@ -329,16 +284,14 @@ def sinkhorn_log_assignment(S, iters=10):
 
 
 def listwise_loss(S, onehot):
-    """onehot [nu, nl]: true lower of each upper. Row CE over lowers + column CE over uppers + Sinkhorn term."""
     row = -(torch.log_softmax(S, 1) * onehot).sum(1).mean()
-    St = S @ onehot.T                                           # [nu, nu]: column of each true lower
+    St = S @ onehot.T
     col = -(torch.log_softmax(St, 0) * torch.eye(S.shape[0], device=S.device)).sum(0).mean()
     sink = -(sinkhorn_log_assignment(S) * onehot).sum(1).mean()
     return row + col + SINKHORN_WEIGHT * sink
 
 
 def refine(N, su, sl, weight, threshold):
-    """Score-level analogy refinement used after ensembling (weight and threshold tuned out of fold)."""
     su = torch.where(su >= threshold, su, torch.zeros_like(su))
     sl = torch.where(sl >= threshold, sl, torch.zeros_like(sl))
     out = N
@@ -348,7 +301,6 @@ def refine(N, su, sl, weight, threshold):
 
 
 def assign(score):
-    """One-to-one assignment; any upper left over (only if lowers < uppers) takes its best lower."""
     s = score.cpu().numpy()
     choice = s.argmax(1)
     r, c = linear_sum_assignment(-s)
@@ -356,7 +308,6 @@ def assign(score):
     return choice
 
 
-# ----------------------------------------------------------------------------- training
 def time_shift(r, s):
     if s == 0:
         return r
@@ -368,19 +319,17 @@ def time_shift(r, s):
 
 def augment(ru, rl, g):
     if float(torch.rand(1, generator=g)) < STRETCH_PROB:
-        # the same music at doubled note values: stretch a random half-passage window of both staves
         a = int(torch.randint(0, T // 2 + 1, (1,), generator=g))
         idx = (a + torch.arange(T) // 2).to(DEVICE)
         ru, rl = ru[:, :, idx].clone(), rl[:, :, idx].clone()
         ru[:, 1, 1::2] = 0
         rl[:, 1, 1::2] = 0
     if float(torch.rand(1, generator=g)) < OCTAVE_PROB:
-        # the lower staff an octave higher or lower (pitch classes unchanged), if it stays on the keyboard
         o = 12 if float(torch.rand(1, generator=g)) < 0.5 else -12
         keys = rl[:, 0].amax((0, 1)).nonzero().flatten()
         if len(keys) and int(keys.min()) + o >= 0 and int(keys.max()) + o < P:
             rl = torch.roll(rl, o, -1)
-    s = int(torch.randint(-4, 5, (1,), generator=g)) * 2      # same time shift for both staves
+    s = int(torch.randint(-4, 5, (1,), generator=g)) * 2
     ru, rl = time_shift(ru, s), time_shift(rl, s)
     keep_u = (torch.rand(ru.shape[0], 1, 1, P, generator=g) > 0.1).float().to(DEVICE)
     keep_l = (torch.rand(rl.shape[0], 1, 1, P, generator=g) > 0.1).float().to(DEVICE)
@@ -403,7 +352,7 @@ def train_model(train_ids, B, onehots, siblings, seed):
             b = train_ids[k]
             ru, rl, oh = B[b]["ru"], B[b]["rl"], onehots[b]
             sib = siblings[b]
-            if sib:   # extra negatives: lower parts of another batch of the same piece
+            if sib:
                 other = B[sib[int(torch.randint(0, len(sib), (1,), generator=g))]]["rl"]
                 pick = torch.randperm(other.shape[0], generator=g)[:HARD_NEGATIVES].to(DEVICE)
                 rl = torch.cat([rl, other[pick]])
@@ -422,7 +371,6 @@ def train_model(train_ids, B, onehots, siblings, seed):
 
 @torch.no_grad()
 def score_batches(model, B, ids):
-    """Normalised scores averaged over identical time shifts of both staves (each batch on its own)."""
     out = {}
     for b in ids:
         if not (B[b]["U"] and B[b]["L"]):
@@ -459,7 +407,6 @@ def main():
     TB = load_batches(test_notes, test_up)
     print(f"train batches {len(B)}  test batches {len(TB)}", flush=True)
 
-    # training batches usable for supervision: every upper has its labelled lower inside the batch
     onehots = {}
     for b, d in B.items():
         if d["U"] and d["L"] and all(truth.get(u) in d["L"] for u in d["U"]):
@@ -495,7 +442,6 @@ def main():
             hits += [B[b]["L"][j] == truth[u] for u, j in zip(B[b]["U"], choice)]
         print(f"fold {f}: held-out composers {sorted(set(composer[va_idx]))}  accuracy {np.mean(hits):.4f}", flush=True)
 
-    # analogy refinement: weight and threshold chosen on out-of-fold scores (reported nested, chosen on all for test)
     sims = batch_similarities(B, ids)
     base_hits, nested_hits = [], []
     for f in range(n_folds):
@@ -519,7 +465,6 @@ def main():
         rows += [(u, L[j]) for u, j in zip(U, choice)]
     sub = pd.DataFrame(rows, columns=["upper_id", "lower_id"])
 
-    # submission checks: every test upper id exactly once, no blank lower ids
     assert sub.upper_id.is_unique, "repeated upper_id"
     assert set(sub.upper_id) == set(test_up.upper_id), "missing upper_id"
     assert (sub.lower_id.astype(str).str.len() > 0).all(), "blank lower_id"
