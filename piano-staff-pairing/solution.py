@@ -19,15 +19,14 @@ ARGS, _ = parser.parse_known_args()
 SEED = 42
 DEVICE = torch.device("cpu")
 N_FOLDS = 5
-EPOCHS = 15
+EPOCHS = 10
 LR = 1e-3
 WEIGHT_DECAY = 0.05
 D_MODEL = 64
 DROPOUT = 0.2
-HARD_NEGATIVES = 6
 STRETCH_PROB = 0.5
 OCTAVE_PROB = 0.3
-CHORD_DIM = 64
+CHORD_DIM = 32
 SINKHORN_WEIGHT = 1.0
 ANALOGY_THRESHOLD = 0.4
 TTA_SHIFTS = (0, -2, 2)
@@ -334,7 +333,7 @@ def forward(model, ru, rl, reg_shift=0.0):
     return model(pair_features(ru, rl, reg_shift), chord_inputs(ru, rl), analogy_inputs(ru, rl))
 
 
-def train_model(train_ids, B, onehots, siblings, seed):
+def train_model(train_ids, B, onehots, seed):
     torch.manual_seed(seed)
     g = torch.Generator().manual_seed(seed)
     model = PairScorer().to(DEVICE)
@@ -345,12 +344,6 @@ def train_model(train_ids, B, onehots, siblings, seed):
         for k in torch.randperm(len(train_ids), generator=g).tolist():
             b = train_ids[k]
             ru, rl, oh = B[b]["ru"], B[b]["rl"], onehots[b]
-            sib = siblings[b]
-            if sib:
-                other = B[sib[int(torch.randint(0, len(sib), (1,), generator=g))]]["rl"]
-                pick = torch.randperm(other.shape[0], generator=g)[:HARD_NEGATIVES].to(DEVICE)
-                rl = torch.cat([rl, other[pick]])
-                oh = torch.cat([oh, torch.zeros(oh.shape[0], len(pick), device=DEVICE)], 1)
             ru, rl = augment(ru, rl, g)
             reg_shift = int(torch.randint(-5, 6, (1,), generator=g)) / 12
             loss = listwise_loss(forward(model, ru, rl, reg_shift), oh)
@@ -410,7 +403,6 @@ def main():
             onehots[b] = oh.to(DEVICE)
     ids = sorted(onehots)
     composer = groups.composer_id.reindex(ids).fillna("unknown").values
-    piece = groups.piece_id.reindex(ids).fillna("unknown").to_dict()
     n_folds = min(N_FOLDS, len(set(composer)))
 
     test_ids = sorted(TB)
@@ -420,11 +412,10 @@ def main():
     for f, (tr_idx, va_idx) in enumerate(GroupKFold(n_splits=n_folds).split(ids, groups=composer)):
         tr = [ids[i] for i in tr_idx]
         va = [ids[i] for i in va_idx]
-        siblings = {b: [o for o in tr if o != b and piece[o] == piece[b] and piece[b] != "unknown"] for b in tr}
         for b in va:
             oof_score[b] = 0
             fold_of[b] = f
-        model = train_model(tr, B, onehots, siblings, SEED + f)
+        model = train_model(tr, B, onehots, SEED + f)
         for b, S in score_batches(model, B, va).items():
             oof_score[b] = oof_score[b] + S
         for b, S in score_batches(model, TB, test_ids).items():
