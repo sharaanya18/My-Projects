@@ -1,6 +1,3 @@
-import os
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-
 import argparse
 import random
 from pathlib import Path
@@ -20,7 +17,7 @@ parser.add_argument("--threads", type=int, default=4)
 ARGS, _ = parser.parse_known_args()
 
 SEED = 42
-DEVICE = torch.device("cuda")
+DEVICE = torch.device("cpu")
 N_FOLDS = 5
 EPOCHS = 15
 LR = 1e-3
@@ -39,9 +36,6 @@ REFINE_GRID = [(w, thr) for w in (0.0, 4.0, 8.0, 16.0) for thr in (0.3, 0.4, 0.5
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 torch.use_deterministic_algorithms(True)
 torch.set_num_threads(ARGS.threads)
 
