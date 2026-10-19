@@ -324,7 +324,7 @@ def train_model(train_ids, B, onehots, siblings, seed):
             b = train_ids[k]
             ru, rl, oh = B[b]["ru"], B[b]["rl"], onehots[b]
             sib = siblings[b]
-            if HARD_NEGATIVES > 0 and sib:
+            if sib:   # extra negatives: lower parts of another batch of the same piece
                 other = B[sib[int(torch.randint(0, len(sib), (1,), generator=g))]]["rl"]
                 pick = torch.randperm(other.shape[0], generator=g)[:HARD_NEGATIVES].to(DEVICE)
                 rl = torch.cat([rl, other[pick]])
