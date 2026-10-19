@@ -11,8 +11,8 @@ from scipy.optimize import linear_sum_assignment
 from sklearn.model_selection import GroupKFold
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--data-dir", default="./dataset/public/")
-parser.add_argument("--output", default="./working/submission.csv")
+parser.add_argument("public_dir", nargs="?", default="./dataset/public")
+parser.add_argument("submission_out", nargs="?", default="./working/submission.csv")
 parser.add_argument("--threads", type=int, default=4)
 ARGS, _ = parser.parse_known_args()
 
@@ -38,8 +38,8 @@ torch.manual_seed(SEED)
 torch.use_deterministic_algorithms(True)
 torch.set_num_threads(ARGS.threads)
 
-DATA = Path(ARGS.data_dir)
-OUT = Path(ARGS.output)
+DATA = Path(ARGS.public_dir)
+OUT = Path(ARGS.submission_out)
 
 TICKS = 1536
 RES = 48
