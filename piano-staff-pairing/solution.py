@@ -6,15 +6,19 @@ Approach
 2. For every (upper, lower) pair of a batch we compute, frame by frame, the histogram of the
    intervals between the notes of the two staves (folded to 12 interval classes x 3 register
    spans). Intervals are unchanged by transposition, so the model sees harmony, not key.
-   Extra channels compare the upper staff with the lower staff one beat earlier/later and with
-   the local harmony around each frame, plus simple per-staff activity and register curves.
+   Extra channels compare the upper staff with the lower staff one beat earlier/later, with the
+   local harmony around each frame, with the bass note and the melody note, plus simple per-staff
+   activity and register curves.
+   A chord/key branch looks at the combined pitch classes of both staves from each of the 12
+   possible roots (learned templates, pooled over roots, so again transposition-invariant): it
+   judges whether the two staves form coherent chords and a coherent key, not just good intervals.
 3. A neural pair scorer (dilated temporal convolutions + attention pooling) turns each pair into
    an embedding; axial attention layers then let every pair look at the competing pairs of its
    row (the other lower parts) and column (the other upper parts) inside the same batch.
 4. Training is listwise per batch: each upper must pick its lower among all candidates, and each
    true lower must pick its upper. Extra negatives come from other batches of the same piece.
    Augmentation: transposition of the register channels, identical time shifts of both staves,
-   random note dropout.
+   time stretching (doubled note values), octave displacement of the lower staff, note dropout.
 5. Models are trained on composer-grouped folds (test composers never appear in training) and
    their held-out accuracy is reported. Test scores of all models are normalised per batch
    (row + column log-softmax), summed, and decoded with the Hungarian algorithm so that every
@@ -52,6 +56,9 @@ WEIGHT_DECAY = 0.05
 D_MODEL = 64
 DROPOUT = 0.2
 HARD_NEGATIVES = 6
+STRETCH_PROB = 0.5
+OCTAVE_PROB = 0.3
+CHORD_DIM = 32
 
 random.seed(SEED)
 np.random.seed(SEED)
@@ -79,7 +86,7 @@ _k = np.arange(KLO, KHI)
 _span = np.where(_k < 12, 0, np.where(_k < 24, 1, 2))
 FOLD_MAT = torch.zeros(K, 36)
 FOLD_MAT[np.arange(K), _span * 12 + (_k % 12)] = 1.0
-N_PAIR_TYPES = 8
+N_PAIR_TYPES = 10
 NH = 6
 C_IN = N_PAIR_TYPES * 36 + 2 * NH
 
@@ -131,6 +138,15 @@ def window_max(x):
     return F.max_pool1d(x.permute(0, 2, 1), 2 * WIN + 1, 1, WIN).permute(0, 2, 1)
 
 
+def extreme_note(s, lowest):
+    """One-hot of the lowest (bass) or highest (melody) sounding key per frame."""
+    idx = torch.arange(P, dtype=torch.float32, device=s.device)
+    fill = torch.full_like(idx, 999.0 if lowest else -1.0)
+    e = torch.where(s > 0, idx, fill)
+    e = e.amin(-1, keepdim=True) if lowest else e.amax(-1, keepdim=True)
+    return (s > 0).float() * (idx == e).float()
+
+
 def staff_curves(s, o):
     n = s.sum(-1)
     on = (n > 0).float()
@@ -148,7 +164,8 @@ def pair_features(ru, rl, reg_shift=0.0):
     lw = window_max(ls)
     l_prev = F.pad(ls, (0, 0, BEAT, 0))[:, :T]
     l_next = F.pad(ls, (0, 0, 0, BEAT))[:, BEAT:]
-    pairs = [(Us, ls), (Uo, lo), (Uo, ls), (Us, lo), (Us, lw), (Uw, ls), (Us, l_prev), (Us, l_next)]
+    pairs = [(Us, ls), (Uo, lo), (Uo, ls), (Us, lo), (Us, lw), (Uw, ls), (Us, l_prev), (Us, l_next),
+             (Us, extreme_note(ls, True)), (shifted(extreme_note(us, False)), ls)]
     X = torch.cat([torch.einsum("itkp,jtp->ijtk", a, b) @ FOLD_MAT for a, b in pairs], -1)
     X = torch.log1p(X)
     hu, hl = staff_curves(us, uo), staff_curves(ls, lo)
@@ -156,6 +173,33 @@ def pair_features(ru, rl, reg_shift=0.0):
     hl[..., 3:6] += reg_shift * hl[..., 2:3]
     nu, nl = ru.shape[0], rl.shape[0]
     return torch.cat([X, hu[:, None].expand(nu, nl, T, NH), hl[None].expand(nu, nl, T, NH)], -1)
+
+
+# Chord / key coherence inputs: the pitch classes of both staves seen from each of the 12 possible roots.
+TO_PC = torch.zeros(P, 12)
+TO_PC[torch.arange(P), (torch.arange(P) + PLO) % 12] = 1.0
+TO_PC = TO_PC.to(DEVICE)
+ROOTS = ((torch.arange(12)[:, None] + torch.arange(12)[None]) % 12).to(DEVICE)   # ROOTS[r, k] = (r + k) % 12
+N_CHROMA = 5
+
+
+def staff_chroma(s, o, lowest):
+    """[n, T, 5, 12]: sounding, onsets, local window, whole passage, bass (lower) or melody (upper) note."""
+    cs = (s @ TO_PC).clamp(max=1)
+    co = (o @ TO_PC).clamp(max=1)
+    cw = (window_max(s) @ TO_PC).clamp(max=1)
+    cp = s.sum(1, keepdim=True) @ TO_PC
+    cp = (cp / cp.amax(-1, keepdim=True).clamp(min=1)).expand_as(cs)
+    return torch.stack([cs, co, cw, cp, extreme_note(s, lowest) @ TO_PC], 2)
+
+
+def chord_inputs(ru, rl):
+    """Root-relative views [n, T, 12, 5*12]; templates applied to them are transposition-invariant."""
+    cu = staff_chroma(ru[:, 0], ru[:, 1], lowest=False)
+    cl = staff_chroma(rl[:, 0], rl[:, 1], lowest=True)
+    def rel(c):
+        return c[..., ROOTS].permute(0, 1, 3, 2, 4).reshape(c.shape[0], T, 12, -1)
+    return rel(cu), rel(cl)
 
 
 # ----------------------------------------------------------------------------- model
@@ -194,15 +238,22 @@ class AxialLayer(nn.Module):
 class PairScorer(nn.Module):
     def __init__(self, d=D_MODEL, p=DROPOUT):
         super().__init__()
-        self.inp = nn.Sequential(nn.Dropout(0.1), nn.Linear(C_IN, d), nn.GELU(), nn.Dropout(p), nn.Linear(d, d))
+        self.inp = nn.Sequential(nn.Dropout(0.1), nn.Linear(C_IN + 2 * CHORD_DIM, d), nn.GELU(), nn.Dropout(p), nn.Linear(d, d))
+        # chord/key templates over the combined pitch classes of both staves (summed per staff, then non-linear)
+        self.chord_u = nn.Linear(N_CHROMA * 12, CHORD_DIM)
+        self.chord_l = nn.Linear(N_CHROMA * 12, CHORD_DIM, bias=False)
+        self.chord_mlp = nn.Sequential(nn.GELU(), nn.Linear(CHORD_DIM, CHORD_DIM), nn.GELU())
         self.blocks = nn.ModuleList([ConvBlock(d, dl, p) for dl in (1, 2, 4, 8)])
         self.att = nn.Linear(d, 1)
         self.proj = nn.Sequential(nn.LayerNorm(2 * d), nn.Linear(2 * d, d))
         self.axial = nn.ModuleList([nn.ModuleList([AxialLayer(d, p), AxialLayer(d, p)]) for _ in range(2)])
         self.head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d), nn.GELU(), nn.Dropout(p), nn.Linear(d, 1))
 
-    def forward(self, x):
+    def forward(self, x, chord):
         nu, nl = x.shape[:2]
+        vu, vl = chord
+        c = self.chord_mlp(self.chord_u(vu)[:, None] + self.chord_l(vl)[None])   # [nu, nl, T, 12 roots, CHORD_DIM]
+        x = torch.cat([x, c.amax(3), c.mean(3)], -1)                              # pooled over roots
         h = self.inp(x.reshape(nu * nl, T, -1))
         for blk in self.blocks:
             h = blk(h)
@@ -237,6 +288,19 @@ def assign(score):
 
 # ----------------------------------------------------------------------------- training
 def augment(ru, rl, g):
+    if float(torch.rand(1, generator=g)) < STRETCH_PROB:
+        # the same music at doubled note values: stretch a random half-passage window of both staves
+        a = int(torch.randint(0, T // 2 + 1, (1,), generator=g))
+        idx = (a + torch.arange(T) // 2).to(DEVICE)
+        ru, rl = ru[:, :, idx].clone(), rl[:, :, idx].clone()
+        ru[:, 1, 1::2] = 0
+        rl[:, 1, 1::2] = 0
+    if float(torch.rand(1, generator=g)) < OCTAVE_PROB:
+        # the lower staff an octave higher or lower (pitch classes unchanged), if it stays on the keyboard
+        o = 12 if float(torch.rand(1, generator=g)) < 0.5 else -12
+        keys = rl[:, 0].amax((0, 1)).nonzero().flatten()
+        if len(keys) and int(keys.min()) + o >= 0 and int(keys.max()) + o < P:
+            rl = torch.roll(rl, o, -1)
     shift = int(torch.randint(-4, 5, (1,), generator=g)) * 2      # same time shift for both staves
     if shift != 0:
         ru, rl = torch.roll(ru, shift, 2), torch.roll(rl, shift, 2)
@@ -267,7 +331,7 @@ def train_model(train_ids, B, onehots, siblings, seed):
                 oh = torch.cat([oh, torch.zeros(oh.shape[0], len(pick), device=DEVICE)], 1)
             ru, rl = augment(ru, rl, g)
             reg_shift = int(torch.randint(-5, 6, (1,), generator=g)) / 12
-            loss = listwise_loss(model(pair_features(ru, rl, reg_shift)), oh)
+            loss = listwise_loss(model(pair_features(ru, rl, reg_shift), chord_inputs(ru, rl)), oh)
             opt.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -279,7 +343,7 @@ def train_model(train_ids, B, onehots, siblings, seed):
 
 @torch.no_grad()
 def score_batches(model, B, ids):
-    return {b: normalised(model(pair_features(B[b]["ru"], B[b]["rl"]))) for b in ids
+    return {b: normalised(model(pair_features(B[b]["ru"], B[b]["rl"]), chord_inputs(B[b]["ru"], B[b]["rl"]))) for b in ids
             if B[b]["U"] and B[b]["L"]}
 
 
