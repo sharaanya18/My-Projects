@@ -1,41 +1,9 @@
-"""Restoring the order of speeches in a scene.
+"""Restoring the order of speeches in a scene (CPU solution).
 
     python3 solution.py <public_dir> <submission_out>
-
-Approach
---------
-Every row is one scene whose speeches are shuffled. The metric is Kendall's
-tau, i.e. the fraction of speech PAIRS put in the right relative order, so the
-model is trained directly on pairwise precedence.
-
-1. Speech encoder: the provided multilingual-e5-small checkpoint, fine-tuned
-   end to end (word-embedding matrix frozen to save memory and to limit
-   overfitting on 5k scenes). Long speeches keep their head and their tail,
-   because the start of a turn answers the previous one and the end of a turn
-   (often a question) sets up the next one.
-2. Scene context: a 2-layer transformer over the speech vectors of one scene,
-   with NO positional encoding (the presented order carries no information),
-   so every speech is represented in the context of the other speeches of its
-   own scene - the row itself is the unit of inference, nothing is pooled
-   across test rows.
-3. Two heads trained jointly:
-   - pairwise precedence logit P[i, j] (antisymmetric: P[j, i] = -P[i, j]),
-     binary cross-entropy against "i was spoken before j";
-   - per-speech relative position in [0, 1], squared error.
-4. Decoding: each speech gets an "earliness" score = blend of the fraction of
-   other speeches it is predicted to precede and its predicted position, then
-   an optional adjacent-swap pass makes neighbours agree with P.
-
-Model selection happens inside this script on author-grouped validation (the
-test split is by author): train on 80% of the author groups, pick the epoch
-count and the decode settings by validation Kendall tau, then retrain on all
-training rows with the selected epoch count. Everything is fixed in advance:
-seeds, epochs, batch composition, candidate grids - no clock and no
-machine-dependent branches.
 """
 import os
 
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -52,36 +20,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 
-# ── fixed configuration ───────────────────────────────────────────────────────
 SEED = 42
-DEVICE = torch.device("cuda")          # the test environment is one A10G
-AMP_DTYPE = torch.bfloat16
+DEVICE = torch.device("cpu")
 NUM_THREADS = 4
-HEAD_TOKENS = 72                       # tokens kept from the start of a speech
-TAIL_TOKENS = 54                       # tokens kept from the end of a speech
-SCENES_PER_BATCH = 8
-EPOCHS_MAX = 4                         # fixed training length, selected below
-LR_ENCODER = 3e-5
-LR_HEAD = 1e-3
-WEIGHT_DECAY = 0.01
-WARMUP_FRAC = 0.06
-POS_LOSS_WEIGHT = 0.5
-VAL_GROUP_FRAC = 0.2                   # share of author groups held out
-CTX_LAYERS = 2
-CTX_HEADS = 6
-PAIR_HIDDEN = 256
-DROPOUT = 0.1
-INFER_SCENES_PER_BATCH = 16
-BLEND_GRID = [0.0, 0.25, 0.5, 0.75, 1.0]   # weight of the position head
-SWAP_GRID = [False, True]                  # adjacent-swap refinement on/off
+FULL_HEAD, FULL_TAIL = 72, 54      # long speeches: keep start and end
+EDGE_TOKENS = 40                   # separate "opening" / "closing" views
+EMBED_BATCH = 64
 
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-torch.use_deterministic_algorithms(True, warn_only=True)
+torch.use_deterministic_algorithms(True)
 torch.set_num_threads(NUM_THREADS)
 
 
@@ -89,204 +38,172 @@ def log(*a):
     print(*a, flush=True)
 
 
-# ── metric (identical to the challenge's evaluate) ────────────────────────────
-def kendall_tau(true_order, pred_order):
-    n = len(true_order)
-    rank_true = np.empty(n, dtype=np.int64)
-    rank_pred = np.empty(n, dtype=np.int64)
-    rank_true[np.asarray(true_order)] = np.arange(n)
-    rank_pred[np.asarray(pred_order)] = np.arange(n)
-    dt = np.sign(rank_true[:, None] - rank_true[None, :])
-    dp = np.sign(rank_pred[:, None] - rank_pred[None, :])
-    concordant = int(((dt * dp) > 0).sum() // 2)
-    discordant = int(((dt * dp) < 0).sum() // 2)
-    return (concordant - discordant) / (n * (n - 1) / 2)
+@torch.inference_mode()
+def encode_ids(model, id_lists, pad_id):
+    """Mean-pooled, L2-normalised e5 vectors; batches built from length-sorted ids."""
+    order = np.argsort([len(x) for x in id_lists], kind="stable")
+    out = np.zeros((len(id_lists), model.config.hidden_size), dtype=np.float32)
+    for s in range(0, len(order), EMBED_BATCH):
+        idx = order[s:s + EMBED_BATCH]
+        L = max(len(id_lists[k]) for k in idx)
+        x = torch.full((len(idx), L), pad_id, dtype=torch.long)
+        a = torch.zeros((len(idx), L), dtype=torch.long)
+        for r, k in enumerate(idx):
+            x[r, :len(id_lists[k])] = torch.tensor(id_lists[k])
+            a[r, :len(id_lists[k])] = 1
+        h = model(input_ids=x, attention_mask=a).last_hidden_state
+        m = a.unsqueeze(-1).float()
+        v = (h * m).sum(1) / m.sum(1)
+        out[idx] = F.normalize(v, dim=-1).numpy()
+    return out
 
 
-def mean_tau(true_orders, pred_orders):
-    return float(np.mean([kendall_tau(t, p) for t, p in zip(true_orders, pred_orders)]))
+def embed_speeches(ckpt_dir, speeches):
+    """Three views per speech: full (head+tail), opening, closing -> [n, 3, d]."""
+    tok = AutoTokenizer.from_pretrained(ckpt_dir)
+    model = AutoModel.from_pretrained(ckpt_dir).eval()
+    raw = tok(["query: " + s for s in speeches], add_special_tokens=False)["input_ids"]
+    cls_id, sep_id = tok.cls_token_id, tok.sep_token_id
+    full, edge_idx, heads, tails = [], [], [], []
+    for i, t in enumerate(raw):
+        f = t if len(t) <= FULL_HEAD + FULL_TAIL else t[:FULL_HEAD] + t[-FULL_TAIL:]
+        full.append([cls_id] + f + [sep_id])
+        if len(t) > EDGE_TOKENS:         # short speeches: all views are the full text
+            edge_idx.append(i)
+            heads.append([cls_id] + t[:EDGE_TOKENS] + [sep_id])
+            # closing view keeps the "query: " prefix so every view is in-format
+            tails.append([cls_id] + t[:3] + t[-(EDGE_TOKENS - 3):] + [sep_id])
+    v_full = encode_ids(model, full, tok.pad_token_id)
+    v_head, v_tail = v_full.copy(), v_full.copy()
+    if edge_idx:
+        v_head[edge_idx] = encode_ids(model, heads, tok.pad_token_id)
+        v_tail[edge_idx] = encode_ids(model, tails, tok.pad_token_id)
+    return np.stack([v_full, v_head, v_tail], 1)
 
 
-# ── data ──────────────────────────────────────────────────────────────────────
-def load_data(public_dir):
-    def need(name):
-        p = public_dir / name
-        if not p.exists():
-            raise FileNotFoundError(f"required file missing: {p}")
-        return p
-
-    train = pd.read_csv(need("train.csv"), keep_default_na=False)
-    test = pd.read_csv(need("test.csv"), keep_default_na=False)
-    groups = pd.read_csv(need("train_groups.csv"), keep_default_na=False)
-    sample = pd.read_csv(need("sample_submission.csv"), keep_default_na=False)
-    need("pretrained/multilingual-e5-small/config.json")
-    train = train.merge(groups, on="id", how="left", validate="one_to_one")
-    if train["group"].eq("").any() or train["group"].isna().any():
-        raise ValueError("train rows without an author group")
-    train["speeches"] = train["speeches"].map(json.loads)
-    test["speeches"] = test["speeches"].map(json.loads)
-    train["order"] = train["order"].map(lambda s: [int(x) for x in s.split()])
-    for sp, od in zip(train["speeches"], train["order"]):
-        if sorted(od) != list(range(len(sp))):
-            raise ValueError("train order is not a permutation of its speeches")
-    return train, test, sample
+# ── surface features (generic punctuation / length cues, per speech) ──────────
+def surface_features(s):
+    t = s.strip()
+    end, start = t[-1:] if t else "", t[:1] if t else ""
+    return [
+        np.log1p(len(t)) / 8.0,
+        np.log1p(t.count("\n")) / 3.0,
+        float(end == "?"),
+        float(end == "!"),
+        float(end in "–-—" or t.endswith("...") or end == "…"),
+        float(start in "–-—" or t.startswith("...") or start == "…"),
+        float(start.islower()),
+        float("?" in t),
+    ]
 
 
-class Tokenized:
-    """Every speech tokenized once: head + tail tokens wrapped in <s> ... </s>."""
-
-    def __init__(self, tokenizer, scenes):
-        flat = ["query: " + s for sc in scenes for s in sc]
-        enc = tokenizer(flat, add_special_tokens=False, truncation=False)["input_ids"]
-        cls_id, sep_id = tokenizer.cls_token_id, tokenizer.sep_token_id
-        self.pad_id = tokenizer.pad_token_id
-        ids = []
-        for t in enc:
-            if len(t) > HEAD_TOKENS + TAIL_TOKENS:
-                t = t[:HEAD_TOKENS] + t[-TAIL_TOKENS:]
-            ids.append([cls_id] + t + [sep_id])
-        self.offsets = np.concatenate([[0], np.cumsum([len(sc) for sc in scenes])])
-        self.ids = ids
-
-    def batch(self, scene_idx):
-        rows = [r for s in scene_idx for r in range(self.offsets[s], self.offsets[s + 1])]
-        L = max(len(self.ids[r]) for r in rows)
-        inp = np.full((len(rows), L), self.pad_id, dtype=np.int64)
-        att = np.zeros((len(rows), L), dtype=np.int64)
-        for k, r in enumerate(rows):
-            inp[k, : len(self.ids[r])] = self.ids[r]
-            att[k, : len(self.ids[r])] = 1
-        sizes = [int(self.offsets[s + 1] - self.offsets[s]) for s in scene_idx]
-        return torch.from_numpy(inp), torch.from_numpy(att), sizes
+N_SURF = 8
 
 
-def rank_targets(orders, scene_idx, n_max):
-    """rank[b, i] = original position of presented speech i (-1 for padding)."""
-    rank = np.full((len(scene_idx), n_max), -1, dtype=np.int64)
-    for b, s in enumerate(scene_idx):
-        od = orders[s]
-        rank[b, np.asarray(od)] = np.arange(len(od))
-    return torch.from_numpy(rank)
+def scene_inputs(scenes, emb, offset):
+    """List of [n, 3*d + N_SURF] float32 arrays, one per scene."""
+    out = []
+    for sc in scenes:
+        n = len(sc)
+        e = emb[offset:offset + n].reshape(n, -1)
+        f = np.array([surface_features(s) for s in sc], dtype=np.float32)
+        out.append(np.concatenate([e, f], 1).astype(np.float32))
+        offset += n
+    return out, offset
 
 
 # ── model ─────────────────────────────────────────────────────────────────────
 class SceneOrderer(nn.Module):
-    def __init__(self, ckpt_dir):
+    def __init__(self, in_dim, d, layers, dropout, noise):
         super().__init__()
-        self.encoder = AutoModel.from_pretrained(ckpt_dir)
-        for p in self.encoder.embeddings.word_embeddings.parameters():
-            p.requires_grad = False
-        d = self.encoder.config.hidden_size
-        layer = nn.TransformerEncoderLayer(d, CTX_HEADS, 2 * d, DROPOUT,
-                                           batch_first=True, norm_first=True)
-        self.context = nn.TransformerEncoder(layer, CTX_LAYERS)
-        self.pair = nn.Sequential(nn.Linear(4 * d, PAIR_HIDDEN), nn.GELU(),
-                                  nn.Dropout(DROPOUT), nn.Linear(PAIR_HIDDEN, 1))
+        self.noise = noise
+        self.inp = nn.Sequential(nn.Dropout(dropout), nn.Linear(in_dim, d), nn.GELU(), nn.LayerNorm(d))
+        layer = nn.TransformerEncoderLayer(d, 4, 2 * d, dropout, batch_first=True, norm_first=True)
+        self.context = nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
+        self.pair = nn.Sequential(nn.Linear(4 * d, d), nn.GELU(), nn.Dropout(dropout), nn.Linear(d, 1))
         self.pos = nn.Linear(d, 1)
+        self.nxt_q, self.nxt_k = nn.Linear(d, d), nn.Linear(d, d)
 
-    def forward(self, input_ids, attention_mask, sizes):
-        out = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        m = attention_mask.unsqueeze(-1).to(out.dtype)
-        vec = (out * m).sum(1) / m.sum(1).clamp(min=1.0)          # mean pooling (e5)
-        B, n_max = len(sizes), max(sizes)
-        h = vec.new_zeros(B, n_max, vec.shape[-1])
-        pad = torch.ones(B, n_max, dtype=torch.bool, device=vec.device)
-        start = 0
-        for b, n in enumerate(sizes):
-            h[b, :n] = vec[start:start + n]
-            pad[b, :n] = False
-            start += n
-        h = self.context(h, src_key_padding_mask=pad)
-        hi = h.unsqueeze(2).expand(B, n_max, n_max, h.shape[-1])
-        hj = h.unsqueeze(1).expand(B, n_max, n_max, h.shape[-1])
+    def forward(self, x, pad):
+        if self.training and self.noise > 0:
+            x = x + self.noise * torch.randn_like(x)
+        h = self.context(self.inp(x), src_key_padding_mask=pad)
+        B, N, D = h.shape
+        hi = h.unsqueeze(2).expand(B, N, N, D)
+        hj = h.unsqueeze(1).expand(B, N, N, D)
         f = self.pair(torch.cat([hi, hj, hi * hj, hi - hj], -1)).squeeze(-1)
-        P = f - f.transpose(1, 2)                                   # antisymmetric
+        P = f - f.transpose(1, 2)                       # antisymmetric precedence logit
         pos = torch.sigmoid(self.pos(h).squeeze(-1))
-        return P, pos, pad
+        A = self.nxt_q(h) @ self.nxt_k(h).transpose(1, 2) / D ** 0.5   # i -> next j
+        return P, pos, A
 
 
-def scene_loss(P, pos, pad, rank):
+def make_batch(feats, ranks, idx, rng=None, crop_p=0.0, min_len=8):
+    xs, rs = [], []
+    for k in idx:
+        x, r = feats[k], ranks[k]
+        n = len(r)
+        if rng is not None and n > min_len and rng.rand() < crop_p:
+            L = rng.randint(min_len, n)                 # contiguous sub-scene
+            a = rng.randint(0, n - L + 1)
+            keep = np.where((r >= a) & (r < a + L))[0]
+            x, r = x[keep], r[keep] - a
+        xs.append(x)
+        rs.append(r)
+    N = max(len(r) for r in rs)
+    X = np.zeros((len(idx), N, xs[0].shape[1]), dtype=np.float32)
+    R = np.full((len(idx), N), -1, dtype=np.int64)
+    for b, (x, r) in enumerate(zip(xs, rs)):
+        X[b, :len(r)], R[b, :len(r)] = x, r
+    R = torch.from_numpy(R)
+    return torch.from_numpy(X), R, R < 0
+
+
+def loss_fn(P, pos, A, R, pad, w_pos, w_next):
     valid = ~pad
-    pair_mask = valid.unsqueeze(2) & valid.unsqueeze(1)
-    pair_mask &= ~torch.eye(P.shape[1], dtype=torch.bool, device=P.device).unsqueeze(0)
-    y = (rank.unsqueeze(2) < rank.unsqueeze(1)).float()          # i spoken before j
-    l_pair = F.binary_cross_entropy_with_logits(P.float()[pair_mask], y[pair_mask])
-    n = valid.sum(1, keepdim=True).float()
-    target = rank.float() / (n - 1)
-    l_pos = F.mse_loss(pos.float()[valid], target[valid])
-    return l_pair + POS_LOSS_WEIGHT * l_pos
-
-
-# ── training / inference ──────────────────────────────────────────────────────
-def build_optimizer(model, total_steps):
-    enc = [p for n, p in model.named_parameters() if n.startswith("encoder.") and p.requires_grad]
-    head = [p for n, p in model.named_parameters() if not n.startswith("encoder.")]
-    opt = torch.optim.AdamW([{"params": enc, "lr": LR_ENCODER},
-                             {"params": head, "lr": LR_HEAD}], weight_decay=WEIGHT_DECAY)
-    warm = max(1, int(WARMUP_FRAC * total_steps))
-
-    def lr_lambda(step):
-        if step < warm:
-            return (step + 1) / warm
-        return max(0.0, (total_steps - step) / max(1, total_steps - warm))
-
-    return opt, torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
-
-
-def epoch_batches(n_scenes, epoch):
-    rng = np.random.RandomState(SEED + epoch)
-    perm = rng.permutation(n_scenes)
-    return [perm[i:i + SCENES_PER_BATCH] for i in range(0, n_scenes, SCENES_PER_BATCH)]
-
-
-def train_epoch(model, opt, sched, tok, orders, epoch):
-    model.train()
-    losses = []
-    for scene_idx in epoch_batches(len(orders), epoch):
-        inp, att, sizes = tok.batch(scene_idx)
-        rank = rank_targets(orders, scene_idx, max(sizes)).to(DEVICE)
-        with torch.autocast(device_type=DEVICE.type, dtype=AMP_DTYPE):
-            P, pos, pad = model(inp.to(DEVICE), att.to(DEVICE), sizes)
-        loss = scene_loss(P, pos, pad, rank)
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
-        sched.step()
-        losses.append(loss.item())
-    return float(np.mean(losses))
+    n = valid.sum(1).float()
+    eye = torch.eye(P.shape[1], dtype=torch.bool).unsqueeze(0)
+    pm = valid.unsqueeze(2) & valid.unsqueeze(1) & ~eye
+    y = (R.unsqueeze(2) < R.unsqueeze(1)).float()
+    lp = F.binary_cross_entropy_with_logits(P, y, reduction="none") * pm
+    l_pair = (lp.sum((1, 2)) / pm.sum((1, 2))).mean()              # each scene weighs equally
+    tgt = R.float() / (n.unsqueeze(1) - 1)
+    l_pos = (((pos - tgt) ** 2) * valid).sum(1).div(n).mean()
+    # next-speech: for every speech except the last, softmax over the other speeches
+    An = A.masked_fill(~(valid.unsqueeze(1) & ~eye), -1e4)
+    nxt = R.unsqueeze(2) + 1 == R.unsqueeze(1)
+    has = nxt.any(2) & valid
+    tgt_j = nxt.float().argmax(2)
+    l_next = F.cross_entropy(An[has], tgt_j[has])
+    return l_pair + w_pos * l_pos + w_next * l_next
 
 
 @torch.no_grad()
-def predict(model, tok, n_scenes):
-    """Per scene: (P as float numpy [n, n], predicted position [n])."""
+def predict(model, feats, batch=64):
     model.eval()
     out = []
-    for s in range(0, n_scenes, INFER_SCENES_PER_BATCH):
-        scene_idx = list(range(s, min(n_scenes, s + INFER_SCENES_PER_BATCH)))
-        inp, att, sizes = tok.batch(scene_idx)
-        with torch.autocast(device_type=DEVICE.type, dtype=AMP_DTYPE):
-            P, pos, _ = model(inp.to(DEVICE), att.to(DEVICE), sizes)
-        P, pos = P.float().cpu().numpy(), pos.float().cpu().numpy()
-        for b, n in enumerate(sizes):
-            out.append((P[b, :n, :n], pos[b, :n]))
+    for s in range(0, len(feats), batch):
+        idx = list(range(s, min(len(feats), s + batch)))
+        X, _, pad = make_batch([feats[k] for k in idx], [np.arange(len(feats[k])) for k in idx], range(len(idx)))
+        P, pos, _ = model(X, pad)
+        for b, k in enumerate(idx):
+            n = len(feats[k])
+            out.append((P[b, :n, :n].numpy().astype(np.float64), pos[b, :n].numpy().astype(np.float64)))
     return out
 
 
 def decode(P, pos, blend, swap):
-    """Order of presented indices, earliest first."""
     n = len(pos)
     prob = 1.0 / (1.0 + np.exp(-P))
     np.fill_diagonal(prob, 0.0)
-    wins = prob.sum(1) / (n - 1)                       # share of others it precedes
-    early = (1.0 - blend) * wins + blend * (1.0 - pos)
-    order = list(np.lexsort((np.arange(n), -early)))   # stable, index tie-break
+    early = (1.0 - blend) * prob.sum(1) / (n - 1) + blend * (1.0 - pos)
+    order = list(np.lexsort((np.arange(n), -early)))
     if swap:
-        for _ in range(n):                             # fixed number of passes
+        for _ in range(n):
             changed = False
             for k in range(n - 1):
                 a, b = order[k], order[k + 1]
-                if P[b, a] > 0:                        # model prefers b before a
+                if P[b, a] > 0:
                     order[k], order[k + 1] = b, a
                     changed = True
             if not changed:
@@ -294,33 +211,80 @@ def decode(P, pos, blend, swap):
     return [int(x) for x in order]
 
 
-def fit(ckpt_dir, tok, orders, n_epochs, eval_fn=None):
-    torch.manual_seed(SEED)
-    model = SceneOrderer(ckpt_dir).to(DEVICE)
-    steps_per_epoch = len(epoch_batches(len(orders), 0))
-    opt, sched = build_optimizer(model, steps_per_epoch * EPOCHS_MAX)
-    history = []
-    for ep in range(n_epochs):
-        loss = train_epoch(model, opt, sched, tok, orders, ep)
-        score = eval_fn(model) if eval_fn is not None else None
-        history.append(score)
-        log(f"  epoch {ep + 1}/{n_epochs}  train loss {loss:.4f}"
-            + ("" if score is None else f"  val tau {score[0]:.4f} (blend={score[1]}, swap={score[2]})"))
-    return model, history
+def kendall_tau(true_order, pred_order):
+    n = len(true_order)
+    rt, rp = np.empty(n, np.int64), np.empty(n, np.int64)
+    rt[np.asarray(true_order)] = np.arange(n)
+    rp[np.asarray(pred_order)] = np.arange(n)
+    dt = np.sign(rt[:, None] - rt[None, :])
+    dp = np.sign(rp[:, None] - rp[None, :])
+    return (int(((dt * dp) > 0).sum() // 2) - int(((dt * dp) < 0).sum() // 2)) / (n * (n - 1) / 2)
 
 
-def best_decode(preds, true_orders):
-    best = None
-    for blend in BLEND_GRID:
-        for swap in SWAP_GRID:
-            pred = [decode(P, pos, blend, swap) for P, pos in preds]
-            tau = mean_tau(true_orders, pred)
-            if best is None or tau > best[0]:
-                best = (tau, blend, swap)
-    return best
+def mean_tau(orders_true, preds, blend=0.0, swap=False):
+    return float(np.mean([kendall_tau(t, decode(P, p, blend, swap)) for t, (P, p) in zip(orders_true, preds)]))
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
+def train_model(cfg, tr_feats, tr_ranks, va_feats, va_orders, seed):
+    torch.manual_seed(seed)
+    rng = np.random.RandomState(seed)
+    model = SceneOrderer(tr_feats[0].shape[1], cfg["d"], cfg["layers"], cfg["dropout"], cfg["noise"])
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["wd"])
+    steps = cfg["epochs"] * int(np.ceil(len(tr_feats) / cfg["batch"]))
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=cfg["lr"], total_steps=steps, pct_start=0.1)
+    best, best_state, bad = -9.0, None, 0
+    for ep in range(cfg["epochs"]):
+        model.train()
+        perm = rng.permutation(len(tr_feats))
+        for s in range(0, len(perm), cfg["batch"]):
+            X, R, pad = make_batch(tr_feats, tr_ranks, perm[s:s + cfg["batch"]], rng, cfg["crop_p"])
+            P, pos, A = model(X, pad)
+            loss = loss_fn(P, pos, A, R, pad, cfg["w_pos"], cfg["w_next"])
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            sched.step()
+        tau = mean_tau(va_orders, predict(model, va_feats))
+        if tau > best:
+            best, best_state, bad = tau, {k: v.clone() for k, v in model.state_dict().items()}, 0
+        else:
+            bad += 1
+        if bad >= cfg["patience"]:                       # early stopping on validation score
+            break
+    model.load_state_dict(best_state)
+    return model, best, ep + 1
+
+
+# ── configuration search space (fixed list, fixed order) ─────────────────────
+BASE = dict(d=256, layers=2, dropout=0.15, noise=0.02, lr=1e-3, wd=0.05, batch=32,
+            epochs=40, patience=6, crop_p=0.5, w_pos=0.5, w_next=0.3)
+CONFIGS = [
+    dict(BASE),
+    dict(BASE, d=384, layers=3, dropout=0.2),
+    dict(BASE, w_next=0.0, crop_p=0.0),
+]
+N_FOLDS = 5
+HPO_FOLDS = 2                       # configs compared on the first 2 author folds
+BLEND_GRID = [0.0, 0.25, 0.5, 0.75, 1.0]
+SWAP_GRID = [False, True]
+
+
+def author_folds(groups, n_folds):
+    """Balanced folds of whole author groups (largest first, seeded tie order)."""
+    rng = np.random.RandomState(SEED)
+    sizes = groups.value_counts()
+    names = np.array(sorted(sizes.index))
+    names = names[rng.permutation(len(names))]
+    names = sorted(names, key=lambda g: -sizes[g])          # stable: keeps seeded order
+    load, fold_of = np.zeros(n_folds), {}
+    for g in names:
+        f = int(np.argmin(load))
+        fold_of[g] = f
+        load[f] += sizes[g]
+    return groups.map(fold_of).to_numpy()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("public_dir", nargs="?", default="./dataset/public")
@@ -328,52 +292,79 @@ def main():
     args, _unknown = ap.parse_known_args()
     public_dir, out_path = Path(args.public_dir), Path(args.submission_out)
     ckpt_dir = str(public_dir / "pretrained" / "multilingual-e5-small")
+    for name in ["train.csv", "test.csv", "train_groups.csv", "sample_submission.csv",
+                 "pretrained/multilingual-e5-small/config.json"]:
+        if not (public_dir / name).exists():
+            raise FileNotFoundError(f"required file missing: {public_dir / name}")
 
-    train, test, sample = load_data(public_dir)
-    log(f"train {len(train)} scenes / {train['group'].nunique()} author groups, test {len(test)} scenes")
-    tokenizer = AutoTokenizer.from_pretrained(ckpt_dir)
+    train = pd.read_csv(public_dir / "train.csv", keep_default_na=False)
+    test = pd.read_csv(public_dir / "test.csv", keep_default_na=False)
+    groups = pd.read_csv(public_dir / "train_groups.csv", keep_default_na=False)
+    sample = pd.read_csv(public_dir / "sample_submission.csv", keep_default_na=False)
+    train = train.merge(groups, on="id", how="left", validate="one_to_one")
+    tr_sc = train["speeches"].map(json.loads).tolist()
+    te_sc = test["speeches"].map(json.loads).tolist()
+    tr_orders = [[int(x) for x in s.split()] for s in train["order"]]
+    tr_ranks = []
+    for sc, od in zip(tr_sc, tr_orders):
+        if sorted(od) != list(range(len(sc))):
+            raise ValueError("train order is not a permutation")
+        r = np.empty(len(od), np.int64)
+        r[np.asarray(od)] = np.arange(len(od))
+        tr_ranks.append(r)
+    log(f"train {len(tr_sc)} scenes / {train['group'].nunique()} authors, test {len(te_sc)} scenes")
 
-    # author-grouped holdout, mirroring the by-author test split
-    rng = np.random.RandomState(SEED)
-    grp = np.array(sorted(train["group"].unique()))
-    grp = grp[rng.permutation(len(grp))]
-    counts = train["group"].value_counts()
-    cum = np.cumsum([counts[g] for g in grp])
-    val_groups = set(grp[: int(np.searchsorted(cum, VAL_GROUP_FRAC * len(train))) + 1])
-    is_val = train["group"].isin(val_groups).to_numpy()
-    tr_part, va_part = train[~is_val].reset_index(drop=True), train[is_val].reset_index(drop=True)
-    log(f"holdout: {len(val_groups)} author groups, {len(va_part)} scenes")
+    log("embedding every speech with the frozen e5-small encoder (3 views) ...")
+    emb = embed_speeches(ckpt_dir, [s for sc in tr_sc + te_sc for s in sc])
+    tr_feats, off = scene_inputs(tr_sc, emb, 0)
+    te_feats, _ = scene_inputs(te_sc, emb, off)
 
-    tok_tr = Tokenized(tokenizer, tr_part["speeches"].tolist())
-    tok_va = Tokenized(tokenizer, va_part["speeches"].tolist())
-    va_true = va_part["order"].tolist()
+    fold = author_folds(train["group"], N_FOLDS)
 
-    def eval_val(model):
-        return best_decode(predict(model, tok_va, len(va_part)), va_true)
+    def run_fold(cfg, f, seed):
+        tr_i, va_i = np.where(fold != f)[0], np.where(fold == f)[0]
+        model, tau, ep = train_model(cfg, [tr_feats[i] for i in tr_i], [tr_ranks[i] for i in tr_i],
+                                     [tr_feats[i] for i in va_i], [tr_orders[i] for i in va_i], seed)
+        return model, va_i, tau, ep
 
-    log("stage 1: train on 80% of authors, select epochs + decoding on held-out authors")
-    _, history = fit(ckpt_dir, tok_tr, tr_part["order"].tolist(), EPOCHS_MAX, eval_val)
-    best_ep = int(np.argmax([h[0] for h in history])) + 1
-    _, blend, swap = history[best_ep - 1]
-    log(f"selected: epochs={best_ep}, blend={blend}, swap={swap}, held-out-author tau={history[best_ep - 1][0]:.4f}")
+    log("hyperparameter search on held-out author folds")
+    hpo = []
+    for c, cfg in enumerate(CONFIGS):
+        taus = [run_fold(cfg, f, SEED + f)[2] for f in range(HPO_FOLDS)]
+        hpo.append(float(np.mean(taus)))
+        log(f"  config {c}: {cfg}  held-out tau {np.round(taus, 4).tolist()} -> {hpo[-1]:.4f}")
+    cfg = CONFIGS[int(np.argmax(hpo))]
+    log(f"selected config {int(np.argmax(hpo))}")
 
-    log("stage 2: retrain on all training scenes with the selected settings")
-    tok_all = Tokenized(tokenizer, train["speeches"].tolist())
-    model, _ = fit(ckpt_dir, tok_all, train["order"].tolist(), best_ep)
+    log(f"{N_FOLDS}-fold author-grouped training of the selected config")
+    oof = [None] * len(tr_sc)
+    te_P = [np.zeros((len(x), len(x))) for x in te_feats]
+    te_pos = [np.zeros(len(x)) for x in te_feats]
+    for f in range(N_FOLDS):
+        model, va_i, tau, ep = run_fold(cfg, f, SEED + f)
+        for i, p in zip(va_i, predict(model, [tr_feats[i] for i in va_i])):
+            oof[i] = p
+        for k, (P, pos) in enumerate(predict(model, te_feats)):
+            te_P[k] += P / N_FOLDS
+            te_pos[k] += pos / N_FOLDS
+        log(f"  fold {f}: held-out tau {tau:.4f} after {ep} epochs")
 
-    tok_te = Tokenized(tokenizer, test["speeches"].tolist())
-    preds = predict(model, tok_te, len(test))
-    orders = [decode(P, pos, blend, swap) for P, pos in preds]
+    best = None
+    for blend in BLEND_GRID:
+        for swap in SWAP_GRID:
+            t = mean_tau(tr_orders, oof, blend, swap)
+            if best is None or t > best[0]:
+                best = (t, blend, swap)
+    _, blend, swap = best
+    log(f"out-of-fold (unseen authors) Kendall tau {best[0]:.4f}  [blend={blend}, swap={swap}]")
 
+    orders = [decode(P, pos, blend, swap) for P, pos in zip(te_P, te_pos)]
     sub = pd.DataFrame({"id": test["id"], "order": [" ".join(map(str, o)) for o in orders]})
-    sub = sub.set_index("id").loc[sample["id"]].reset_index()     # sample's id order
+    sub = sub.set_index("id").loc[sample["id"]].reset_index()
 
-    # validate before writing: a malformed file is ranked below a score of 0
-    n_by_id = dict(zip(test["id"], test["speeches"].map(len)))
-    if list(sub.columns) != list(sample.columns):
-        raise ValueError(f"columns {list(sub.columns)} != {list(sample.columns)}")
-    if len(sub) != len(sample) or sub["id"].duplicated().any():
-        raise ValueError("row count or ids do not match sample_submission.csv")
+    n_by_id = dict(zip(test["id"], map(len, te_sc)))
+    if list(sub.columns) != list(sample.columns) or len(sub) != len(sample) or sub["id"].duplicated().any():
+        raise ValueError("submission does not match sample_submission.csv")
     for i, o in zip(sub["id"], sub["order"]):
         if sorted(int(x) for x in o.split()) != list(range(n_by_id[i])):
             raise ValueError(f"row {i}: order is not a permutation")
