@@ -281,14 +281,10 @@ def train_model(cfg, tr_feats, tr_ranks, va_feats, va_orders, seed):
 
 # ── configuration search space (fixed list, fixed order) ─────────────────────
 BASE = dict(d=256, layers=2, dropout=0.15, noise=0.02, lr=1e-3, wd=0.05, batch=32,
-            epochs=40, patience=6, crop_p=0.5, w_pos=0.5, w_next=0.3)
-CONFIGS = [
-    dict(BASE),
-    dict(BASE, d=384, layers=3, dropout=0.2),
-    dict(BASE, w_next=0.0, crop_p=0.0),
-]
-N_FOLDS = 5
-HPO_FOLDS = 2                       # configs compared on the first 2 author folds
+            epochs=14, patience=3, crop_p=0.5, w_pos=0.5, w_next=0.3)
+CONFIGS = [BASE]
+N_FOLDS = 5                         # author folds
+TRAIN_FOLDS = 2                     # fold models trained (CPU budget); test = their average
 BLEND_GRID = [0.0, 0.25, 0.5, 0.75, 1.0]
 SWAP_GRID = [False, True]
 
@@ -350,32 +346,25 @@ def main():
                                      [tr_feats[i] for i in va_i], [tr_orders[i] for i in va_i], seed)
         return model, va_i, tau, ep
 
-    log("hyperparameter search on held-out author folds")
-    hpo = []
-    for c, cfg in enumerate(CONFIGS):
-        taus = [run_fold(cfg, f, SEED + f)[2] for f in range(HPO_FOLDS)]
-        hpo.append(float(np.mean(taus)))
-        log(f"  config {c}: {cfg}  held-out tau {np.round(taus, 4).tolist()} -> {hpo[-1]:.4f}")
-    cfg = CONFIGS[int(np.argmax(hpo))]
-    log(f"selected config {int(np.argmax(hpo))}")
-
-    log(f"{N_FOLDS}-fold author-grouped training of the selected config")
-    oof = [None] * len(tr_sc)
+    cfg = CONFIGS[0]
+    log(f"training {TRAIN_FOLDS} of {N_FOLDS} author-grouped folds")
+    oof = {}
     te_P = [np.zeros((len(x), len(x))) for x in te_feats]
     te_pos = [np.zeros(len(x)) for x in te_feats]
-    for f in range(N_FOLDS):
+    for f in range(TRAIN_FOLDS):
         model, va_i, tau, ep = run_fold(cfg, f, SEED + f)
         for i, p in zip(va_i, predict(model, [tr_feats[i] for i in va_i])):
             oof[i] = p
         for k, (P, pos) in enumerate(predict(model, te_feats)):
-            te_P[k] += P / N_FOLDS
-            te_pos[k] += pos / N_FOLDS
+            te_P[k] += P / TRAIN_FOLDS
+            te_pos[k] += pos / TRAIN_FOLDS
         log(f"  fold {f}: held-out tau {tau:.4f} after {ep} epochs")
 
     best = None
     for blend in BLEND_GRID:
         for swap in SWAP_GRID:
-            t = mean_tau(tr_orders, oof, blend, swap)
+            keys = sorted(oof)
+            t = mean_tau([tr_orders[i] for i in keys], [oof[i] for i in keys], blend, swap)
             if best is None or t > best[0]:
                 best = (t, blend, swap)
     _, blend, swap = best
