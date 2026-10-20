@@ -281,10 +281,10 @@ def train_model(cfg, tr_feats, tr_ranks, va_feats, va_orders, seed):
 
 # ── configuration search space (fixed list, fixed order) ─────────────────────
 BASE = dict(d=256, layers=2, dropout=0.15, noise=0.02, lr=1e-3, wd=0.05, batch=32,
-            epochs=14, patience=3, crop_p=0.5, w_pos=0.5, w_next=0.3)
+            epochs=8, patience=2, crop_p=0.5, w_pos=0.5, w_next=0.3)
 CONFIGS = [BASE]
 N_FOLDS = 5                         # author folds
-TRAIN_FOLDS = 2                     # fold models trained (CPU budget); test = their average
+TRAIN_FOLDS = 1                     # fold models trained (CPU budget); test = their average
 BLEND_GRID = [0.0, 0.25, 0.5, 0.75, 1.0]
 SWAP_GRID = [False, True]
 
