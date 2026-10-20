@@ -26,6 +26,7 @@ NUM_THREADS = 4
 FULL_HEAD, FULL_TAIL = 72, 54      # long speeches: keep start and end
 EDGE_TOKENS = 40                   # separate "opening" / "closing" views
 EMBED_BATCH = 64
+PAIR_HIDDEN = 128
 
 random.seed(SEED)
 np.random.seed(SEED)
@@ -117,24 +118,36 @@ class SceneOrderer(nn.Module):
     def __init__(self, in_dim, d, layers, dropout, noise):
         super().__init__()
         self.noise = noise
+        self.emb_dim = (in_dim - N_SURF) // 3
         self.inp = nn.Sequential(nn.Dropout(dropout), nn.Linear(in_dim, d), nn.GELU(), nn.LayerNorm(d))
         layer = nn.TransformerEncoderLayer(d, 4, 2 * d, dropout, batch_first=True, norm_first=True)
         self.context = nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
-        self.pair = nn.Sequential(nn.Linear(4 * d, d), nn.GELU(), nn.Dropout(dropout), nn.Linear(d, 1))
+        # factorised pair MLP: the per-speech linear terms are computed once per
+        # speech, only the interaction term is computed per pair
+        p = PAIR_HIDDEN
+        self.pair_i, self.pair_j = nn.Linear(d, p), nn.Linear(d, p, bias=False)
+        self.pair_x, self.pair_s = nn.Linear(d, p, bias=False), nn.Linear(3, p, bias=False)
+        self.pair_out = nn.Sequential(nn.GELU(), nn.Dropout(dropout), nn.Linear(p, 1))
         self.pos = nn.Linear(d, 1)
         self.nxt_q, self.nxt_k = nn.Linear(d, d), nn.Linear(d, d)
 
     def forward(self, x, pad):
+        # raw cosine similarities between the frozen views of two speeches of the
+        # scene: full~full, closing(i)~opening(j), opening(i)~closing(j)
+        B, N = x.shape[:2]
+        v = x[..., :3 * self.emb_dim].reshape(B, N, 3, self.emb_dim)
+        sims = torch.stack([v[:, :, 0] @ v[:, :, 0].transpose(1, 2),
+                            v[:, :, 2] @ v[:, :, 1].transpose(1, 2),
+                            v[:, :, 1] @ v[:, :, 2].transpose(1, 2)], -1)
         if self.training and self.noise > 0:
             x = x + self.noise * torch.randn_like(x)
         h = self.context(self.inp(x), src_key_padding_mask=pad)
-        B, N, D = h.shape
-        hi = h.unsqueeze(2).expand(B, N, N, D)
-        hj = h.unsqueeze(1).expand(B, N, N, D)
-        f = self.pair(torch.cat([hi, hj, hi * hj, hi - hj], -1)).squeeze(-1)
+        z = (self.pair_i(h).unsqueeze(2) + self.pair_j(h).unsqueeze(1)
+             + self.pair_x(h.unsqueeze(2) * h.unsqueeze(1)) + self.pair_s(sims))
+        f = self.pair_out(z).squeeze(-1)
         P = f - f.transpose(1, 2)                       # antisymmetric precedence logit
         pos = torch.sigmoid(self.pos(h).squeeze(-1))
-        A = self.nxt_q(h) @ self.nxt_k(h).transpose(1, 2) / D ** 0.5   # i -> next j
+        A = self.nxt_q(h) @ self.nxt_k(h).transpose(1, 2) / h.shape[-1] ** 0.5   # i -> next j
         return P, pos, A
 
 
@@ -181,14 +194,15 @@ def loss_fn(P, pos, A, R, pad, w_pos, w_next):
 @torch.no_grad()
 def predict(model, feats, batch=64):
     model.eval()
-    out = []
-    for s in range(0, len(feats), batch):
-        idx = list(range(s, min(len(feats), s + batch)))
+    out = [None] * len(feats)
+    by_size = sorted(range(len(feats)), key=lambda k: len(feats[k]))
+    for s in range(0, len(by_size), batch):
+        idx = by_size[s:s + batch]
         X, _, pad = make_batch([feats[k] for k in idx], [np.arange(len(feats[k])) for k in idx], range(len(idx)))
         P, pos, _ = model(X, pad)
         for b, k in enumerate(idx):
             n = len(feats[k])
-            out.append((P[b, :n, :n].numpy().astype(np.float64), pos[b, :n].numpy().astype(np.float64)))
+            out[k] = (P[b, :n, :n].numpy().astype(np.float64), pos[b, :n].numpy().astype(np.float64))
     return out
 
 
@@ -225,6 +239,16 @@ def mean_tau(orders_true, preds, blend=0.0, swap=False):
     return float(np.mean([kendall_tau(t, decode(P, p, blend, swap)) for t, (P, p) in zip(orders_true, preds)]))
 
 
+def size_batches(feats, batch, rng, pool=20):
+    """Seeded shuffle, then group scenes of similar size to cut padding."""
+    perm = rng.permutation(len(feats))
+    batches = []
+    for s in range(0, len(perm), batch * pool):
+        chunk = sorted(perm[s:s + batch * pool], key=lambda k: len(feats[k]))
+        batches += [chunk[i:i + batch] for i in range(0, len(chunk), batch)]
+    return [batches[i] for i in rng.permutation(len(batches))]
+
+
 def train_model(cfg, tr_feats, tr_ranks, va_feats, va_orders, seed):
     torch.manual_seed(seed)
     rng = np.random.RandomState(seed)
@@ -235,9 +259,8 @@ def train_model(cfg, tr_feats, tr_ranks, va_feats, va_orders, seed):
     best, best_state, bad = -9.0, None, 0
     for ep in range(cfg["epochs"]):
         model.train()
-        perm = rng.permutation(len(tr_feats))
-        for s in range(0, len(perm), cfg["batch"]):
-            X, R, pad = make_batch(tr_feats, tr_ranks, perm[s:s + cfg["batch"]], rng, cfg["crop_p"])
+        for idx in size_batches(tr_feats, cfg["batch"], rng):
+            X, R, pad = make_batch(tr_feats, tr_ranks, idx, rng, cfg["crop_p"])
             P, pos, A = model(X, pad)
             loss = loss_fn(P, pos, A, R, pad, cfg["w_pos"], cfg["w_next"])
             opt.zero_grad()
