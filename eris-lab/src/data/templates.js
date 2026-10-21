@@ -115,6 +115,185 @@ print(f"wrote {SUBMISSION_OUT} rows={len(submission)}")
 `,
     },
     {
+      id: "skeleton-tabular-reg",
+      name: "Rubric-ready tabular regression (log-space metric)",
+      lang: "python",
+      note: "Built from the platform's worked example: a requirements map up top, every feature type encoded on purpose, an L1 objective on log1p(y), out-of-fold entity statistics for a random split, the train-fit score printed next to CV, and the grader's own checks before writing. Swap the column lists for your challenge and drop the blocks it doesn't have.",
+      code: `"""<Challenge name> - solution.
+
+Run: python3 solution.py <public_dir> <submission_out>
+
+Requirements map (rubric criterion / constraint -> where it is met):
+- Drop target-leaking columns (defensive, only if present) -> LEAKY, load section
+- Drop entirely-null columns -> ALL_NULL, load section
+- Log-transform the skewed target to match the metric -> fit_target(), y_log
+- Split pipe-separated lists and multi-hot encode them -> encode_multi()
+- Dates parsed with the documented format -> encode_dates(), DATE_FORMAT
+- Text column handled with TF-IDF fitted on train only -> encode_text()
+- Gradient boosting model -> LGBMRegressor in run_cv()
+- Train vs validation gap reported -> "train-fit" line in the CV log
+- Predictions clipped to the valid range -> np.clip before writing
+- Output checked against the grader's own rules -> asserts before to_csv
+"""
+import os
+
+# Pin thread counts before numpy/sklearn load so float reductions don't vary
+# with the machine's core count.
+for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ[_v] = "4"
+
+import random
+import sys
+from pathlib import Path
+
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import MultiLabelBinarizer
+
+SEED = 42
+N_FOLDS = 5
+N_THREADS = 4
+ID_COL, TARGET = "id", "target"
+LEAKY = ["fork_count", "views", "comments_count"]   # columns the description says leak the target
+ALL_NULL = ["unused_a", "unused_b"]                 # columns the description says are entirely null
+NUMERIC = ["num_a", "num_b"]
+CATEGORICAL = ["cat_a"]
+DATES = ["created_date"]
+DATE_FORMAT = "%d/%m/%Y"                            # the format the description documents
+MULTI = ["tags"]                                    # pipe-separated lists
+TEXT = "title"
+ENTITY = "author"                                   # key that recurs in train and test (random split)
+PARAMS = dict(objective="l1", learning_rate=0.03, num_leaves=63, min_child_samples=40,
+              subsample=0.8, subsample_freq=1, colsample_bytree=0.7, reg_lambda=1.0,
+              n_estimators=4000, random_state=SEED, n_jobs=N_THREADS, verbose=-1)
+
+random.seed(SEED)
+np.random.seed(SEED)
+
+PUBLIC_DIR = Path(sys.argv[1])
+SUBMISSION_OUT = Path(sys.argv[2])
+
+
+def metric(y_true, y_pred):
+    # MAE in log space, as the challenge defines it. Lower is better.
+    return float(np.mean(np.abs(np.log1p(y_true) - np.log1p(y_pred))))
+
+
+train = pd.read_csv(PUBLIC_DIR / "train.csv")
+test = pd.read_csv(PUBLIC_DIR / "test.csv")
+sample = pd.read_csv(PUBLIC_DIR / "sample_submission.csv")
+# Leaking and empty columns go first, and only where present (the rubric asks for it even as a no-op).
+train = train.drop(columns=[c for c in LEAKY + ALL_NULL if c in train.columns])
+test = test.drop(columns=[c for c in LEAKY + ALL_NULL if c in test.columns])
+y = train[TARGET].to_numpy(dtype=float)
+# The metric is an L1 error on log1p(y), minimised by the median of log1p(y): train there with an L1 objective.
+y_log = np.log1p(y)
+
+
+def encode_dates(df):
+    out = pd.DataFrame(index=df.index)
+    for c in DATES:
+        d = pd.to_datetime(df[c], format=DATE_FORMAT)
+        out[c + "_days"] = (d - pd.Timestamp("1970-01-01")).dt.days
+    return out
+
+
+def encode_multi(tr, te):
+    # Fitted on training rows only; values unseen in train are ignored for test rows.
+    blocks_tr, blocks_te = [], []
+    for c in MULTI:
+        mlb = MultiLabelBinarizer(sparse_output=True)
+        split = lambda s: s.fillna("").str.split("|").apply(lambda v: [x for x in v if x])
+        blocks_tr.append(mlb.fit_transform(split(tr[c])).astype(np.float32))
+        known = set(mlb.classes_)
+        blocks_te.append(mlb.transform(split(te[c]).apply(lambda v: [x for x in v if x in known])).astype(np.float32))
+    return sp.hstack(blocks_tr).tocsr(), sp.hstack(blocks_te).tocsr()
+
+
+def encode_text(tr, te):
+    tfidf = TfidfVectorizer(max_features=2000, ngram_range=(1, 2), min_df=3, sublinear_tf=True)
+    return tfidf.fit_transform(tr[TEXT].fillna("")).astype(np.float32), tfidf.transform(te[TEXT].fillna("")).astype(np.float32)
+
+
+def dense_block(df):
+    out = df[NUMERIC].astype(float).copy()
+    out[NUMERIC] = np.log1p(out[NUMERIC].clip(lower=0))   # skewed counts
+    out = out.join(encode_dates(df))
+    for c in CATEGORICAL:
+        out[c] = df[c].astype("category").cat.codes
+    return out
+
+
+def entity_stats(keys_fit, y_fit, keys_apply):
+    # Mean log-target and row count per entity, fitted on the given rows only (inside each fold).
+    g = pd.DataFrame({"k": keys_fit.to_numpy(), "y": y_fit}).groupby("k")["y"].agg(["mean", "count"])
+    prior, k = float(np.mean(y_fit)), 10.0
+    smooth = (g["mean"] * g["count"] + prior * k) / (g["count"] + k)
+    m = keys_apply.map(smooth).fillna(prior).to_numpy()
+    n = keys_apply.map(g["count"]).fillna(0).to_numpy()
+    return np.column_stack([m, n]).astype(np.float32)
+
+
+D_tr, D_te = dense_block(train), dense_block(test)
+M_tr, M_te = encode_multi(train, test)
+T_tr, T_te = encode_text(train, test)
+X_base_tr = sp.hstack([sp.csr_matrix(D_tr.to_numpy(np.float32)), M_tr, T_tr]).tocsr()
+X_base_te = sp.hstack([sp.csr_matrix(D_te.to_numpy(np.float32)), M_te, T_te]).tocsr()
+
+# The prepare script split rows at random, so shuffled KFold mirrors the hidden test.
+folds = list(KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED).split(X_base_tr))
+
+
+def with_entity(X, stats):
+    return sp.hstack([X, sp.csr_matrix(stats)]).tocsr()
+
+
+oof_log = np.zeros(len(train))
+best_iters, fold_scores, fit_scores = [], [], []
+for f, (tr, va) in enumerate(folds):
+    s_tr = np.zeros((len(tr), 2), dtype=np.float32)
+    inner = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED + f).split(tr)
+    for a, b in inner:   # out-of-fold entity stats for the training rows too
+        s_tr[b] = entity_stats(train[ENTITY].iloc[tr[a]], y_log[tr[a]], train[ENTITY].iloc[tr[b]])
+    s_va = entity_stats(train[ENTITY].iloc[tr], y_log[tr], train[ENTITY].iloc[va])
+    X_tr, X_va = with_entity(X_base_tr[tr], s_tr), with_entity(X_base_tr[va], s_va)
+    model = lgb.LGBMRegressor(**PARAMS)
+    model.fit(X_tr, y_log[tr], eval_set=[(X_va, y_log[va])], callbacks=[lgb.early_stopping(200, verbose=False)])
+    oof_log[va] = model.predict(X_va)
+    best_iters.append(model.best_iteration_)
+    fold_scores.append(metric(y[va], np.clip(np.expm1(oof_log[va]), 0, None)))
+    fit_scores.append(metric(y[tr], np.clip(np.expm1(model.predict(X_tr)), 0, None)))
+    print(f"fold {f}: valid {fold_scores[-1]:.5f} train-fit {fit_scores[-1]:.5f} iters {best_iters[-1]}")
+
+print(f"CV {np.mean(fold_scores):.5f} +/- {np.std(fold_scores):.5f} train-fit {np.mean(fit_scores):.5f} folds={np.round(fold_scores, 5).tolist()}")
+print(f"baseline constant median: {metric(y, np.full(len(y), np.median(y))):.5f}")
+
+# Final fit on all training rows with a fixed iteration count from CV.
+s_all = np.zeros((len(train), 2), dtype=np.float32)
+for a, b in folds:
+    s_all[b] = entity_stats(train[ENTITY].iloc[a], y_log[a], train[ENTITY].iloc[b])
+s_test = entity_stats(train[ENTITY], y_log, test[ENTITY])
+final = lgb.LGBMRegressor(**{**PARAMS, "n_estimators": int(np.median(best_iters))})
+final.fit(with_entity(X_base_tr, s_all), y_log)
+pred = np.clip(np.expm1(final.predict(with_entity(X_base_te, s_test))), 0, None)
+
+submission = pd.DataFrame({ID_COL: test[ID_COL], TARGET: pred})[list(sample.columns)]
+
+# The grader's own checks: exact columns, one row per test id, values >= 0. Plus finite values.
+assert set(submission.columns) == set(sample.columns), "column mismatch"
+assert len(submission) == len(test) and submission[ID_COL].is_unique, "row/id mismatch"
+assert np.isfinite(submission[TARGET]).all() and (submission[TARGET] >= 0).all(), "invalid predictions"
+
+SUBMISSION_OUT.parent.mkdir(parents=True, exist_ok=True)
+submission.to_csv(SUBMISSION_OUT, index=False)
+print(f"wrote {SUBMISSION_OUT} rows={len(submission)}")
+`,
+    },
+    {
       id: "skeleton-torch",
       name: "Seed and device header (PyTorch)",
       lang: "python",
@@ -213,15 +392,24 @@ PY
 - Kaggle Docker image libraries only. Pretrained general-purpose weights from Hugging Face or timm are OK unless the category forbids them.
 - Determinism: seed everything; DEVICE = torch.device("cuda"); constants for workers and batch size; fixed epochs; HPO with a seeded sampler and fixed n_trials.
 - No clock- or machine-dependent logic, no try/except fallbacks, no env-var or debug switches.
-- Runtime under 75 min on an A10G (limit 1.5 h). Challenge-specific limits override.
+- Fixed work plan ≤ 50 min on the target hardware with ≥ 30% headroom (limit 1.5 h). CPU-only or shorter limits in the description override.
+- Source: plain readable UTF-8 under 512 KB. Write submission.csv exactly once, after validation. A requirements-map docstring quotes each rule.
 - Test data: one-sample or one-query-list inference only. No pseudo-labels, test-fitted transforms or test-distribution calibration.
 - No external data, no synthetic training data, no LLM API calls, no hardcoded labels or rules.
 
 ## Category: <general | NLP | CV | RAG | Fine-tuning | From-scratch | bio-chem>
 <paste the category rules from Eris Solver Lab>
 
+## Rubric (copy it from the challenge page)
+- REQUIRED: <criterion> -> <where the code meets it>
+- RECOMMENDED: <criterion> -> <done, or why skipped>
+Every REQUIRED item is met visibly and listed in the requirements-map docstring. Print the train-fit score next to CV.
+
+## Grader contract (from the grading script)
+- Columns: <exact set>. Rows: one per test id. Values: <range, e.g. >= 0>. Assert all of it, plus finite values, before writing.
+
 ## Validation
-- Split: <GroupKFold on X | time split on Y | leave-one-group-out on Z>. Fold seed 42. Folds saved once and reused.
+- Split: mirror the prepare script (<random KFold | GroupKFold on X | time split on Y>). Fold seed 42. Folds saved once and reused.
 - Stress split: <leave-one-group-out on ...>
 - Metric: <exact definition>. Direction: <higher | lower> is better.
 

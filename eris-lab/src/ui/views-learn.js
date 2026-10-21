@@ -9,6 +9,7 @@
   UI.pageHead = pageHead;
 
   /* ---------------- Dashboard ---------------- */
+  let dashUnsub = null;
   V.dashboard = {
     title: "Dashboard",
     render(s) {
@@ -60,6 +61,22 @@
       <section class="section">
         <div class="section-head"><h2>Next steps from your evidence</h2><a class="btn btn-ghost btn-small" href="#tracker">Tracker</a></div>
         <ol class="rec-list">${recs.map((r) => `<li class="rec p${r.priority}"><div><strong>${esc(r.title)}</strong><p class="muted">${esc(r.evidence)}</p><p>${esc(r.action)}</p></div></li>`).join("")}</ol>
+      </section>
+
+      <section class="section two-col data-panel" id="your-data">
+        <div>
+          <h2>Back up and restore</h2>
+          <p class="small muted">A backup holds every workspace and your learning progress (not the private pack). Keep one after each work session.</p>
+          <div class="btn-row"><button type="button" class="btn" id="bk-download">Download backup</button><button type="button" class="btn btn-ghost" id="bk-copy">Copy backup</button></div>
+          <form id="bk-restore" class="stack" autocomplete="off">
+            <div class="row-fields"><label>Restore from file<input type="file" id="bk-file" accept=".json,application/json"></label>
+            <label>How<select id="bk-mode"><option value="merge">Add its workspaces to mine</option><option value="replace">Replace everything here</option></select></label></div>
+          </form>
+        </div>
+        <div>
+          <h2>Sync to your account</h2>
+          <div id="sync-panel" class="sync-panel" aria-live="polite"></div>
+        </div>
       </section>
 
       <section class="section" id="workspaces">
@@ -115,6 +132,41 @@
       </section>`;
     },
     mount(root) {
+      // backup / restore
+      root.querySelector("#bk-download").addEventListener("click", () => UI.download(`eris-solver-lab-backup-${new Date().toISOString().slice(0, 10)}.json`, UI.store.exportAll(), "application/json"));
+      root.querySelector("#bk-copy").addEventListener("click", async () => { try { await navigator.clipboard.writeText(UI.store.exportAll()); UI.toast("Backup copied to clipboard"); } catch (_) { UI.toast("Clipboard blocked here. Use Download backup."); } });
+      root.querySelector("#bk-file").addEventListener("change", async (e) => {
+        const f = e.target.files[0]; if (!f) return;
+        const mode = root.querySelector("#bk-mode").value;
+        const text = await UI.readFile(f);
+        const go = () => { try { const r = UI.store.importAll(text, mode); UI.toast(mode === "replace" ? "Backup restored" : `Added ${r.added} workspace${r.added === 1 ? "" : "s"} from the backup`); E.app.refreshChrome(); E.app.render(); } catch (err) { UI.toast("Restore failed: " + err.message); } };
+        if (mode === "replace") {
+          const box = document.createElement("div"); box.className = "confirm-inline";
+          box.innerHTML = `<p>Replace every workspace and your progress in this browser with the backup?</p><div class="btn-row"><button type="button" class="btn btn-small btn-primary" data-yes>Replace</button><button type="button" class="btn btn-small btn-ghost" data-no>Cancel</button></div>`;
+          root.querySelector("#bk-restore").appendChild(box);
+          box.querySelector("[data-yes]").addEventListener("click", go);
+          box.querySelector("[data-no]").addEventListener("click", () => { box.remove(); e.target.value = ""; });
+        } else go();
+      });
+      // sync panel
+      const panel = root.querySelector("#sync-panel");
+      const drawSync = () => {
+        const S = UI.sync; if (!S || !panel.isConnected) return;
+        const on = !!UI.store.global().syncOn;
+        const when = (t) => (t ? new Date(t).toLocaleString() : "never");
+        if (S.state === "checking") { panel.innerHTML = `<p class="muted">Checking…</p>`; return; }
+        if (S.state === "unavailable") { panel.innerHTML = `<p class="muted">${UI.esc(S.message)}</p><p class="small muted">Use backups to move data between browsers.</p>`; return; }
+        panel.innerHTML = `<label class="switch"><input type="checkbox" id="sync-on" ${on ? "checked" : ""}> <span>Keep my workspaces and progress in my account (private to me)</span></label>
+          ${S.remoteIsNewer() ? `<div class="sync-newer"><p><strong>Your account has a newer copy</strong> (saved ${UI.esc(when(S.remoteUpdated))}).</p><div class="btn-row"><button type="button" class="btn btn-small btn-primary" id="sync-pull">Load account copy</button><button type="button" class="btn btn-small btn-ghost" id="sync-push-over">Keep this browser's</button></div></div>` : ""}
+          <p class="small ${S.state === "error" ? "warn-text" : "muted"}">${S.state === "syncing" ? "Syncing…" : S.state === "error" ? UI.esc(S.message) : `Last synced: ${UI.esc(when(S.lastSync))}`}</p>
+          <div class="btn-row"><button type="button" class="btn btn-small" id="sync-push" ${on ? "" : "disabled"}>Save to account now</button></div>`;
+        panel.querySelector("#sync-on").addEventListener("change", (ev) => UI.sync.enable(ev.target.checked));
+        const push = panel.querySelector("#sync-push"); if (push) push.addEventListener("click", () => UI.sync.push().then((ok) => ok && UI.toast("Saved to your account")));
+        const pull = panel.querySelector("#sync-pull"); if (pull) pull.addEventListener("click", () => UI.sync.pull().then((ok) => { if (ok) { UI.toast("Loaded your account copy"); E.app.refreshChrome(); E.app.render(); } }));
+        const over = panel.querySelector("#sync-push-over"); if (over) over.addEventListener("click", () => UI.sync.push().then((ok) => ok && UI.toast("Account copy replaced with this browser's")));
+      };
+      if (UI.sync) { if (dashUnsub) dashUnsub(); dashUnsub = UI.sync.onChange(drawSync); UI.sync.init().then(drawSync); drawSync(); }
+
       root.querySelector("#ws-new").addEventListener("submit", (e) => {
         e.preventDefault();
         const name = root.querySelector("#ws-name").value;
@@ -276,7 +328,7 @@
         const b = e.target.closest("[data-tag]"); if (!b) return;
         root.querySelectorAll("#tech-tags .chip").forEach((c) => c.classList.toggle("on", c === b));
         const t = b.dataset.tag;
-        const map = { rmse: ["rmse", "rmsle", "mae"], f1: ["f1", "qwk", "accuracy"], ranking: ["ranking", "recsys", "contrastive"], cv: ["cv", "audio"], nlp: ["nlp", "finetune"] };
+        const map = { rmse: ["rmse", "rmsle", "mae", "maelog"], f1: ["f1", "qwk", "accuracy"], ranking: ["ranking", "recsys", "contrastive"], cv: ["cv", "audio"], nlp: ["nlp", "finetune"] };
         const want = map[t] || [t];
         root.querySelectorAll(".tech").forEach((el) => { const tags = el.dataset.tags.split(" "); el.hidden = !(t === "all" || tags.includes("all") && t !== "banned" || want.some((w) => tags.includes(w))); });
       });
@@ -392,16 +444,18 @@
   V.library = {
     title: "Strategy library",
     render() {
-      const kinds = [["all", "All"], ["lesson", "Your lessons"], ["strategy", "Strategies"], ["pitfall", "Pitfalls"]];
-      return `${pageHead("Improve", "Reusable ML strategy library", "Organised by task type. Lessons come from your high_score.py: the code does what they describe, but no score came with the file, so their effect is unmeasured.")}
+      const kinds = [["all", "All"], ["lesson", "Your lessons"], ["pack", "From your corpus"], ["strategy", "Strategies"], ["pitfall", "Pitfalls"]];
+      const pack = UI.pack();
+      const packItems = pack ? pack.lessons.filter((l) => !/^X-/.test(l.id)).map((l) => ({ task: l.task === "signal" ? "signal" : l.task, kind: "lesson", pack: true, id: l.id, prov: l.prov, title: `${l.id} · ${l.title}`, body: l.body, validate: l.validate, cite: "your corpus" })) : [];
+      return `${pageHead("Improve", "Reusable ML strategy library", pack ? `Organised by task type, including ${packItems.length} lessons from your private corpus (tagged measured or seen in top solutions).` : "Organised by task type. Lessons come from your high_score.py: the code does what they describe, but no score came with the file, so their effect is unmeasured. Load your private pack (Case studies) to add your corpus lessons.")}
       <div class="toolbar">
         <label class="field-inline"><span class="sr-only">Search library</span><input id="lib-q" type="search" placeholder="Search strategies…" autocomplete="off"></label>
         <label class="field-inline">Task <select id="lib-task">${E.TASK_TYPES.map((t) => `<option value="${t.id}">${esc(t.name)}</option>`).join("")}</select></label>
         <div class="chips" id="lib-kind">${kinds.map(([k, l]) => `<button type="button" class="chip${k === "all" ? " on" : ""}" data-kind="${k}">${esc(l)}</button>`).join("")}</div>
       </div>
       <p class="muted small" id="lib-count"></p>
-      <div class="lib-grid">${E.LIBRARY.map((l, i) => `<article class="lib kind-${l.kind}" id="lib-${i}" data-task="${l.task}" data-kind="${l.kind}" data-text="${esc((l.title + " " + l.body + " " + l.validate).toLowerCase())}">
-        <div class="lib-top"><span class="lib-kind">${esc({ lesson: "Lesson", strategy: "Strategy", pitfall: "Pitfall" }[l.kind])}</span><span class="lib-task">${esc((E.TASK_TYPES.find((t) => t.id === l.task) || {}).name)}</span></div>
+      <div class="lib-grid">${[...packItems, ...E.LIBRARY].map((l, i) => `<article class="lib kind-${l.kind}${l.pack ? " from-pack" : ""}" id="${l.pack ? "lib-pack-" + esc(l.id) : "lib-" + (i - packItems.length)}" data-task="${l.task}" data-kind="${l.kind}" data-pack="${l.pack ? 1 : 0}" data-text="${esc((l.title + " " + l.body + " " + l.validate).toLowerCase())}">
+        <div class="lib-top"><span class="lib-kind">${esc(l.pack ? "Your corpus" : { lesson: "Lesson", strategy: "Strategy", pitfall: "Pitfall" }[l.kind])}</span><span class="lib-task">${esc((E.TASK_TYPES.find((t) => t.id === l.task) || {}).name)}</span></div>
         <h3>${esc(l.title)}</h3><p>${esc(l.body)}</p>
         <p class="lib-validate"><strong>Validate:</strong> ${esc(l.validate)}</p>
         <div class="lib-foot">${UI.prov(l.prov, l.cite)}</div></article>`).join("")}</div>`;
@@ -413,7 +467,8 @@
         const task = root.querySelector("#lib-task").value;
         let n = 0;
         root.querySelectorAll(".lib").forEach((el) => {
-          const show = (task === "general" || el.dataset.task === task || el.dataset.task === "general") && (kind === "all" || el.dataset.kind === kind) && (!q || el.dataset.text.includes(q));
+          const kindOk = kind === "all" || (kind === "pack" ? el.dataset.pack === "1" : el.dataset.kind === kind);
+          const show = (task === "general" || el.dataset.task === task || el.dataset.task === "general") && kindOk && (!q || el.dataset.text.includes(q));
           el.hidden = !show; if (show) n++;
         });
         root.querySelector("#lib-count").textContent = `${n} entr${n === 1 ? "y" : "ies"}${task !== "general" ? " (including entries for all tasks)" : ""}`;

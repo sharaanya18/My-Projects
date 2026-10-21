@@ -57,11 +57,20 @@ Must contain exactly 48,210 rows.`;
         // the fictional example is never saved as "your" analysis
         if (text !== EXAMPLE_DESC) UI.store.update((s) => { s.analysis = a; s.analyzerText = text; });
         out.innerHTML = renderAnalysis(a);
+        out.querySelectorAll("[data-rubric]").forEach((cb) => cb.addEventListener("change", () => {
+          UI.store.update((s) => { s.rubricChecks = Object.assign({}, s.rubricChecks, { [cb.dataset.rubric]: cb.checked }); });
+          const h = cb.closest(".rubric-list").previousElementSibling.previousElementSibling;
+          const req = a.rubric.filter((r) => r.level === "required"), d = UI.store.load().rubricChecks || {};
+          if (h) h.querySelector("span").textContent = `${req.filter((r) => d[r.text]).length}/${req.length} required ticked`;
+        }));
         out.querySelector("#an-to-prompt").addEventListener("click", () => {
           UI.store.update((s) => {
             s.promptCtx = Object.assign({}, s.promptCtx, {
               challenge: a.title || s.promptCtx.challenge, category: a.category, task: a.task,
               metric: a.metric ? a.metric.name : "", direction: a.metric ? a.metric.dir : "max", budgetMin: a.budgetMin,
+              metricId: a.metric ? a.metric.id : "", cpuOnly: a.restrict.cpuOnly, cores: a.hardware.cores || null,
+              rubric: a.rubric.map((r) => ({ level: r.level, category: r.category, text: r.text })), grader: a.grader.map((g) => g.text), prep: a.prep.map((p) => p.text),
+              reference: a.reference ? String(a.reference.value) : "",
               constraints: [...a.restrictions.map((r) => r.text), a.runtimeLimit ? `Challenge runtime limit ${a.runtimeLimit.minutes} min` : ""].filter(Boolean).join("; "),
             });
             if (a.title) s.settings.challenge = a.title;
@@ -100,6 +109,16 @@ Must contain exactly 48,210 rows.`;
       ${a.rows ? `<p>Required rows: <strong class="num">${a.rows.toLocaleString()}</strong></p>` : ""}
       ${a.runtimeLimit ? `<p>Challenge runtime limit: <strong>${a.runtimeLimit.minutes} min</strong> ${ev(a.runtimeLimit.evidence)}. This overrides the 1.5 h default. ${UI.cite("S2 §5.4")} Plan for about ${a.budgetMin} min.</p>` : ""}
 
+      ${a.grader.length ? `<h3>Grader contract ${UI.prov("page")}</h3><ul class="grader-list">${a.grader.map((g) => `<li>${esc(g.text)} ${g.prov ? UI.prov(g.prov) : ""} ${ev(g.evidence)}</li>`).join("")}</ul>` : ""}
+      ${a.reference ? `<p>Reference solution score: <strong class="num">${a.reference.value}</strong> ${UI.prov("page")} ${ev(a.reference.evidence)}<br><span class="small muted">A test-set number. Re-run that recipe on your folds to see how your CV maps onto it.</span></p>` : ""}
+      ${a.aiBaseline ? `<p>Baseline to beat: <strong class="num">${a.aiBaseline.value}</strong> ${ev(a.aiBaseline.evidence)} <span class="small muted">Relayed baselines have been wrong before: reproduce it.</span></p>` : ""}
+      <p class="small">Hardware: <strong>${a.hardware.kind === "cpu" ? `CPU only${a.hardware.cores ? `, ${a.hardware.cores} cores` : ""}${a.hardware.ramGb ? `, ${a.hardware.ramGb} GB RAM` : ""}` : esc(a.hardware.name)}</strong> ${ev(a.hardware.evidence)}</p>
+
+      ${a.rubric.length ? rubricHTML(a) : ""}
+      ${a.prep.length ? `<h3>Data preparation checklist</h3><ul class="prep-list">${a.prep.map((p) => `<li>${esc(p.text)} ${ev(p.evidence)}</li>`).join("")}</ul>` : ""}
+      ${a.prepare && a.prepare.filters.length ? `<p class="small">The prepare script filters the raw data: ${a.prepare.filters.map((f) => `<code>${esc(f)}</code>`).join(", ")}. Train and test both come from that subset.</p>` : ""}
+      ${a.notUse.length ? `<h3>What the text says not to use</h3><ul>${a.notUse.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}
+
       ${a.restrictions.length ? `<h3>Challenge-specific restrictions</h3><ul>${a.restrictions.map((r) => `<li>${esc(r.text)} ${ev(r.evidence)}</li>`).join("")}</ul>` : ""}
       ${a.boilerplate.length ? `<h3>Boilerplate to ignore</h3><ul class="boiler">${a.boilerplate.map((b) => `<li>${ev(b.evidence)}<p>${esc(b.note)}</p></li>`).join("")}</ul>` : ""}
 
@@ -113,8 +132,21 @@ Must contain exactly 48,210 rows.`;
       ${a.risks.length ? `<h3>Risks</h3><ul class="risk-list">${a.risks.map((r) => `<li>${esc(r.text)} ${UI.cite(r.cite)}</li>`).join("")}</ul>` : ""}
       ${a.questions.length ? `<h3>Ask a reviewer before building on</h3><ul>${a.questions.map((q) => `<li>${esc(q)}</li>`).join("")}</ul>` : ""}
 
+      ${(() => { const pk = UI.pack(); if (!pk) return ""; const rel = pk.cases.filter((c) => c.category === a.category || c.task === a.task || (a.metric && c.metric === a.metric.id)).slice(0, 4);
+        return rel.length ? `<h3>From your past challenges</h3><ul class="rel-cases">${rel.map((c) => `<li><a href="#cases" data-anchor="case-${esc(c.slug)}"><strong>${esc(c.title)}</strong></a> <span class="small muted">${esc(c.keyLesson)}</span></li>`).join("")}</ul>` : ""; })()}
       <h3>Relevant library entries</h3>
       <ul class="lib-mini">${a.library.map((l) => `<li><a href="#library">${esc(l.title)}</a> <span class="small muted">${esc(l.kind)}</span></li>`).join("")}</ul>`;
+  }
+
+  // the rubric as a checklist; ticks are kept per workspace, keyed by the criterion text
+  function rubricHTML(a) {
+    const done = UI.store.load().rubricChecks || {};
+    const req = a.rubric.filter((r) => r.level === "required");
+    const met = req.filter((r) => done[r.text]).length;
+    return `<h3>Rubric <span class="small muted">${met}/${req.length} required ticked</span></h3>
+      <p class="small muted">Tick a criterion once the code visibly meets it. The Final review lists the unticked ones. ${UI.prov("page")}</p>
+      <ul class="rubric-list">${a.rubric.map((r) => `<li class="rubric-${esc(r.level)}"><label><input type="checkbox" data-rubric="${esc(r.text)}" ${done[r.text] ? "checked" : ""}>
+        <span class="rubric-level">${esc(r.level)}</span>${r.category ? `<span class="rubric-cat">${esc(r.category)}</span>` : ""}<span class="rubric-text">${esc(r.text)}</span></label>${r.detail ? `<p class="small muted">${esc(r.detail)}</p>` : ""}</li>`).join("")}</ul>`;
   }
 
   function analysisMarkdown(a) {
@@ -124,6 +156,9 @@ Must contain exactly 48,210 rows.`;
       "## Restrictions", ...(a.restrictions.length ? a.restrictions.map((r) => `- ${r.text}`) : ["- none detected"]),
       "## Boilerplate to ignore", ...(a.boilerplate.length ? a.boilerplate.map((b) => `- "${b.evidence}": ${b.note}`) : ["- none"]),
       "## Rules", ...a.constraints.map((r) => `- [${r.sev}] ${r.title} (${r.cite})`),
+      ...(a.rubric.length ? ["## Rubric", ...a.rubric.map((r) => `- [${r.level.toUpperCase()}]${r.category ? ` (${r.category})` : ""} ${r.text}`)] : []),
+      ...(a.grader.length ? ["## Grader contract", ...a.grader.map((g) => `- ${g.text}`)] : []),
+      ...(a.prep.length ? ["## Data preparation", ...a.prep.map((p) => `- ${p.text}`)] : []),
       "## Opportunities (hypotheses)", ...a.opportunities.map((o) => `- ${o}`)].join("\n");
   }
 
@@ -131,7 +166,7 @@ Must contain exactly 48,210 rows.`;
   V.prompts = {
     title: "Claude Code prompt generator",
     render(s) {
-      const c = Object.assign({ challenge: "", category: "general", task: "", metric: "", direction: "max", publicDir: "./dataset/public", solutionPath: "solution.py", budgetMin: 75, bestCv: "", constraints: "", focus: "", failureLog: "", template: "recon" }, s.promptCtx);
+      const c = Object.assign({ challenge: "", category: "general", task: "", metric: "", direction: "max", publicDir: "./dataset/public", solutionPath: "solution.py", budgetMin: 50, bestCv: "", constraints: "", focus: "", failureLog: "", template: "recon" }, s.promptCtx);
       return `${ph("Build with Claude", "Claude Code prompt generator", "Every prompt carries the platform contract, the evidence standard and the prohibited shortcuts, so Claude inspects your files before acting, labels what it verified, and won't take banned shortcuts.")}
       <div class="tool-split prompt-split">
         <form id="pg-form" class="stack tool-input" autocomplete="off">
@@ -164,19 +199,32 @@ Must contain exactly 48,210 rows.`;
       const form = root.querySelector("#pg-form");
       const out = root.querySelector("#pg-out");
       const fields = ["challenge", "category", "task", "metric", "direction", "publicDir", "solutionPath", "budgetMin", "bestCv", "constraints", "focus", "failureLog"];
+      // evidence attached by the analyzer; it rides along until the metric is changed by hand or detached
+      const ATTACHED = ["metricId", "cpuOnly", "cores", "rubric", "grader", "prep", "reference", "relatedCase"];
       const update = () => {
+        const prev = UI.store.load().promptCtx || {};
         const ctx = {};
+        ATTACHED.forEach((k) => { if (prev[k] !== undefined && prev[k] !== null && prev[k] !== "") ctx[k] = prev[k]; });
         fields.forEach((f) => { ctx[f] = root.querySelector("#pg-" + f).value; });
         ctx.template = form.querySelector("input[name=template]:checked").value;
+        if (ctx.metricId && prev.metric !== undefined && ctx.metric !== prev.metric) delete ctx.metricId;
         ctx.categoryName = (CATEGORY_OPTS.find(([k]) => k === ctx.category) || [])[1];
         ctx.taskName = (E.TASK_TYPES.find((t) => t.id === ctx.task) || {}).name;
         root.querySelector(".pg-focus").hidden = ctx.template !== "experiment";
         root.querySelector(".pg-fail").hidden = ctx.template !== "debug";
         UI.store.update((s) => { s.promptCtx = ctx; });
         const text = E.buildPrompt(ctx.template, ctx);
-        out.innerHTML = `<div class="section-head"><h2>${esc(E.PROMPTS[ctx.template].name)}</h2><span class="muted small num">${text.length.toLocaleString()} chars</span></div>${UI.codeBlock(text, "prompt", { download: `prompt-${ctx.template}.md`, tall: true })}
+        const att = [ctx.rubric && ctx.rubric.length ? `rubric (${ctx.rubric.length})` : "", ctx.grader && ctx.grader.length ? `grader checks (${ctx.grader.length})` : "", ctx.prep && ctx.prep.length ? `data quirks (${ctx.prep.length})` : "", ctx.metricId ? "metric decode notes" : "", ctx.reference ? "reference score" : ""].filter(Boolean);
+        out.innerHTML = `<div class="section-head"><h2>${esc(E.PROMPTS[ctx.template].name)}</h2><span class="muted small num">${text.length.toLocaleString()} chars</span></div>
+          ${att.length ? `<p class="attached small">From the analyzer: ${esc(att.join(", "))} <button type="button" class="btn btn-ghost btn-small" id="pg-detach">Detach</button></p>` : ""}
+          ${UI.codeBlock(text, "prompt", { download: `prompt-${ctx.template}.md`, tall: true })}
           <p class="small muted">Paste this into Claude Code from the challenge folder. Add the CLAUDE.md template there too, so the rules persist across sessions.</p>`;
       };
+      out.addEventListener("click", (e) => {
+        if (!e.target.closest("#pg-detach")) return;
+        UI.store.update((s) => { ATTACHED.forEach((k) => { delete s.promptCtx[k]; }); });
+        update();
+      });
       form.addEventListener("input", update);
       // Text fields already update on "input". Re-rendering again on their blur
       // ("change") would replace the Copy button mid-click and swallow the click.
@@ -305,7 +353,7 @@ pd.DataFrame({"id": test.id, "prediction": pred > thr}).to_csv("working/submissi
         <label>Challenge<input id="ts-challenge" value="${esc(set.challenge || "")}" placeholder="name"></label>
         <label>Metric<input id="ts-metric" value="${esc(set.metric || "")}" placeholder="e.g. AUC"></label>
         <label>Direction<select id="ts-direction"><option value="max" ${set.direction !== "min" ? "selected" : ""}>Higher is better</option><option value="min" ${set.direction === "min" ? "selected" : ""}>Lower is better</option></select></label>
-        <label>Runtime budget (min)<input id="ts-budget" type="number" value="${esc(set.budgetMin || 75)}"></label>
+        <label>Runtime budget (min)<input id="ts-budget" type="number" value="${esc(set.budgetMin || 50)}"></label>
       </form>
       ${hasDemo ? `<p class="example-flag">Demo rows (names start with "demo-") are invented to show how the tracker works. The dashboard and the final review ignore them. <button type="button" class="btn btn-small" id="tr-clear-demo">Remove demo rows</button></p>` : ""}
       <div id="tr-main"></div>
@@ -444,7 +492,7 @@ pd.DataFrame({"id": test.id, "prediction": pred > thr}).to_csv("working/submissi
           s.settings.challenge = root.querySelector("#ts-challenge").value;
           s.settings.metric = root.querySelector("#ts-metric").value;
           s.settings.direction = root.querySelector("#ts-direction").value;
-          s.settings.budgetMin = Number(root.querySelector("#ts-budget").value) || 75;
+          s.settings.budgetMin = Number(root.querySelector("#ts-budget").value) || 50;
         });
         draw();
       });

@@ -97,6 +97,19 @@
       ],
     },
     {
+      id: "anatomy", title: "Read a challenge like its author", mins: 5, demo: "logmae", tool: "analyzer",
+      body: [
+        "A challenge is built from parts: a dataset description, a prepare script that cuts the raw data into train and a hidden test, a problem description with the metric, a grading script, a config (score direction and range), a rubric of REQUIRED and RECOMMENDED criteria, and a reference solution with its score. The platform's worked example, Notebook Upvote Prediction, shows all of them (see Case studies).",
+        "Each part answers a question. The prepare script says how to validate: the example splits rows at random, so the same authors sit in train and test. The grading script says what turns a file into an error: an extra column, a wrong row count, one negative value. The rubric says what a reviewer expects to see in your code.",
+        "The metric says what to predict. The example scores MAE on log(y+1). An absolute error is smallest at the median, so the best single guess is the median of log(y+1), not the mean. Drag the slider over a toy set of upvote counts and compare the three marked guesses.",
+      ],
+      quiz: [
+        { q: "The prepare script runs train_test_split(data, test_size=0.1, random_state=0) on rows. Which CV mirrors the hidden test?", options: ["GroupKFold by author", "Shuffled KFold on rows", "A time-based split"], a: 1, why: "The test was cut at random by row, so shuffled KFold copies it. Authors recur in both sets, so out-of-fold author statistics are fair signal here." },
+        { q: "The metric is MAE on log(y+1). Which training target and loss fit it best?", options: ["Raw y with MSE", "log1p(y) with MSE", "log1p(y) with an L1 (median) loss"], a: 2, why: "L1 is minimised by the median, and the metric is an L1 error in log space. MSE on log1p(y) aims at the mean of the log, which sits above the median for skewed counts." },
+        { q: "A REQUIRED rubric item says to drop fork_count, but test.csv has no such column. What do you do?", options: ["Ignore it: nothing to drop", "Drop it if present, with a comment, and list it in the requirements docstring"], a: 1, why: "Reviewers read the rubric against your code. A defensive, commented drop shows the criterion is met even when the column is already gone." },
+      ],
+    },
+    {
       id: "claude", title: "Working with Claude Code", mins: 4, demo: null, tool: "prompts",
       body: [
         "Claude Code can read your files, run experiments and fix bugs. Your prompts decide whether it works from evidence or guesses.",
@@ -145,6 +158,10 @@
     { s: "You post your approach publicly in the #general Discord channel.", a: "allowed", why: "Public sharing is allowed and encouraged.", cite: "§5.1.4" },
     { s: "The description says 'no internet access', so you skip downloading pretrained weights.", a: "grey", why: "That line is usually leftover boilerplate (§5.4). Downloading weights is allowed, so skipping them is legal but may cost score. Ask a reviewer if unsure.", cite: "§5.4" },
     { s: "You seed a DataLoader with num_workers=4, worker_init_fn and a seeded generator.", a: "allowed", why: "A multi-worker DataLoader with a fixed worker count and seeding is fine.", cite: "§3.3, §3.4" },
+    { s: "Rows were split at random, so you add each author's mean log-upvotes, computed out-of-fold on train, as a feature.", a: "allowed", why: "Statistics of training labels fitted inside the folds are ordinary feature engineering. Computing them with the validation rows' own labels would only inflate your CV.", cite: "§5.1" },
+    { s: "You look up each author's current Kaggle follower count online and add it as a feature.", a: "banned", why: "That is external data. Only the challenge files may feed the model.", cite: "§5.2.3" },
+    { s: "You fit a TF-IDF vocabulary on the training titles only, then transform the test titles with it.", a: "allowed", why: "Fitting on train and transforming test one row at a time is ordinary inference.", cite: "§5.2.5" },
+    { s: "After expm1, a few predictions fall slightly below zero, so you clip them to 0 before writing.", a: "allowed", why: "Per-row post-processing to the valid range is fine, and the grader would raise on negative values anyway.", cite: "§5.1" },
   ];
 
   E.GLOSSARY = [
@@ -166,6 +183,10 @@
     ["TTA", "Test-time augmentation: averaging predictions over transformed copies of one input."],
     ["Pseudo-labelling", "Training on your own predictions for unlabeled test data. Banned on Eris."],
     ["HPO", "Hyperparameter optimisation, e.g. Optuna with a fixed number of seeded trials."],
+    ["Rubric", "The challenge's list of REQUIRED and RECOMMENDED criteria a reviewer checks in your code, e.g. 'log-transform the target'."],
+    ["Prepare script", "The script that cuts the raw data into train.csv, test.csv and the hidden answers. It tells you how the test was built."],
+    ["Reference solution", "The challenge's example script and its score: a floor to beat and a recipe to re-run on your own folds."],
+    ["log1p / expm1", "log(1 + y) and its inverse exp(x) − 1. Used for skewed, non-negative targets such as counts."],
   ];
 
   E.LEVELS = [

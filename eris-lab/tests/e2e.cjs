@@ -8,7 +8,7 @@ const assert = require("node:assert/strict");
 
 const url = "file://" + path.join(__dirname, "..", "index.html");
 const shotDir = process.argv.includes("--shots") ? process.argv[process.argv.indexOf("--shots") + 1] : null;
-const ROUTES = ["dashboard", "rules", "learn", "game", "analyzer", "workflow", "leaderboard", "generalization", "oof", "library", "prompts", "templates", "auditor", "tracker", "checker", "review"];
+const ROUTES = ["dashboard", "rules", "learn", "game", "cases", "analyzer", "workflow", "leaderboard", "generalization", "oof", "library", "prompts", "templates", "auditor", "tracker", "checker", "review"];
 
 (async () => {
   const browser = await chromium.launch();
@@ -158,9 +158,9 @@ const ROUTES = ["dashboard", "rules", "learn", "game", "analyzer", "workflow", "
     await page.goto(url + "#review");
     await page.waitForSelector("#rv-out h2");
     const before = await page.textContent("#rv-out");
-    assert.match(before, /15 checklist item\(s\) still open/);
+    assert.match(before, /17 checklist item\(s\) still open/);
     await page.check("input[data-fc=fc-argv]");
-    await page.waitForFunction(() => document.querySelector("#rv-out").textContent.includes("14 checklist item(s) still open"));
+    await page.waitForFunction(() => document.querySelector("#rv-out").textContent.includes("16 checklist item(s) still open"));
     assert.match(await page.textContent("#rv-out"), /violations\.py/);
   });
   await step("search: Ctrl+K, query, navigate to a rule anchor", async () => {
@@ -254,6 +254,83 @@ const ROUTES = ["dashboard", "rules", "learn", "game", "analyzer", "workflow", "
     await page.waitForSelector(".exp-table");
     assert.ok(await page.evaluate(() => Eris.ui.store.load().experiments.length) > 0);
     assert.ok(await page.evaluate(() => Eris.ui.store.global().badges.organised));
+  });
+  await step("worked example: practise workspace analyses the rubric, grader and metric", async () => {
+    await page.goto(url + "#cases");
+    await page.waitForSelector("#example-notebook-upvotes");
+    await page.click("[data-practise=notebook-upvotes]");
+    await page.waitForFunction(() => location.hash === "#analyzer" && document.querySelector("#an-out .rubric-list"));
+    const t = await page.textContent("#an-out");
+    assert.match(t, /MAE in log space/);
+    assert.match(t, /random \(prepare script\)/);
+    assert.match(t, /Grader contract/);
+    assert.match(t, /0\/4 required ticked/);
+    assert.match(t, /1\.061/);
+    assert.equal(await page.locator("#an-out .rubric-list li").count(), 11);
+    assert.equal(await page.evaluate(() => Eris.ui.store.active().name), "Notebook Upvote Prediction (example)");
+    assert.equal(await page.evaluate(() => Eris.ui.store.load().experiments[0].lb), "1.061");
+  });
+  await step("worked example: rubric ticks persist and reach the final review", async () => {
+    await page.locator("#an-out .rubric-required input").first().check();
+    await page.waitForFunction(() => document.querySelector("#an-out").textContent.includes("1/4 required ticked"));
+    await page.reload();
+    await page.waitForSelector("#an-out .rubric-list");
+    assert.equal(await page.locator("#an-out .rubric-required input").first().isChecked(), true);
+    await page.goto(url + "#review");
+    await page.waitForFunction(() => document.querySelector("main").textContent.includes("Rubric coverage"));
+    assert.match(await page.textContent("main"), /3 REQUIRED rubric criterion\/criteria not yet ticked/);
+  });
+  await step("worked example: analyzer evidence rides into every prompt, and detaches", async () => {
+    await page.goto(url + "#analyzer");
+    await page.waitForSelector("#an-to-prompt");
+    await page.click("#an-to-prompt");
+    await page.waitForSelector("#pg-out .attached");
+    assert.match(await page.textContent("#pg-out .attached"), /rubric \(11\)/);
+    let prompt = await page.textContent("#pg-out pre");
+    assert.match(prompt, /## Challenge rubric/);
+    assert.match(prompt, /conditional median of log1p/);
+    await page.check("input[name=template][value=rubric]");
+    await page.waitForFunction(() => document.querySelector("#pg-out h2").textContent.includes("Rubric coverage"));
+    prompt = await page.textContent("#pg-out pre");
+    assert.match(prompt, /REQUIRED \(Modeling\): No significant overfitting/);
+    await page.click("#pg-detach");
+    await page.waitForFunction(() => !document.querySelector("#pg-out .attached"));
+    assert.doesNotMatch(await page.textContent("#pg-out pre"), /## Challenge rubric/);
+  });
+  await step("lesson demo: log-space MAE is lowest at the median", async () => {
+    await page.goto(url + "#learn");
+    await page.evaluate(() => { Eris.openLesson("anatomy"); Eris.app.render(); });
+    await page.waitForSelector("[data-lm=median]");
+    await page.click("[data-lm=mean]");
+    assert.match(await page.textContent("#lm-msg"), /worse than the median guess/);
+    await page.click("[data-lm=median]");
+    assert.match(await page.textContent("#lm-msg"), /lowest possible/);
+  });
+  await step("backup: download content round-trips through a merge restore", async () => {
+    await page.goto(url + "#dashboard");
+    const before = await page.evaluate(() => Eris.ui.store.list().length);
+    const file = path.join(require("node:os").tmpdir(), "eris-backup-e2e.json");
+    fs.writeFileSync(file, await page.evaluate(() => Eris.ui.store.exportAll()));
+    await page.selectOption("#bk-mode", "merge");
+    await page.setInputFiles("#bk-file", file);
+    await page.waitForFunction((n) => Eris.ui.store.list().length === 2 * n, before);
+    assert.match(await page.textContent("#ws-select"), /\(restored\)/);
+    fs.unlinkSync(file);
+  });
+  await step("sync: explains it is unavailable outside the published page", async () => {
+    await page.waitForFunction(() => /unavailable|account|backups/i.test(document.querySelector("#sync-panel").textContent));
+  });
+  if (process.env.ERIS_PACK) await step("private pack: loads, opens a case workspace, and is removed", async () => {
+    await page.goto(url + "#cases");
+    await page.setInputFiles("#pack-file", process.env.ERIS_PACK);
+    await page.waitForSelector(".case-card[id^=case-]");
+    assert.equal(await page.locator(".case-card[id^=case-]").count(), 12);
+    await page.locator("[data-open-case]").first().click();
+    await page.waitForFunction(() => location.hash === "#tracker" && document.querySelector(".exp-table"));
+    await page.goto(url + "#cases");
+    await page.click("#pack-remove"); await page.click("#pack-remove");
+    await page.waitForSelector("#pack-file");
+    assert.equal(await page.evaluate(() => localStorage.getItem("eris-lab:pack")), null);
   });
   await step("workflow ticks persist across reload", async () => {
     await page.goto(url + "#workflow");

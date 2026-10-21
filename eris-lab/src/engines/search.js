@@ -19,6 +19,12 @@
     (E.LESSONS || []).forEach((l) => add("Lesson", l.title, l.body.join(" "), "learn", "lesson-" + l.id));
     (E.GLOSSARY || []).forEach(([t, d], i) => add("Glossary", t, d, "learn", "gloss-" + i));
     (E.SCENARIOS || []).forEach((s) => add("Rules game", s.s.length > 70 ? s.s.slice(0, 68) + "…" : s.s, `${s.why} ${s.a} ${s.cite}`, "game", ""));
+    (E.EXAMPLES || []).forEach((x) => add("Worked example", x.title, `${x.domain} ${x.summary} ${x.anatomy.map((a) => a.join(" ")).join(" ")} ${x.rubric.map((r) => r[2]).join(" ")} ${x.room.join(" ")}`, "cases", "example-" + x.slug));
+    const pack = E.ui && E.ui.pack ? E.ui.pack() : E.PACK;
+    if (pack) {
+      (pack.cases || []).forEach((c) => add("Case study", c.title, `${c.family} ${c.summary} ${c.keyLesson} ${(c.leadersDid || []).join(" ")} ${(c.ourGaps || []).join(" ")}`, "cases", "case-" + c.slug));
+      (pack.lessons || []).forEach((l) => add("Your lesson", `${l.id} · ${l.title}`, `${l.body} ${l.validate}`, /^X-/.test(l.id) ? "cases" : "library", "lib-pack-" + l.id));
+    }
     return items;
   }
 

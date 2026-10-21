@@ -132,6 +132,46 @@
       run();
     },
 
+    /* MAE in log space on a toy set of skewed counts: the median wins, the mean loses badly. */
+    logmae(el) {
+      const ys = [0, 0, 0, 0, 1, 1, 1, 1, 2, 3, 5, 9, 25, 80, 260];
+      const L = ys.map((y) => Math.log1p(y));
+      const loss = (s) => L.reduce((a, l) => a + Math.abs(l - s), 0) / L.length;
+      const mean = ys.reduce((a, y) => a + y, 0) / ys.length;
+      const sortedL = [...L].sort((a, b) => a - b);
+      const marks = [
+        ["median", "Median of log(y+1)", sortedL[(L.length - 1) / 2]],
+        ["gmean", "Mean of log(y+1)", L.reduce((a, l) => a + l, 0) / L.length],
+        ["mean", "Mean of y", Math.log1p(mean)],
+      ];
+      const SMAX = 5.8;
+      el.innerHTML = `<div class="demo-head"><strong>Try it:</strong> pick one guess for every notebook</div>
+        <p class="small">Toy upvote counts (made up, skewed like the example): <span class="num">${ys.join(", ")}</span></p>
+        <svg viewBox="0 0 600 190" class="demo-svg" role="img" aria-label="Log-space MAE for each constant guess, lowest at the median"><g id="lm-g"></g></svg>
+        <label class="demo-slider">Guess <input type="range" id="lm" min="0" max="${SMAX}" step="0.01" value="${marks[2][2].toFixed(2)}"><output id="lm-v" class="num"></output></label>
+        <div class="btn-row">${marks.map(([k, label]) => `<button type="button" class="btn btn-ghost btn-small" data-lm="${k}">${esc(label)}</button>`).join("")}</div>
+        <p id="lm-msg" class="cap-msg"></p>`;
+      const x = (s) => 40 + (s / SMAX) * 540;
+      const lo = loss(marks[0][2]), hi = Math.max(loss(0), loss(SMAX));
+      const y = (v) => 165 - ((v - lo * 0.8) / (hi - lo * 0.8)) * 145;
+      const path = Array.from({ length: 117 }, (_, i) => { const s = (i / 116) * SMAX; return `${i ? "L" : "M"}${x(s).toFixed(1)} ${y(loss(s)).toFixed(1)}`; }).join(" ");
+      const draw = () => {
+        const s = Number(el.querySelector("#lm").value);
+        el.querySelector("#lm-v").textContent = `${Math.expm1(s).toFixed(1)} upvotes`;
+        el.querySelector("#lm-g").innerHTML = `<line x1="40" x2="580" y1="165" y2="165" class="demo-axis"/><path d="${path}" class="curve-val"/>
+          ${marks.map(([k, label, v], i) => `<line x1="${x(v)}" x2="${x(v)}" y1="20" y2="165" class="lm-mark lm-${k}"/><text x="${x(v) + 4}" y="${30 + i * 18}" class="demo-tick lm-lab">${esc(label)}</text>`).join("")}
+          <circle cx="${x(s)}" cy="${y(loss(s))}" r="7" class="pt-val"/>
+          <text x="40" y="184" class="demo-tick">0 upvotes</text><text x="580" y="184" text-anchor="end" class="demo-tick">${Math.round(Math.expm1(SMAX))} upvotes (log scale)</text>`;
+        const m = loss(s), best = lo;
+        const msg = el.querySelector("#lm-msg");
+        msg.className = "cap-msg " + (m - best < 0.02 ? "cap-sweet" : m - best < 0.25 ? "cap-under" : "cap-over");
+        msg.textContent = `Guess ${Math.expm1(s).toFixed(1)} → log-space MAE ${m.toFixed(3)}${m - best < 0.02 ? ". The lowest possible: the median of log(y+1)." : `, ${(m - best).toFixed(3)} worse than the median guess (${best.toFixed(3)}).`}`;
+      };
+      el.querySelector("#lm").addEventListener("input", draw);
+      el.querySelector(".btn-row").addEventListener("click", (e) => { const b = e.target.closest("[data-lm]"); if (!b) return; el.querySelector("#lm").value = marks.find((mk) => mk[0] === b.dataset.lm)[2].toFixed(2); draw(); });
+      draw();
+    },
+
     checks(el) {
       el.innerHTML = `<div class="demo-head"><strong>The four checks</strong> (click each)</div><ol class="check-steps">${E.CHECKS.map((c) => `<li><button type="button" class="check-step" data-n="${c.n}"><span class="cs-n">${c.n}</span>${esc(c.name)}</button></li>`).join("")}</ol><div class="check-detail" id="cd"></div>`;
       const show = (n) => { const c = E.CHECKS[n - 1]; el.querySelectorAll(".check-step").forEach((b) => b.classList.toggle("on", Number(b.dataset.n) === n)); el.querySelector("#cd").innerHTML = `<p>${esc(c.what)}</p><p class="${n === 4 ? "bad-text" : "good-text"}"><b>${esc(c.credit)}</b></p>`; };
@@ -150,7 +190,7 @@
       if (currentLesson) return lessonHTML(E.LESSONS.find((l) => l.id === currentLesson), g);
       const next = E.LESSONS.find((l) => !g.lessons[l.id]);
       const lv = UI.level(g.xp);
-      return `${UI.pageHead("Learn", "Learn the craft", "Eight short lessons, each with a live demo and a three-question quiz. Every lesson ends at the tool you'll use for real.")}
+      return `${UI.pageHead("Learn", "Learn the craft", "Nine short lessons, each with a live demo and a three-question quiz. Every lesson ends at the tool you'll use for real.")}
         <section class="learn-hero">
           ${UI.speech(done === E.LESSONS.length ? "wink" : "happy", done === 0 ? "Hi, I'm <b>Pip</b>, the golden apple of Eris. Start with lesson 1. It takes four minutes." : done === E.LESSONS.length ? "You finished every lesson! Keep your edge with the <a href=\"#game\">rules game</a>." : `Nice progress! Next up: <b>${esc(next.title)}</b>.`)}
           <div class="learn-progress">
@@ -228,6 +268,9 @@
 
   /* ---------------- Allowed or banned? ---------------- */
   const ROUND = 12;
+  // the public scenarios plus any from the private pack (prefixed so award keys stay distinct)
+  const pool = () => [...E.SCENARIOS.map((s, i) => ({ ...s, key: String(i) })), ...((UI.pack() || {}).scenarios || []).map((s, i) => ({ ...s, key: "p" + i, pack: true }))];
+  let POOL = null;
   let game = null; // { order, i, score, streak, bestStreak, answers }
   const LABEL = { allowed: "Allowed", grey: "Grey area", banned: "Banned" };
 
@@ -239,7 +282,7 @@
         return `${UI.pageHead("Learn", "Allowed or banned?", "Rejections usually come from rules, not bad models. Judge real situations against the Eris rulebook. Each round is 12 random scenarios.")}
           <section class="game-intro">
             ${UI.speech("think", "I'll describe something a solver did. You decide: <b>Allowed</b>, <b>Grey area</b> (reviewer's call) or <b>Banned</b>. Every answer comes with the rule behind it.")}
-            <div class="game-stats"><div><span>Best round</span><b class="num">${g.game.best === null ? "–" : g.game.best + "/" + ROUND}</b></div><div><span>Rounds played</span><b class="num">${g.game.plays}</b></div><div><span>Scenarios</span><b class="num">${E.SCENARIOS.length}</b></div></div>
+            <div class="game-stats"><div><span>Best round</span><b class="num">${g.game.best === null ? "–" : g.game.best + "/" + ROUND}</b></div><div><span>Rounds played</span><b class="num">${g.game.plays}</b></div><div><span>Scenarios</span><b class="num">${pool().length}</b></div></div>
             <button type="button" class="btn btn-primary btn-big" id="gm-start">Start a round</button>
           </section>`;
       }
@@ -249,11 +292,11 @@
         return `${UI.pageHead("Learn", "Round complete", "")}
           <section class="game-end">
             ${UI.speech(pct === 1 ? "wink" : pct >= 0.8 ? "happy" : pct >= 0.5 ? "think" : "sad", `You scored <b class="num">${game.score}/${ROUND}</b>, with a best streak of ${game.bestStreak}. ${pct === 1 ? "Flawless!" : pct >= 0.8 ? "You know the rules well." : "Review the misses below. They're the ones that cost real submissions."}`)}
-            ${missed.length ? `<h2>Review</h2><ul class="review-list">${missed.map((a) => { const s = E.SCENARIOS[a.idx]; return `<li><p>${esc(s.s)}</p><p><span class="verdict-chip vc-${s.a}">${LABEL[s.a]}</span> ${esc(s.why)} ${UI.cite(s.cite)}</p><p class="small muted">You said: ${LABEL[a.pick]}</p></li>`; }).join("")}</ul>` : ""}
+            ${missed.length ? `<h2>Review</h2><ul class="review-list">${missed.map((a) => { const s = POOL[a.idx]; return `<li><p>${esc(s.s)}</p><p><span class="verdict-chip vc-${s.a}">${LABEL[s.a]}</span> ${esc(s.why)} ${UI.cite(s.cite)}</p><p class="small muted">You said: ${LABEL[a.pick]}</p></li>`; }).join("")}</ul>` : ""}
             <div class="btn-row"><button type="button" class="btn btn-primary" id="gm-start">Play again</button><a class="btn" href="#rules">Read the rules</a></div>
           </section>`;
       }
-      const s = E.SCENARIOS[game.order[game.i]];
+      const s = POOL[game.order[game.i]];
       const ans = game.answers[game.i];
       return `${UI.pageHead("Learn", "Allowed or banned?", "")}
         <div class="game-bar"><span>Scenario <b class="num">${game.i + 1}</b> of ${ROUND}</span><span>Score <b class="num">${game.score}</b></span><span class="streak${game.streak >= 3 ? " hot" : ""}">Streak <b class="num">${game.streak}</b></span></div>
@@ -267,7 +310,8 @@
     mount(root) {
       const start = root.querySelector("#gm-start");
       if (start) start.addEventListener("click", () => {
-        const idx = E.SCENARIOS.map((_, i) => i).sort(() => Math.random() - 0.5).slice(0, ROUND);
+        POOL = pool();
+        const idx = POOL.map((_, i) => i).sort(() => Math.random() - 0.5).slice(0, ROUND);
         game = { order: idx, i: 0, score: 0, streak: 0, bestStreak: 0, answers: [] };
         E.app.render();
       });
@@ -275,9 +319,9 @@
       if (btns) btns.addEventListener("click", (e) => {
         const b = e.target.closest("[data-v]"); if (!b || b.disabled) return;
         const idx = game.order[game.i];
-        const ok = E.SCENARIOS[idx].a === b.dataset.v;
+        const ok = POOL[idx].a === b.dataset.v;
         game.answers[game.i] = { idx, pick: b.dataset.v, ok };
-        if (ok) { game.score++; game.streak++; game.bestStreak = Math.max(game.bestStreak, game.streak); UI.award("game:" + idx, 5, "rule judged right"); }
+        if (ok) { game.score++; game.streak++; game.bestStreak = Math.max(game.bestStreak, game.streak); UI.award("game:" + POOL[idx].key, 5, "rule judged right"); }
         else game.streak = 0;
         E.app.render();
         const nb = document.getElementById("gm-next"); if (nb) nb.focus();

@@ -45,6 +45,13 @@
       role: "Your one previous solution. No scores, logs or audit notes came with it.",
       used: "Lessons in the strategy library and the auditor case study. Code patterns are verified; their effect on score is not.",
     },
+    {
+      id: "S6",
+      file: "CLAUDE.md (private solver repo)",
+      title: "Your solver playbook",
+      role: "Your own compiled rules, including screenshots of real pre-submission check failures and an error-type table.",
+      used: "Check names, the 512 KB source limit, real determinism failures, error fixes, CPU-only defaults, the 50-minute plan. Also used to calibrate the auditor, analyzer and log parser on ~110 real solutions, ~30 descriptions and real Kaggle logs.",
+    },
   ];
 
   E.MISSING_INPUTS = [
@@ -57,7 +64,9 @@
   E.KEY_FACTS = [
     { label: "Runtime command", value: "python3 solution.py <public_dir> <submission_out>", cite: "S3" },
     { label: "Expected max runtime", value: "1.5 h (+ up to 30 min grace, usually only 5–10 min)", cite: "S2 §4.4" },
-    { label: "Hardware", value: "NVIDIA A10G GPU", cite: "S2 §4.5" },
+    { label: "Hardware", value: "NVIDIA A10G GPU by default; many challenges state CPU-only (e.g. 10 cores, 62 GB)", cite: "S2 §4.5, S6" },
+    { label: "Plan for", value: "≤ 50 min total with ≥ 30% headroom", cite: "S6" },
+    { label: "Source file", value: "Plain readable UTF-8, under 512,000 bytes", cite: "S6" },
     { label: "Credits per challenge", value: "6, +1 every 4 h", cite: "S2 §4.6, S1" },
     { label: "Global credits", value: "~15–25 / day, each returns 24 h after use", cite: "S2 §4.6" },
     { label: "Final ranking", value: "Private LB, revealed at close", cite: "S2 §1.2" },
@@ -67,12 +76,18 @@
 
   E.CHECKS = [
     { n: 1, name: "CSV grading check", what: "Your uploaded submission.csv is run through grade.py. Wrong columns, missing ids or bad values fail here.", credit: "Refunded, 5-min cooldown" },
-    { n: 2, name: "Prompt compliance check", what: "An LLM reads your script against the challenge overview and its rules.", credit: "Refunded, 5-min cooldown" },
+    { n: 2, name: "Prompt compliance check", what: "An LLM reads your script against the challenge overview and its rules. Your notes show a 'Held-out Answer Ingestion' check runs at this stage too. A requirements-map docstring has fixed a 'Check Error' before.", credit: "Refunded, 5-min cooldown" },
     { n: 3, name: "Determinism check", what: "An LLM reviews the code (no rerun) for seeds, clock-dependent and machine-dependent logic.", credit: "Refunded, 5-min cooldown" },
     { n: 4, name: "Script run", what: "Full end-to-end run on the test environment. Any error (OOM, ValueError, missing package) fails it.", credit: "Credit consumed. A malformed output scores as an error and ranks below a 0." },
   ];
 
   E.CONFLICTS = [
+    {
+      topic: "Is the CSV score check free?",
+      a: "An older retrospective in your repo says each public-score probe costs a credit.",
+      b: "S2 §2/§4.6 and your current CLAUDE.md (S6): uploading the CSV alone is free and scores instantly. Only the scripted run costs a credit.",
+      resolution: "Treat the CSV-only upload as free. Run locally, upload the CSV, and spend a credit on the script only when CV and the free probe agree.",
+    },
     {
       topic: "Solution file and paths",
       a: "S1: notebook solution.ipynb that reads ./dataset/public/ and writes ./working/submission.csv.",
@@ -83,7 +98,7 @@
       topic: "Runtime budget",
       a: "S1: completes in approximately 1 hour.",
       b: "S2 §4.4: 1.5 h expected max, grace of up to 30 min (usually 5–10). A lower limit in a challenge's own rules is binding (§5.4).",
-      resolution: "Plan for 75 min or less on an A10G, leaving headroom for inference and writing the file. If the challenge states a lower limit, use it.",
+      resolution: "Plan for about 50 min (your solver notes, S6), which keeps at least 30% headroom under 1.5 h for inference, writing the file and slower hardware. If the challenge states a lower limit, keep 30% under that.",
     },
     {
       topic: "Library list completeness",
@@ -161,6 +176,11 @@
     { id: "SUB-3", group: "Submission and review", sev: "info", cite: "S2 §2", title: "Your uploaded CSV is a self-check", text: "It costs no credits and doesn't count for the leaderboard. Only the scripted run's output counts." },
     { id: "SUB-4", group: "Submission and review", sev: "info", cite: "S2 §5.5–5.6", title: "Relative review after close", text: "Neighbouring ranks are compared pairwise on appropriateness. A rank with a much worse appropriateness rating than the one below it is removed. Credits are never refunded." },
     { id: "SUB-5", group: "Submission and review", sev: "info", cite: "S1", title: "Show progression", text: "3–5 complete submissions, from a solid baseline to your best model. Comment your reasoning at each step." },
+    { id: "SRC-1", group: "Submission and review", sev: "blocker", cite: "S6", title: "Readable source under 512 KB", text: "No base64/zlib blobs, embedded weights, exec/eval or generated code. Opaque or oversized sources fail with 'source cannot be inspected'." },
+    { id: "SUB-6", group: "Submission and review", sev: "high", cite: "S6", title: "Write the submission once, at the end", text: "Placeholder or fallback writes (a dummy file first 'to be safe', or a write inside try/except) are what the checks flag, even though several top files had them." },
+    { id: "SUB-7", group: "Submission and review", sev: "high", cite: "S6", title: "Empty strings become NaN", text: "For text or JSON predictions, empty strings reload as NaN and count as missing. Ensure non-empty values and verify with keep_default_na=False." },
+    { id: "SUB-8", group: "Submission and review", sev: "info", cite: "S6", title: "Requirements map in the docstring", text: "A short docstring that quotes each challenge rule next to the code satisfying it makes Prompt Compliance pass legibly. In your records it fixed a 'Check Error'." },
+    { id: "CH-3", group: "Challenge-specific rules", sev: "high", cite: "S6", title: "Read Compute / Runtime / 'What not to use' before any default", text: "Many tasks are CPU-only, ban downloaded weights, forbid TTA or cross-row pooling, or set shorter limits. The stricter reading wins: hardcode device='cpu' when the text says CPU." },
     { id: "LB-1", group: "Submission and review", sev: "info", cite: "S2 §1.2", title: "The private LB decides prizes", text: "Treat the public LB as a soft signal. Over-optimizing for it can drop you sharply at the reveal." },
   ];
 
@@ -168,7 +188,8 @@
   E.ALLOWED_PACKAGES = [
     "jax","jax-cuda12-pjrt","jax-cuda12-plugin","jaxlib","keras","keras-hub","keras-nlp","tensorflow","tensorflow-datasets","tensorflow-hub","tensorflow-metadata","tensorflow-probability","tensorflow-text","tensorflow_decision_forests","tf_keras","torch","torchao","torchaudio","torchdata","torchsummary","torchtune","torchvision","Boruta","Cartopy","ImageHash","Janome","PyArabic","PyUpSet","Pympler","Rtree","shapely","SimpleITK","TPOT","Wand","bayesian-optimization","boto3","catboost","category-encoders","cesium","comm","cytoolz","datasets","deap","dipy","docker","easyocr","emoji","fasttext","featuretools","fiona","fury","fuzzywuzzy","geojson","gensim","google-adk","google-cloud-aiplatform","google-cloud-videointelligence","google-cloud-vision","google-genai","gpxpy","h2o","haversine","hep-ml","igraph","ipympl","ipywidgets","isoweek","jedi","jiter","jupyter-lsp","jupyter_server","jupyter_server_proxy","jupyterlab","jupyterlab-lsp","kaggle","kaggle-environments","keras-cv","keras-tuner","kornia","langid","libpysal","lime","line_profiler","mamba","matplotlib","mlcrate","mne","mpld3","nbconvert","nbdev","nilearn","olefile","onnx","openslide-bin","openslide-python","optuna","pandas-profiling","pandasql","papermill","path","path.py","pdf2image","plotly-express","preprocessing","pudb","pyLDAvis","pycryptodome","pydicom","pyemd","pyexcel-ods","pymongo","pypdf","pytesseract","python-lsp-server","pytorch-ignite","pytorch-lightning","qgrid","qtconsole","ray","rgf-python","s3fs","scikit-learn","scikit-learn-intelex","scikit-multilearn","scikit-optimize","scikit-plot","scikit-surprise","segment-anything","squarify","tensorflow-cloud","tensorflow-io","torchinfo","torchmetrics","transformers","vtk","wavio","xvfbwrapper","ydata-profiling",
   ];
-  E.CORE_PACKAGES = ["pandas", "numpy", "scikit-learn", "xgboost", "lightgbm", "tensorflow", "torch"];
+  // core Kaggle packages: named in S1, plus the core stack the owner's solver notes confirm (scipy, seaborn, nltk, opencv, pillow; timm treated as available)
+  E.CORE_PACKAGES = ["pandas", "numpy", "scikit-learn", "xgboost", "lightgbm", "tensorflow", "torch", "scipy", "seaborn", "nltk", "opencv-python", "pillow", "matplotlib", "timm", "tqdm", "catboost"];
 
   /* import name -> distribution name, for the import checker */
   E.IMPORT_ALIASES = {
@@ -188,6 +209,6 @@
   };
   /* Packages that are very likely in the Kaggle image but are not on either
    * supplied list. The checker labels these "verify" instead of "unknown". */
-  E.LIKELY_IN_IMAGE = ["scipy", "pillow", "opencv-python", "pyyaml", "seaborn", "statsmodels", "tqdm", "nltk", "spacy", "tokenizers", "safetensors", "albumentations", "timm", "sentence-transformers", "peft", "accelerate", "huggingface_hub", "beautifulsoup4", "imbalanced-learn", "faiss", "rank_bm25"];
+  E.LIKELY_IN_IMAGE = ["threadpoolctl", "joblib", "requests", "regex", "scipy", "pillow", "opencv-python", "pyyaml", "seaborn", "statsmodels", "tqdm", "nltk", "spacy", "tokenizers", "safetensors", "albumentations", "timm", "sentence-transformers", "peft", "accelerate", "huggingface_hub", "beautifulsoup4", "imbalanced-learn", "faiss", "rank_bm25"];
   E.STDLIB = "abc argparse array ast asyncio base64 bisect builtins bz2 calendar collections concurrent contextlib copy csv ctypes dataclasses datetime decimal difflib enum errno fnmatch fractions functools gc getpass glob gzip hashlib heapq hmac html http importlib inspect io ipaddress itertools json keyword locale logging lzma math mimetypes multiprocessing numbers operator os pathlib pickle platform pprint queue random re resource sched secrets select shlex shutil signal socket sqlite3 ssl stat statistics string struct subprocess sys tarfile tempfile textwrap threading time timeit tokenize traceback types typing unicodedata unittest urllib uuid warnings weakref xml zipfile zlib __future__".split(" ");
 })();

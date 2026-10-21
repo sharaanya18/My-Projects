@@ -66,7 +66,7 @@
 
   function recommend(exps, settings = {}) {
     const dir = settings.direction || "max";
-    const budget = Number(settings.budgetMin || 75);
+    const budget = Number(settings.budgetMin || 50);
     const R = [];
     const add = (priority, title, evidence, action) => R.push({ priority, title, evidence, action });
     const scored = exps.filter((e) => stats(e).mean !== null);

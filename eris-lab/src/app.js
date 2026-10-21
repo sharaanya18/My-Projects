@@ -7,7 +7,7 @@
 
   const NAV = [
     ["Overview", "teal", [["dashboard", "Dashboard"], ["rules", "Platform rules"]]],
-    ["Learn", "coral", [["learn", "Lessons"], ["game", "Allowed or banned?"]]],
+    ["Learn", "coral", [["learn", "Lessons"], ["game", "Allowed or banned?"], ["cases", "Case studies"]]],
     ["Plan", "sun", [["analyzer", "Challenge analyzer"], ["workflow", "Workflow"]]],
     ["Improve", "lilac", [["leaderboard", "Leaderboard optimization"], ["generalization", "Generalization"], ["oof", "OOF lab"], ["library", "Strategy library"]]],
     ["Build with Claude", "sky", [["prompts", "Prompt generator"], ["templates", "Templates"]]],
@@ -81,7 +81,7 @@
     document.getElementById("ws-dot").className = "ws-swatch ws-c-" + act.color;
     refreshXp();
   }
-  E.app = { render, refreshChrome };
+  E.app = { render, refreshChrome, resetIndex: () => { index = null; } };
 
   function go(r, anchor) {
     pendingAnchor = anchor || null;
@@ -160,6 +160,7 @@
     setupSearch();
     setupTheme();
     refreshChrome();
+    if (UI.sync) UI.sync.init();
     window.addEventListener("hashchange", render);
     render();
   }

@@ -5,7 +5,7 @@ const path = require("node:path");
 const fs = require("node:fs");
 
 const root = path.join(__dirname, "..", "src");
-for (const f of ["data/platform.js", "data/library.js", "data/techniques.js", "data/prompts.js", "data/templates.js", "data/learn.js",
+for (const f of ["data/platform.js", "data/library.js", "data/techniques.js", "data/prompts.js", "data/templates.js", "data/learn.js", "data/examples.js",
   "engines/auditor.js", "engines/checker.js", "engines/analyzer.js", "engines/tracker.js", "engines/report.js", "engines/search.js", "engines/oof.js", "engines/logparse.js"]) {
   require(path.join(root, f));
 }
@@ -261,10 +261,217 @@ test("logparse: skeleton-template output and /usr/bin/time", () => {
 });
 
 test("learn: lessons, scenarios and glossary are well-formed", () => {
-  assert.equal(E.LESSONS.length, 8);
+  assert.equal(E.LESSONS.length, 9);
   E.LESSONS.forEach((l) => { assert.equal(l.quiz.length, 3); l.quiz.forEach((q) => assert.ok(q.a >= 0 && q.a < q.options.length)); });
   assert.ok(E.SCENARIOS.length >= 30);
   E.SCENARIOS.forEach((s) => { assert.ok(["allowed", "grey", "banned"].includes(s.a)); assert.ok(s.cite.startsWith("§")); });
   const idx = E.search.buildIndex();
   assert.ok(E.search.search(idx, "overfitting").some((x) => x.type === "Lesson"));
+});
+
+/* Calibration cases from auditing real Eris solutions (top-5 files and the
+ * owner's own scripts). Snippets are synthetic re-statements of the patterns. */
+test("auditor calibration: legitimate patterns are not flagged", () => {
+  const code = `"""Requirements map: R1 argv paths, R2 train only."""
+import os, sys, base64, json
+from pathlib import Path
+import numpy as np, pandas as pd, torch
+import argparse
+PUBLIC_DIR = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("./dataset/public")
+OUT = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("./working/submission.csv")
+torch.manual_seed(0); np.random.seed(0)
+ans = pd.read_csv(PUBLIC_DIR / "train_answers.csv")
+arr = np.load(PUBLIC_DIR / "train_inputs.npz")
+raw = np.frombuffer(base64.b64decode(row["flow_b64"]), np.uint8)
+assert torch.cuda.is_available()
+print(f"threads={torch.get_num_threads()}")
+msg = ("%d rows"
+% (len(ans),))
+model.eval()
+ema.load_state_dict(net.state_dict())
+model.fit(X, y)
+OUT.parent.mkdir(parents=True, exist_ok=True)
+sub.to_csv(OUT, index=False)
+`;
+  const r = E.auditor.audit(code);
+  const bad = r.findings.filter((x) => x.sev === "blocker" || x.sev === "high").map((x) => x.id);
+  assert.deepEqual(bad, [], "unexpected: " + bad.join(", "));
+  assert.ok(r.findings.some((x) => x.id === "det-cuda-guard" && x.sev === "low"));
+});
+
+test("auditor calibration: patterns seen in real top files are flagged", () => {
+  const code = `import os, sys, signal
+from pathlib import Path
+import learner
+EPOCHS = int(os.environ.get("EPOCHS", "14"))
+for cand in (sys.argv[1], os.environ.get("DATA_DIR"), "dataset/public"):
+    pass
+USE_EMA = 0
+if USE_EMA:
+    pass
+signal.alarm(3000)
+OUT = Path(sys.argv[2])
+pd.DataFrame({"id": test.id, "note": "x"}).to_csv(OUT, index=False)
+model.fit(X, y)
+sub.to_csv(OUT, index=False)
+CFG = json.loads('{"align": {"chunk_elems": 128000000, "ctx": false, "dim": 32, "heads": 4, "layers": 2, "lr": 0.0003, "steps": 12000, "warmup": 500, "wd": 0.01, "drop": 0.1, "seed": 42, "batch": 64, "x": 1}}')
+`;
+  const ids = E.auditor.audit(code).findings.map((x) => x.id);
+  for (const id of ["det-env-switch", "det-path-chain", "det-dead-switch", "det-alarm", "io-placeholder", "env-unknown-import", "src-embedded-config"])
+    assert.ok(ids.includes(id), `expected ${id}; got ${ids.join(", ")}`);
+});
+
+test("auditor: source size limit and restrictions", () => {
+  const big = "x = 1\n".repeat(90000);
+  assert.ok(E.auditor.audit(big).findings.some((x) => x.id === "src-size" && x.sev === "blocker"));
+  const gpu = `import sys\nDEVICE = "cuda"\npred = (model(x) + model(torch.flip(x, [3]))) / 2\nmodel.fit(X)\nP=sys.argv[1]; O=sys.argv[2]`;
+  const ids = E.auditor.audit(gpu, { restrict: { cpuOnly: true, noTTA: true } }).findings.map((x) => x.id);
+  assert.ok(ids.includes("rx-cpu") && ids.includes("rx-tta"));
+  const custom = E.auditor.audit(gpu, { custom: [{ pattern: "torch\\.flip", title: "No flips", sev: "medium" }] });
+  assert.ok(custom.findings.some((x) => x.id === "custom-0" && x.sev === "medium"));
+});
+
+test("auditor: before/after diff", () => {
+  const a = E.auditor.audit(`import torch\nDEV = "cuda" if torch.cuda.is_available() else "cpu"\nmodel.fit(X)`);
+  const b = E.auditor.audit(`import sys, torch\ntorch.manual_seed(0)\nDEV = torch.device("cuda")\nmodel.fit(X)\nP=sys.argv[1];O=sys.argv[2]`);
+  const d = E.auditor.diff(a, b);
+  assert.ok(d.fixed.some((x) => x.id === "det-cuda-available"));
+  assert.ok(d.fixed.some((x) => x.id === "io-argv-missing"));
+});
+
+test("logparse calibration: real log formats (Kaggle JSON lines, held-out lines, per-group scores)", () => {
+  const kaggle = [
+    '[{"stream_name":"stdout","time":12.5,"data":"[      0s] fold 0: train 6559 rows / 52 authors; held-out 1626 rows / 11 authors\\n"}',
+    ',{"stream_name":"stdout","time":1300.2,"data":"[   1290s]   epoch 4: greedy chrF held-out authors (600 rows) = 0.2179 | train rows = 0.6920\\n"}',
+    ',{"stream_name":"stderr","time":1310.0,"data":"SyntaxWarning: invalid escape sequence 0.99\\n"}]',
+  ].join("\n");
+  const a = E.logparse.parse(kaggle);
+  assert.equal(a.cv, 0.2179);
+  assert.ok(Math.abs(a.runtime - 1310 / 60) < 1e-9, "runtime from the last time field");
+  assert.equal(a.ood, undefined, "plain held-out validation is not a stress split");
+
+  const b = E.logparse.parse(`[  201s] validation (held-out headwords, one CTC model, n=3201): score 0.3768 full-match 0.3077
+[  382.5s] HELD-OUT-PERSON validation, official metric: TOTAL 0.5816  x 0.5085  y 0.7365
+[  382.5s]   per-held-out-person scores: 0.379 0.496 0.546
+[  382.5s]   reference: best constant (median) waveform scores 0.2469 -> model adds +0.3347
+[ 1791.8s] wrote working_run/submission.csv shape=(322, 4)`);
+  assert.equal(b.cv, 0.5816);
+  assert.deepEqual(b.groups, [0.379, 0.496, 0.546]);
+  assert.equal(b.groupLabel, "person");
+  assert.equal(b.baseline, 0.2469);
+  assert.ok(Math.abs(b.runtime - 1791.8 / 60) < 1e-9);
+});
+
+test("analyzer calibration: real description header and rules", () => {
+  const desc = `# Dating Segments
+Creator x · Domain: From Scratch · Difficulty: Medium · Scoring: lower is better · Compute: CPU · Tags: features
+## Overview
+Every model must be trained from zero on the provided data, on CPU. No pretrained weights of any kind.
+The training data are complete series from other sites; test items come from unseen sites.
+## Evaluation
+q = 0.999 * p + 0.001 / 421
+score = mean over test segments of -ln(q)
+Spreading the probability evenly over the 421 candidate years scores ln(421) = 6.04.
+Your full solution must run on CPU only, on 10 cores with 62.5 GiB of RAM and no GPU, within 90 minutes.
+Do not pool predictions across test charts: predict each chart on its own, with no voting.
+folds.csv - five folds over the training charts.
+A submission is rejected outright if it has duplicate ids.`;
+  const a = E.analyzer.analyze(desc);
+  assert.equal(a.category, "scratch");
+  assert.equal(a.header.difficulty, "Medium");
+  assert.equal(a.metric.dir, "min");
+  assert.equal(a.hardware.kind, "cpu");
+  assert.equal(a.hardware.cores, 10);
+  assert.equal(a.runtimeLimit.minutes, 90);
+  assert.equal(a.budgetMin, 63);
+  assert.deepEqual(a.restrict, { cpuOnly: true, noPretrained: true, perRow: true, noTTA: false });
+  assert.equal(a.split[0].kind, "provided folds");
+  assert.ok(a.rejectIf.length >= 1);
+  assert.equal(a.difficulty, 3);
+  const b = E.analyzer.analyze("Metric: mean set F1 (prec, rec). Gold has exactly two. A prediction may contain a different count. Environment: CPU.");
+  assert.equal(b.metric.id, "setf1");
+  assert.ok(b.opportunities.some((o) => /Decode to the metric/.test(o)));
+});
+
+test("analyzer: the platform worked example (rubric, grader, prepare script, log-space MAE)", () => {
+  const x = E.EXAMPLES.find((e) => e.slug === "notebook-upvotes");
+  const a = E.analyzer.analyze(x.description);
+  assert.equal(a.task, "tabular");
+  assert.equal(a.category, "general");
+  assert.equal(a.metric.id, "maelog");
+  assert.equal(a.metric.dir, "min");
+  assert.equal(a.rubric.length, 11);
+  assert.equal(a.rubric.filter((r) => r.level === "required").length, 4);
+  assert.equal(a.rubric[0].category, "Data Handling");
+  assert.ok(a.grader.some((g) => /exactly \{content_id, upvotes\}/.test(g.text)));
+  assert.ok(a.grader.some((g) => /≥ 0/.test(g.text)));
+  assert.equal(a.prepare.kind, "random");
+  assert.equal(a.split[0].prob, "confirmed");
+  assert.ok(a.prep.some((p) => /%d\/%m\/%Y/.test(p.text)));
+  assert.ok(a.prep.some((p) => /pipe-separated/.test(p.text)));
+  assert.equal(a.reference.value, 1.061);
+  assert.deepEqual(a.submissionColumns.map((c) => c.name), ["content_id", "upvotes"]);
+  assert.ok(a.opportunities.some((o) => /median of log1p/.test(o)));
+  assert.ok(a.opportunities.some((o) => /author_username/.test(o)));
+});
+
+test("analyzer: rubric pasted as one line per criterion, and no rubric in ordinary text", () => {
+  const a = E.analyzer.analyze("Some challenge.\nREQUIRED Data Handling Remove the leaking columns before training. They hold future information.\nRECOMMENDED Modeling Use a gradient boosting model for the regression.");
+  assert.equal(a.rubric.length, 2);
+  assert.equal(a.rubric[0].category, "Data Handling");
+  assert.equal(a.rubric[0].text, "Remove the leaking columns before training.");
+  assert.equal(a.rubric[1].level, "recommended");
+  assert.equal(E.analyzer.analyze("All fields are required. Scoring: lower is better").rubric.length, 0);
+  // a text column inside a non-tabular challenge is not a tabular free-text note
+  assert.ok(!E.analyzer.analyze("Rank the candidate passages for each query. Free text answers are not scored.").prep.some((p) => /Free-text/.test(p.text)));
+});
+
+test("auditor calibration: the platform's exemplary tabular solution patterns", () => {
+  const code = `import sys
+from pathlib import Path
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.feature_extraction.text import TfidfVectorizer
+public_dir = Path(sys.argv[1])
+submission_out = Path(sys.argv[2])
+train = pd.read_csv(public_dir / "train.csv")
+train["d"] = pd.to_datetime(train["created_date"])
+tfidf = TfidfVectorizer(max_features=256)
+rf = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+rf.fit(train[["d"]], train["y"])
+pd.DataFrame({"a": [1]}).to_csv(submission_out, index=False)
+`;
+  const r = E.auditor.audit(code, { category: "general" });
+  const by = (id) => r.findings.find((x) => x.id === id);
+  assert.equal(by("det-all-cores").sev, "low");
+  assert.equal(by("grey-tfidf").sev, "low");
+  assert.ok(by("data-date-guess"));
+  assert.equal(E.auditor.audit(code, { category: "nlp" }).findings.find((x) => x.id === "grey-tfidf").sev, "medium");
+  assert.ok(!ids(E.auditor.audit(code.replace('pd.to_datetime(train["created_date"])', 'pd.to_datetime(train["created_date"], format="%d/%m/%Y")'))).includes("data-date-guess"));
+});
+
+test("prompts: analyzer evidence (rubric, grader, metric decode) reaches every prompt", () => {
+  const ctx = { challenge: "Upvotes", metric: "MAE in log space", metricId: "maelog", direction: "min",
+    rubric: [{ level: "required", category: "Modeling", text: "No significant overfitting." }, { level: "recommended", category: "", text: "Clip predictions at 0." }],
+    grader: ["Every upvotes value must be ≥ 0."], prep: ["Parse dates with format=\"%d/%m/%Y\"."], reference: "1.061" };
+  for (const id of E.PROMPT_ORDER) {
+    const p = E.buildPrompt(id, ctx);
+    assert.ok(/## Challenge rubric/.test(p) && /REQUIRED \(Modeling\): No significant overfitting/.test(p), id);
+    assert.ok(/conditional median of log1p/.test(p) && /Grader contract/.test(p) && /Reference solution score.*1\.061/.test(p), id);
+  }
+  assert.ok(E.PROMPT_ORDER.includes("rubric"));
+  assert.ok(/train-fit score next to the validation score/.test(E.buildPrompt("baseline", {})));
+  assert.ok(!/## Challenge rubric/.test(E.buildPrompt("recon", {})));
+});
+
+test("templates: the rubric-ready regression template audits without blocker or high findings", () => {
+  const r = E.auditor.audit(E.TEMPLATES.find((t) => t.id === "skeleton-tabular-reg").code);
+  assert.deepEqual(r.findings.filter((x) => x.sev === "blocker" || x.sev === "high").map((x) => x.id), []);
+});
+
+test("report: unticked REQUIRED rubric criteria are listed", () => {
+  const a = E.analyzer.analyze(E.EXAMPLES[0].description);
+  const md = E.report.build({ analysis: a, rubricChecks: { [a.rubric[0].text]: true }, experiments: [], settings: {} });
+  assert.ok(/Rubric coverage/.test(md));
+  assert.ok(/3 REQUIRED rubric criterion\/criteria not yet ticked/.test(md));
 });

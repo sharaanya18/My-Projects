@@ -13,9 +13,31 @@
     return hit;
   }
 
+  /* Kaggle kernel logs arrive as JSON lines: {"stream_name":"stdout","time":12.3,"data":"[ 12s] fold 1 ...\n"}.
+   * Unwrap them to plain text and remember the largest time stamp (seconds). */
+  function unwrap(text) {
+    const raw = String(text || "").replace(/\r\n?/g, "\n").split("\n");
+    let maxTime = null, kaggle = false;
+    const lines = [];
+    for (const l of raw) {
+      const m = l.match(/"data"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+      if (m && /"stream_name"/.test(l)) {
+        kaggle = true;
+        const tm = l.match(/"time"\s*:\s*([\d.]+)/);
+        if (tm) maxTime = Math.max(maxTime || 0, Number(tm[1]));
+        if (/"stream_name"\s*:\s*"stderr"/.test(l)) continue;
+        let d = m[1];
+        try { d = JSON.parse('"' + m[1] + '"'); } catch (_) { /* keep the raw text */ }
+        d.split("\n").forEach((x) => { if (x.trim()) lines.push(x); });
+      } else lines.push(l);
+    }
+    return { lines, maxTime, kaggle };
+  }
+
   function parse(text) {
-    const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
-    const out = { folds: [], evidence: {} };
+    const U = unwrap(text);
+    const lines = U.lines;
+    const out = { folds: [], evidence: {}, kaggle: U.kaggle };
 
     // 1) explicit list: "folds=[0.81, 0.82]" or "fold scores: 0.81 0.82 ..."
     const listRe = /fold[_ ]?scores?\s*[:=]\s*\[?\s*((?:-?\d*\.\d+(?:e-?\d+)?[\s,;]*){2,})\]?/i;
@@ -54,12 +76,28 @@
     const cv = lastMatch(lines, new RegExp("\\b(?:cv|oof|validation|valid|val|mean)\\b[^\\n]{0,40}?" + NUM + "\\s*(?:\\+/-|±|\\+-)\\s*" + NUM, "i"));
     if (cv) { out.cv = Number(cv.m[1]); out.cvStd = Number(cv.m[2]); out.evidence.cv = cv.line; }
     else {
-      const cv2 = lastMatch(lines, new RegExp("\\b(?:cv|oof)\\b\\s*(?:" + METRIC_WORDS + ")?\\s*[:=]?\\s*" + NUM, "i"));
-      if (cv2) { out.cv = Number(cv2.m[1]); out.evidence.cv = cv2.line; }
+      // "validation (held-out headwords…): score 0.3768", "HELD-OUT validation, official metric: TOTAL 0.5816",
+      // "OOF skill (mean over cells) at thr 0.55: 0.4669", "CV auc 0.81"
+      const kw = "(?:score|skill|total|util|metric|auc|f1|acc(?:uracy)?|mrr|ndcg|rmse|mae|logloss|loss|map|ap)";
+      const cv2 = lastMatch(lines, new RegExp("\\b(?:cv|oof|validation|valid|held[- ]out)\\b[^\\n]*?\\b" + kw + "\\b\\s*[:=]?\\s*" + NUM, "i"))
+        || lastMatch(lines, /\b(?:cv|oof|validation|held[- ]out)\b[^\n]*?[:=]\s*(-?\d*\.\d+)(?![^\n|]*:\s*\d)/i);
+      if (cv2 && !/\bfold\s*\d/i.test(cv2.line)) { out.cv = Number(cv2.m[cv2.m.length - 1]); out.evidence.cv = cv2.line; }
     }
 
+    // per-group scores ("per-held-out-person scores: 0.379 0.496 …") → subgroup field
+    const per = lastMatch(lines, /\bper[- ]([\w-]+?)\s+scores?\s*[:=]\s*((?:-?\d*\.\d+[\s,]*){2,})/i);
+    if (per) {
+      const label = per.m[1].replace(/^held[- ]out[- ]/i, "");
+      out.groups = per.m[2].trim().split(/[\s,]+/).map(Number);
+      out.groupLabel = label;
+      out.evidence.groups = per.line;
+    }
+    const base = lastMatch(lines, new RegExp("\\b(?:best constant|constant|baseline|random)\\b[^\\n]*?(?:scores?|=|:)\\s*" + NUM, "i"));
+    if (base) { out.baseline = Number(base.m[1]); out.evidence.baseline = base.line; }
+
     // stress split (leave-one-group-out / LODO / unseen …)
-    const ood = lastMatch(lines, new RegExp("\\b(?:lodo|logo|stress|ood|leave[- ]one[- ]\\w+[- ]out|unseen[- ]\\w+|held[- ]out[- ]\\w+)\\b[^\\n]{0,30}?" + NUM, "i"));
+    // a stress split needs stress wording (plain "held-out" validation is ordinary CV) and a decimal score
+    const ood = lastMatch(lines.filter((l) => !/\bper[- ]/i.test(l)), /\b(?:lodo|logo|stress(?:[- ]split)?|ood|leave[- ]one[- ][\w-]+[- ]out|unseen[- ][\w-]+ (?:util|score|auc|f1|acc\w*|skill))\b[^\n]{0,30}?(-?\d*\.\d+)/i);
     if (ood) { out.ood = Number(ood.m[1]); out.evidence.ood = ood.line; }
 
     const tr = lastMatch(lines, new RegExp("\\btrain(?:ing)?[ _]" + METRIC_WORDS + "\\s*[:=]?\\s*" + NUM, "i"));
@@ -78,7 +116,8 @@
       const v = Number(rt.m[1]), u = rt.m[2].toLowerCase();
       out.runtime = u.startsWith("h") ? v * 60 : u.startsWith("m") ? v : v / 60;
       out.evidence.runtime = rt.line;
-    } else if (stamp) { out.runtime = Number(stamp.m[1]) / 60; out.evidence.runtime = stamp.line + "  (last timestamp)"; }
+    } else if (U.maxTime) { out.runtime = U.maxTime / 60; out.evidence.runtime = `Kaggle log: last "time" field ${U.maxTime.toFixed(1)} s`; }
+    else if (stamp) { out.runtime = Number(stamp.m[1]) / 60; out.evidence.runtime = stamp.line + "  (last timestamp)"; }
 
     // peak memory, in GB
     const rss = lastMatch(lines, /Maximum resident set size \(kbytes\):\s*(\d+)/i);
@@ -97,7 +136,7 @@
       const m = out.folds.reduce((s, x) => s + x, 0) / out.folds.length;
       out.cvFromFolds = m;
     }
-    out.found = ["folds", "cv", "ood", "train", "lb", "runtime", "mem"].filter((k) => (k === "folds" ? out.folds.length : out[k] !== undefined));
+    out.found = ["folds", "cv", "ood", "train", "lb", "runtime", "mem", "groups", "baseline"].filter((k) => (k === "folds" ? out.folds.length : out[k] !== undefined));
     return out;
   }
 

@@ -8,7 +8,7 @@
     { id: "fc-argv", text: "Script reads Path(sys.argv[1]) and writes Path(sys.argv[2]), creating the parent directory", cite: "S3" },
     { id: "fc-local", text: "Ran `python3 solution.py ./dataset/public ./working/submission.csv` end to end from a clean folder", cite: "S3" },
     { id: "fc-hash", text: "Two local runs produce identical submission hashes", cite: "S2 §3.3" },
-    { id: "fc-runtime", text: "Total runtime fits ≤ 75 min on an A10G (or the challenge's own limit) with a margin", cite: "S2 §4.4" },
+    { id: "fc-runtime", text: "Total runtime fits the ≈50 min plan: at least 30% headroom under the 1.5 h limit (or the challenge's own limit)", cite: "S2 §4.4, S6" },
     { id: "fc-seeds", text: "Every RNG, model, split, sampler and DataLoader is seeded; device and worker counts are constants", cite: "S2 §3.3" },
     { id: "fc-nobranch", text: "No try/except fallbacks, env or debug switches, clock or machine checks", cite: "S2 §3.3" },
     { id: "fc-train", text: "Real training happens inside the script; the strip-the-model test passes", cite: "S2 §1.1, §5.3" },
@@ -19,6 +19,8 @@
     { id: "fc-csv", text: "Submission checker: columns, rows, ids and values match sample_submission.csv", cite: "S2 §3.1, §4.6" },
     { id: "fc-csvupload", text: "Uploaded the CSV self-check before spending a script credit", cite: "S2 §2" },
     { id: "fc-comments", text: "Comments explain the reasoning at each step", cite: "S1" },
+    { id: "fc-rubric", text: "Every REQUIRED rubric criterion is visibly met and listed in the requirements docstring with its lines", cite: "Platform example" },
+    { id: "fc-gap", text: "The log prints train-fit and validation scores side by side (no large overfitting gap)", cite: "Platform example" },
     { id: "fc-select", text: "Final chosen by matched-split CV and stability, not public LB alone", cite: "S2 §1.2" },
   ];
 
@@ -56,6 +58,14 @@
         rel.forEach((x) => md.push(`| ${x.sev} | ${x.lines.filter(Boolean).join(", ") || "–"} | ${x.title.replace(/\|/g, "/")} | ${x.cite || "–"} | ${x.fix.replace(/\|/g, "/")} |`));
       } else md.push("No blocker, high, medium or low findings.");
     } else md.push("No audit run yet. Run the Solution Auditor on your final script.");
+
+    if (A && A.rubric && A.rubric.length) {
+      const ticks = s.rubricChecks || {};
+      md.push("\n### Rubric coverage (ticked in the analyzer)");
+      A.rubric.forEach((r) => md.push(`- [${ticks[r.text] ? "x" : " "}] ${r.level.toUpperCase()}: ${r.text}`));
+      const miss = A.rubric.filter((r) => r.level === "required" && !ticks[r.text]).length;
+      md.push(miss ? `\n**${miss} REQUIRED rubric criterion/criteria not yet ticked.**` : "\nAll REQUIRED rubric criteria ticked.");
+    }
 
     md.push("\n## 3. Validation evidence");
     if (A && A.split && A.split.length) md.push(`- Planned split (from the challenge reading, HYPOTHESIS until checked): ${A.split[0].kind}. ${A.split[0].cv}.`);

@@ -25,11 +25,28 @@
       `Task type: ${c.taskName || c.task || "(not given)"} | Platform category: ${c.categoryName || c.category || "(not given)"}`,
       `Metric: ${c.metric || "(read it from the problem description)"}${c.direction ? ` (${c.direction === "min" ? "lower" : "higher"} is better)` : ""}`,
       `Data: ${c.publicDir || "./dataset/public"} | Solution file: ${c.solutionPath || "solution.py"}`,
-      `Runtime budget for the whole script: ${c.budgetMin || 75} min on one NVIDIA A10G`,
+      `Runtime budget for the whole script: ${c.budgetMin || 50} min${c.cpuOnly ? " on CPU only (" + (c.cores || "?") + " cores)" : " on one NVIDIA A10G"}, with at least 30% headroom`,
     ];
     if (c.bestCv) lines.push(`Current best validated score (from my own logs): ${c.bestCv}`);
+    if (c.reference) lines.push(`Reference solution score reported on the challenge page: ${c.reference} (a test-set number, not CV)`);
     if (c.constraints) lines.push(`Challenge-specific constraints I know of: ${c.constraints}`);
-    return "## Context\n" + lines.map((l) => "- " + l).join("\n");
+    const m = c.metricId && (E.METRICS || []).find((x) => x.id === c.metricId);
+    if (m) lines.push(`Optimise for the metric (HYPOTHESIS until checked on OOF): train with ${m.loss.replace(/\.$/, "")}. Decode: ${m.post.replace(/\.$/, "")}. Pitfall: ${m.pitfall}`);
+    return "## Context\n" + lines.map((l) => "- " + l).join("\n") + rubricBlock(c) + notesBlock("Grader contract (from the grading script)", c.grader) + notesBlock("Data quirks the description documents", c.prep);
+  }
+
+  function notesBlock(title, items) {
+    return items && items.length ? `\n\n## ${title}\n` + items.map((x) => "- " + x).join("\n") : "";
+  }
+
+  /* The challenge rubric, when one was pasted into the analyzer. REQUIRED items
+   * must be visibly met; the requirements docstring maps each one to code. */
+  function rubricBlock(c) {
+    if (!c.rubric || !c.rubric.length) return "";
+    const req = c.rubric.filter((r) => r.level === "required"), rec = c.rubric.filter((r) => r.level !== "required");
+    return "\n\n## Challenge rubric (from the challenge page)\n" +
+      req.map((r) => `- REQUIRED${r.category ? ` (${r.category})` : ""}: ${r.text}`).concat(rec.map((r) => `- ${r.level.toUpperCase()}${r.category ? ` (${r.category})` : ""}: ${r.text}`)).join("\n") +
+      "\nEvery REQUIRED criterion must be visibly satisfied in the code and listed in the requirements docstring at the top of the solution, with the lines that meet it. Do RECOMMENDED ones when they don't hurt validated CV; if you skip one, say why in a comment.";
   }
 
   function contractBlock(c) {
@@ -77,7 +94,9 @@ Do not write the solution yet. Build a constraint sheet and a validation plan fr
 4. Re-implement the metric exactly as described. Unit-test it on the sample submission so it matches the expected format and range.
 5. Propose a CV scheme (and one stress split) that mimics the hidden-test construction, with the reasons.
 6. List every rule from the platform contract and the challenge text that constrains model choice, and note any line that looks like boilerplate.
-7. Finish with: constraint sheet, validation plan, 3–5 candidate approaches ranked by expected value and compliance risk, and the questions I should ask a reviewer.
+7. Build the rubric. If the challenge page shows one (REQUIRED / RECOMMENDED criteria), copy it. If not, derive the criteria the description implies: every column it flags (target-leaking, entirely null, dates and their format, multi-value or pipe-separated, free text), the target transform the metric implies, the grader's format checks, and a train-vs-validation overfitting check. Mark each derived item HYPOTHESIS.
+8. If a prepare script or grading script is shown, read it: say how it splits train from test (random, grouped, by time) and list every check the grader raises on.
+9. Finish with: constraint sheet, validation plan, 3–5 candidate approaches ranked by expected value and compliance risk, and the questions I should ask a reviewer.
 
 ${contractBlock(c)}
 
@@ -97,11 +116,11 @@ Write ${c.solutionPath || "solution.py"}: a correct, compliant, end-to-end basel
 2. Load data with the exact file names from the description. Fail loudly if a column is missing.
 3. Build the validation folds from the agreed scheme with a fixed seed and use them for every model.
 4. Train one simple, appropriate model (category rules apply). Produce OOF and test predictions.
-5. Log the challenge metric per fold, the mean ± std, and trivial baselines (constant, random, one simple heuristic) on the same folds.
+5. Log the challenge metric per fold, the mean ± std, and trivial baselines (constant, random, one simple heuristic) on the same folds. Also print the train-fit score next to the validation score, so the overfitting gap is visible in the log.
 6. Final fit on all training data with a fixed iteration count derived from CV, then predict test.
 7. Before writing, validate the submission against sample_submission.csv: same columns and order, row count, unique ids matching test, finite values, valid range, not constant. Raise on failure.
 8. Run it locally: \`python3 ${c.solutionPath || "solution.py"} ${c.publicDir || "./dataset/public"} ./working/submission.csv\`. Report wall time and peak memory. Run it twice and compare the CSV hashes.
-Comment the reasoning at each step. Reviewers read the comments.
+Start the file with a requirements-map docstring: each rubric criterion and challenge constraint, and the lines that satisfy it. Comment the reasoning at each step. Reviewers read the comments.
 
 ${contractBlock(c)}
 
@@ -219,7 +238,7 @@ ${PROHIBITED}`,
     body: (c) => `${contextBlock(c)}
 
 ## Task
-Bring the total runtime under ${c.budgetMin || 75} min on an A10G with at least a 15% margin, losing as little validated score as possible.
+Bring the total runtime under ${c.budgetMin || 50} min on the target hardware with at least a 15% margin, losing as little validated score as possible.
 1. Profile each stage (load, features, each fold, final fit, inference) with timestamps. Logging only; nothing may depend on the clock.
 2. Rank the stages by cost and propose cuts: fewer folds in the final script, AMP/bf16, shorter sequences, smaller models, fewer HPO trials, cached tokenisation within the run, and vectorised feature code.
 3. For each cut, measure the score cost on the same folds and the time saved.
@@ -272,8 +291,28 @@ ${EVIDENCE}
 ${PROHIBITED}`,
   };
 
+  T.rubric = {
+    name: "11 · Rubric coverage check",
+    when: "After the baseline and before each scripted submission: is every rubric criterion visibly met?",
+    body: (c) => `${contextBlock(c)}
+
+## Task
+Check ${c.solutionPath || "solution.py"} against the challenge rubric${c.rubric && c.rubric.length ? " above" : " (copy it from the challenge page; if there is none, derive the implied criteria from the description and mark them HYPOTHESIS)"}. Don't change behaviour silently.
+1. For each criterion, quote the line numbers that satisfy it, or write MISSING. "The model handles it implicitly" doesn't count: a reviewer must be able to see it.
+2. For any overfitting criterion, run the script and show the train-fit and validation scores side by side from the log.
+3. For leakage criteria, list the columns that are dropped and show the drop is defensive (only when present) and commented.
+4. Propose the smallest change for each MISSING item. Apply the REQUIRED ones. For RECOMMENDED ones, run each as a controlled experiment on the same folds and keep it only if CV doesn't get worse, or keep it with a comment if it is free.
+5. Update the requirements-map docstring at the top, re-run end to end, validate the CSV, and show the coverage table: criterion, level, lines, status (VERIFIED with log line, or HYPOTHESIS).
+
+${contractBlock(c)}
+
+${EVIDENCE}
+
+${PROHIBITED}`,
+  };
+
   E.PROMPTS = T;
-  E.PROMPT_ORDER = ["recon", "baseline", "experiment", "error", "generalize", "audit", "debug", "runtime", "ensemble", "final"];
+  E.PROMPT_ORDER = ["recon", "baseline", "experiment", "error", "generalize", "audit", "debug", "runtime", "ensemble", "final", "rubric"];
   E.buildPrompt = (id, ctx) => (T[id] ? T[id].body(ctx || {}) : "");
   E.CATEGORY_RULES = CATEGORY_RULES;
 })();

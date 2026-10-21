@@ -15,6 +15,7 @@
     { id: "seqgen", name: "Sequence generation" },
     { id: "recsys", name: "Recommendation" },
     { id: "structured", name: "Structured prediction" },
+    { id: "signal", name: "Time series / signal" },
     { id: "finetune", name: "Fine-tuning challenges" },
     { id: "scratch", name: "From-scratch challenges" },
     { id: "biochem", name: "Biology / chemistry" },
@@ -69,6 +70,23 @@
       "Fitting scalers, vocabularies, PCA or target encoders on concatenated train and test lets test statistics shape the model. That breaks the one-sample inference rule.",
       "Every .fit / .fit_transform call receives training-fold data only.", "S2 §5.2.5"),
 
+    // ---- From the platform's worked example (Notebook Upvote Prediction) ----
+    L("general", "lesson", "example", "Read the prepare script before choosing CV",
+      "The prepare script is the ground truth for how the hidden test was cut. In the worked example it is a random row split (train_test_split, test_size=0.1), so shuffled KFold mirrors it and author keys recur in train and test. A group or time split there would mean GroupKFold or forward-chaining instead.",
+      "Check key overlap between train.csv and test.csv using only the key columns. It should match what the script implies.", "Platform example"),
+    L("general", "lesson", "example", "Treat the rubric as part of the spec",
+      "Challenges carry REQUIRED and RECOMMENDED criteria. The worked example has 11: drop the leaking columns, log-transform the target, split the pipe lists, keep the train/validation gap small, clip to ≥ 0 and more. Meet each REQUIRED one visibly and map it in the requirements docstring. A criterion can apply even as a no-op, like dropping a column that is already gone.",
+      "Paste the rubric into the analyzer and tick each item as the code meets it. Run prompt 11 (Rubric coverage check) before each scripted submission.", "Platform example"),
+    L("general", "pitfall", "example", "The grader's own checks decide errors",
+      "The example's grade() raises on any extra column (an index column included), a wrong row count, or a single negative prediction. It sorts by id, so order doesn't matter, and it never checks for NaN. A good model behind a bad file is an error, not a score.",
+      "Before writing, assert the same checks the grader makes, plus finite values.", "Platform example"),
+    L("tabular", "strategy", "example", "Encode each feature type on purpose",
+      "The worked example handles every column type explicitly: numeric counts, categoricals (one-hot), dates (dd/mm/yyyy to days since epoch), pipe-separated lists (multi-hot), free text (TF-IDF fitted on train) and a high-cardinality id. Write that map down first, so you and a reviewer can see each type was handled, and fit every encoder on training rows only.",
+      "Ablate one block at a time on the same folds and keep the blocks that help.", "Platform example"),
+    L("tabular", "strategy", "hypothesis", "Beat a reference solution with metric-matched training",
+      "The example's reference (a random forest on log1p(y), one 80/20 split, never refit on all rows) scores 1.061 log-MAE. Likely gains: an L1 or quantile-0.5 objective on log1p(y) (the metric rewards the median), K-fold OOF with a full refit, LightGBM or CatBoost with native categoricals, out-of-fold author statistics, and ratio features.",
+      "Re-implement the reference on your folds first, then change one thing at a time and keep only paired gains above 2×SE.", "Platform example"),
+
     // ---- Tabular ----
     L("tabular", "strategy", "hypothesis", "Gradient-boosted trees as the first strong baseline",
       "LightGBM, XGBoost and CatBoost with seeded, early-stopped training on OOF folds are usually the strongest single tabular baseline. Tune learning rate, depth or leaves, regularisation and subsampling inside the script with Optuna (seeded sampler, fixed n_trials).",
@@ -85,7 +103,7 @@
 
     // ---- NLP ----
     L("nlp", "strategy", "hypothesis", "Fine-tune a pretrained transformer as the core model",
-      "A DeBERTa, RoBERTa or multilingual encoder fine-tuned on the provided data, with fixed epochs, a linear-warmup schedule and AMP. Log the measured epoch time and set the epoch count so the full run fits under about 75 min on an A10G.",
+      "A DeBERTa, RoBERTa or multilingual encoder fine-tuned on the provided data, with fixed epochs, a linear-warmup schedule and AMP. Log the measured epoch time and set the epoch count so the full run fits the ≈50 min plan on an A10G.",
       "Show the gain over a TF-IDF + linear baseline on the same folds. That baseline is for reference only, because TF-IDF is a grey area (§5.3.2).", "S2 §4.4"),
     L("nlp", "pitfall", "rule", "Exploiting synthetic-data templates with regex",
       "Synthetic NLP datasets often carry generator artefacts. Noticing them is fine. Hardcoding a regex or template around them gets rejected; the model has to learn them.",

@@ -12,6 +12,10 @@
     verified: ["Verified in your files", "Observed directly in your own files"],
     hypothesis: ["Hypothesis", "General practice, not yet validated on your challenges"],
     verify: ["Check first", "Ambiguous or conflicting; confirm before relying on it"],
+    measured: ["Measured on your runs", "A number from your own runs (OOF, held-out or platform score)"],
+    observed: ["Seen in top solutions", "Seen in supplied top solutions; its score effect wasn't measured by you"],
+    page: ["From the challenge page", "Read directly from the text you pasted: description, prepare or grading script, rubric"],
+    example: ["Platform example", "From the platform's own worked example challenge (Notebook Upvote Prediction)"],
   };
   UI.prov = (p, cite) => {
     const [label, title] = PROV[p] || PROV.hypothesis;
@@ -29,7 +33,7 @@
   const KEY = "eris-lab:v2";
   const KEY_V1 = "eris-lab:v1";
   const WS_COLORS = ["teal", "coral", "lilac", "sun", "sky", "mint"];
-  const freshData = (name) => ({ experiments: [], settings: { direction: "max", budgetMin: 75, challenge: name || "" }, checklist: {}, workflow: {}, leakage: {}, analysis: null, audit: null, promptCtx: {}, analyzerText: null });
+  const freshData = (name) => ({ experiments: [], settings: { direction: "max", budgetMin: 50, challenge: name || "" }, checklist: {}, workflow: {}, leakage: {}, analysis: null, audit: null, promptCtx: {}, analyzerText: null });
   const freshGlobal = () => ({ xp: 0, awarded: {}, badges: {}, lessons: {}, quiz: {}, game: { best: null, plays: 0 }, tourDone: false });
   let root = null;
 
@@ -57,7 +61,45 @@
     active() { UI.store.root(); return activeWs(); },
     list() { UI.store.root(); return root.workspaces; },
     save() {
-      try { localStorage.setItem(KEY, JSON.stringify(root)); return true; } catch (_) { return false; }
+      root.updated = Date.now();
+      let ok = true;
+      try { localStorage.setItem(KEY, JSON.stringify(root)); } catch (_) { ok = false; }
+      document.dispatchEvent(new CustomEvent("eris:saved"));
+      return ok;
+    },
+    /* Full backup: every workspace plus learning progress (not the private pack). */
+    exportAll() {
+      UI.store.root();
+      return JSON.stringify({ format: "eris-solver-lab-backup", version: 2, exported: new Date().toISOString(), root }, null, 2);
+    },
+    /* mode "replace" swaps everything; "merge" adds the backup's workspaces next to yours
+     * and keeps the better learning progress of the two. */
+    importAll(text, mode = "merge") {
+      const obj = JSON.parse(text);
+      const incoming = obj && obj.format === "eris-solver-lab-backup" ? obj.root : obj && obj.version === 2 && obj.workspaces ? obj : null;
+      if (!incoming || !Array.isArray(incoming.workspaces) || !incoming.workspaces.length) throw new Error("This file isn't an Eris Solver Lab backup.");
+      UI.store.root();
+      if (mode === "replace") { root = null; try { localStorage.setItem(KEY, JSON.stringify(incoming)); } catch (_) {} root = readRoot(); if (!root.workspaces.length) throw new Error("Empty backup."); UI.store.save(); return { added: root.workspaces.length }; }
+      let added = 0;
+      incoming.workspaces.forEach((w) => {
+        const clash = root.workspaces.some((x) => x.id === w.id);
+        root.workspaces.push(Object.assign({}, w, { id: clash ? w.id + "-" + Math.random().toString(36).slice(2, 6) : w.id, name: clash ? w.name + " (restored)" : w.name, data: Object.assign(freshData(w.name), w.data || {}) }));
+        added++;
+      });
+      const g = root.global, h = Object.assign(freshGlobal(), incoming.global || {});
+      g.xp = Math.max(g.xp, h.xp); Object.assign(g.awarded, h.awarded); Object.assign(g.badges, h.badges);
+      Object.keys(h.lessons).forEach((k) => { if (!g.lessons[k]) g.lessons[k] = h.lessons[k]; });
+      Object.keys(h.quiz).forEach((k) => { if (g.quiz[k] === undefined) g.quiz[k] = h.quiz[k]; });
+      g.game.best = Math.max(g.game.best || 0, h.game.best || 0) || g.game.best; g.game.plays = Math.max(g.game.plays, h.game.plays);
+      UI.store.save();
+      return { added };
+    },
+    replaceRoot(r) {
+      root = r; root.global = Object.assign(freshGlobal(), root.global || {});
+      root.workspaces.forEach((w) => { w.data = Object.assign(freshData(w.name), w.data || {}); });
+      if (!root.workspaces.some((w) => w.id === root.active)) root.active = root.workspaces[0].id;
+      const keep = root.updated; UI.store.save(); root.updated = keep;
+      try { localStorage.setItem(KEY, JSON.stringify(root)); } catch (_) {}
     },
     update(fn) { const s = UI.store.load(); fn(s); UI.store.save(); return s; },
     updateGlobal(fn) { const g = UI.store.global(); fn(g); UI.store.save(); return g; },
@@ -82,6 +124,31 @@
     },
     reset() { root = null; try { localStorage.removeItem(KEY); localStorage.removeItem(KEY_V1); } catch (_) {} },
   };
+
+  /* ---------- private corpus pack ----------
+   * Baked into private builds as Eris.PACK, or imported by the user and kept in
+   * this browser. The public repository never contains it. */
+  const PACK_KEY = "eris-lab:pack";
+  let packCache;
+  UI.pack = () => {
+    if (E.PACK) return E.PACK;
+    if (packCache !== undefined) return packCache;
+    try { packCache = JSON.parse(localStorage.getItem(PACK_KEY) || "null"); } catch (_) { packCache = null; }
+    return packCache;
+  };
+  UI.validatePack = (obj) => {
+    if (!obj || obj.format !== "eris-solver-lab-pack") throw new Error("This isn't an Eris Solver Lab pack (format field missing).");
+    if (!Array.isArray(obj.cases) || !Array.isArray(obj.lessons)) throw new Error("The pack has no cases or lessons.");
+    return obj;
+  };
+  UI.importPack = (text) => {
+    const obj = UI.validatePack(JSON.parse(text));
+    try { localStorage.setItem(PACK_KEY, JSON.stringify(obj)); } catch (_) { /* keep for this session only */ }
+    packCache = obj;
+    return obj;
+  };
+  UI.removePack = () => { packCache = null; try { localStorage.removeItem(PACK_KEY); } catch (_) {} };
+  UI.packSource = () => (E.PACK ? "built in" : UI.pack() ? "imported into this browser" : null);
 
   /* ---------- XP, levels and badges ----------
    * Each award key pays out once, so repeating an action can't farm XP. */
