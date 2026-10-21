@@ -5,8 +5,8 @@ const path = require("node:path");
 const fs = require("node:fs");
 
 const root = path.join(__dirname, "..", "src");
-for (const f of ["data/platform.js", "data/library.js", "data/techniques.js", "data/prompts.js", "data/templates.js",
-  "engines/auditor.js", "engines/checker.js", "engines/analyzer.js", "engines/tracker.js", "engines/report.js", "engines/search.js"]) {
+for (const f of ["data/platform.js", "data/library.js", "data/techniques.js", "data/prompts.js", "data/templates.js", "data/learn.js",
+  "engines/auditor.js", "engines/checker.js", "engines/analyzer.js", "engines/tracker.js", "engines/report.js", "engines/search.js", "engines/oof.js", "engines/logparse.js"]) {
   require(path.join(root, f));
 }
 const E = globalThis.Eris;
@@ -192,4 +192,79 @@ test("search: finds rules and techniques", () => {
   const r = E.search.search(idx, "pseudo label");
   assert.ok(r.length && r.some((x) => x.type === "Rule" || x.type === "Technique"));
   assert.deepEqual(E.search.search(idx, ""), []);
+});
+
+test("oof: AUC handles ties and matches the rank definition", () => {
+  assert.equal(E.oof.auc([0, 0, 1, 1], [0.1, 0.4, 0.35, 0.8]), 0.75);
+  assert.equal(E.oof.auc([0, 1, 0, 1], [0.5, 0.5, 0.5, 0.5]), 0.5);
+  assert.equal(E.oof.auc([1, 1], [0.2, 0.3]), null);
+});
+
+test("oof: metrics and direction", () => {
+  const y = [0, 1, 1, 0], p = [0.2, 0.7, 0.4, 0.1];
+  assert.equal(E.oof.score("accuracy", y, p), 0.75);
+  assert.ok(Math.abs(E.oof.score("brier", y, p) - (0.04 + 0.09 + 0.36 + 0.01) / 4) < 1e-12);
+  assert.ok(Math.abs(E.oof.score("rmse", [1, 2], [2, 4]) - Math.sqrt(2.5)) < 1e-12);
+  assert.equal(E.oof.METRICS.logloss.dir, "min");
+});
+
+test("oof: simplex grid sums to one", () => {
+  const g = E.oof.simplex(3, 0.1);
+  assert.equal(g.length, 66);
+  assert.ok(g.every((w) => Math.abs(w.reduce((a, b) => a + b, 0) - 1) < 1e-9));
+});
+
+test("oof: sample analysis gives fold scores, subgroups, honest blend and calibration", () => {
+  const t = E.checker.parseCSV(E.oof.sampleCSV());
+  const ds = E.oof.prepare(t, { target: "target", preds: ["lgbm", "catboost", "mlp"], fold: "fold", group: "region" });
+  assert.equal(ds.y.length, 1500);
+  assert.ok(ds.binary && ds.probs);
+  const a = E.oof.analyze(ds, "auc");
+  assert.equal(a.models[0].folds.length, 5);
+  assert.equal(a.subgroups.length, 2);
+  assert.ok(a.blend.honest <= a.blend.score + 1e-12, "honest estimate can't beat the in-sample optimum");
+  assert.ok(a.calibration.ece >= 0 && a.calibration.ece < 1);
+  assert.ok(a.threshold.f1.best.t >= 0 && a.threshold.f1.best.t <= 1);
+});
+
+test("logparse: per-fold lines, CV, stress split, runtime, memory", () => {
+  const log = `[   0.4s] device=cuda
+Fold 1/5 | epoch 3 | train_loss 0.21 | val_loss 0.41 | val_auc 0.8123
+Fold 2/5 | train auc 0.99 valid auc 0.8051
+fold 3: auc=0.8190
+Fold 4 - score: 0.8010
+Fold 5 AUC 0.8122
+CV 0.80992 +/- 0.00700
+  CV util 0.6412 | LODO util 0.5901
+Public LB: 0.807
+peak gpu memory allocated: 7.5 GB
+runtime 2765.2s`;
+  const r = E.logparse.parse(log);
+  assert.deepEqual(r.folds, [0.8123, 0.8051, 0.819, 0.801, 0.8122]);
+  assert.equal(r.cv, 0.80992);
+  assert.equal(r.cvStd, 0.007);
+  assert.equal(r.ood, 0.5901);
+  assert.equal(r.lb, 0.807);
+  assert.ok(Math.abs(r.runtime - 2765.2 / 60) < 1e-9);
+  assert.equal(r.mem, 7.5);
+  assert.ok(r.evidence.folds.includes("Fold 1/5"));
+});
+
+test("logparse: skeleton-template output and /usr/bin/time", () => {
+  const r = E.logparse.parse(`CV 0.81234 +/- 0.00412 folds=[0.811, 0.808, 0.818, 0.809, 0.816]
+\tElapsed (wall clock) time (h:mm:ss or m:ss): 1:02:30
+\tMaximum resident set size (kbytes): 4194304`);
+  assert.deepEqual(r.folds, [0.811, 0.808, 0.818, 0.809, 0.816]);
+  assert.equal(r.runtime, 62.5);
+  assert.equal(r.mem, 4);
+  assert.deepEqual(E.logparse.parse("nothing useful here").found, []);
+});
+
+test("learn: lessons, scenarios and glossary are well-formed", () => {
+  assert.equal(E.LESSONS.length, 8);
+  E.LESSONS.forEach((l) => { assert.equal(l.quiz.length, 3); l.quiz.forEach((q) => assert.ok(q.a >= 0 && q.a < q.options.length)); });
+  assert.ok(E.SCENARIOS.length >= 30);
+  E.SCENARIOS.forEach((s) => { assert.ok(["allowed", "grey", "banned"].includes(s.a)); assert.ok(s.cite.startsWith("§")); });
+  const idx = E.search.buildIndex();
+  assert.ok(E.search.search(idx, "overfitting").some((x) => x.type === "Lesson"));
 });

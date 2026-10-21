@@ -248,7 +248,11 @@ pd.DataFrame({"id": test.id, "prediction": pred > thr}).to_csv("working/submissi
         const code = root.querySelector("#au-code").value;
         const r = E.auditor.audit(code, { category: root.querySelector("#au-cat").value });
         r.fileName = fileName; r.at = Date.now();
-        if (fileName !== "example.py") UI.store.update((s) => { s.audit = r; });
+        if (fileName !== "example.py") {
+          UI.store.update((s) => { s.audit = r; });
+          UI.award("audit:first", 15, "first audit");
+          if (!r.counts.blocker && !r.counts.high) UI.badge("clean-audit");
+        }
         const cats = ["all", ...new Set(r.findings.map((f) => f.cat))];
         const md = auditMarkdown(r);
         const fixPrompt = E.buildPrompt("audit", Object.assign({}, UI.store.load().promptCtx)) + "\n\n## Findings from the static audit (verify each one; some may be false positives)\n" + r.findings.filter((x) => x.sev !== "info").map((x) => `- [${x.sev}] line ${x.lines.filter(Boolean).join(",") || "–"}: ${x.title}. ${x.fix}`).join("\n");
@@ -305,6 +309,15 @@ pd.DataFrame({"id": test.id, "prediction": pred > thr}).to_csv("working/submissi
       </form>
       ${hasDemo ? `<p class="example-flag">Demo rows (names start with "demo-") are invented to show how the tracker works. The dashboard and the final review ignore them. <button type="button" class="btn btn-small" id="tr-clear-demo">Remove demo rows</button></p>` : ""}
       <div id="tr-main"></div>
+      <details class="section log-import" id="tr-log">
+        <summary><span class="btn">Fill from a training log</span></summary>
+        <div class="log-box">
+          <p class="small muted">Paste the output of a run. The parser pulls out fold scores, CV ± std, the stress split, LB, runtime and memory, and shows the line each number came from. Nothing is saved until you press Save run.</p>
+          <textarea id="lg-text" rows="8" class="mono" spellcheck="false" placeholder="Fold 1 | val_auc 0.8123&#10;Fold 2 | val_auc 0.8051&#10;CV 0.8099 +/- 0.0070&#10;runtime 2765.2s"></textarea>
+          <div class="btn-row"><button type="button" class="btn btn-primary" id="lg-parse">Extract numbers</button></div>
+          <div id="lg-out" aria-live="polite"></div>
+        </div>
+      </details>
       <details class="section add-exp" id="tr-add" ${s.experiments.length ? "" : "open"}>
         <summary><span class="btn btn-primary">Add a run</span></summary>
         <form id="tr-form" class="exp-form" autocomplete="off">
@@ -361,7 +374,7 @@ pd.DataFrame({"id": test.id, "prediction": pred > thr}).to_csv("working/submissi
         UI.setCopy("tr-json", JSON.stringify(exps, null, 2));
         root.querySelector("#tr-copy-json").innerHTML = exps.length ? `<button type="button" class="btn" data-copy="tr-json">Copy JSON</button>` : "";
         if (!exps.length) {
-          main.innerHTML = `<div class="empty"><h2>No runs yet</h2><p>Add your baseline first: its per-fold scores, runtime, and whether the numbers come from a log of the current script. Every later run names a parent, so the tracker can compare them fold by fold.</p><p class="muted small">Want to see how it works? Use <strong>Load demo rows</strong> below. Demo numbers are invented and marked as such.</p></div>`;
+          main.innerHTML = `<div class="empty">${UI.pip("think", 72)}<div><h2>No runs in "${esc(UI.store.active().name)}" yet</h2><p>Add your baseline first: its per-fold scores, runtime, and whether the numbers come from a log of the current script. Paste a training log below to fill the form automatically. Every later run names a parent, so the tracker can compare them fold by fold.</p><p class="muted small">Want to see how it works? Use <strong>Load demo rows</strong> below. Demo numbers are invented and marked as such.</p></div></div>`;
           return;
         }
         const recs = E.tracker.recommend(exps.filter((e) => !e.demo).length ? exps.filter((e) => !e.demo) : exps, s.settings);
@@ -411,6 +424,7 @@ pd.DataFrame({"id": test.id, "prediction": pred > thr}).to_csv("working/submissi
         });
         form.reset(); root.querySelector("#te-id").value = ""; root.querySelector("#te-submit").textContent = "Save run";
         UI.toast(`Saved "${rec.name}"`);
+        if (rec.folds || rec.cv) { UI.award("run:first", 20, "first run logged"); UI.badge("first-run"); }
         E.app.render();
       });
       root.querySelector("#te-cancel").addEventListener("click", () => { form.reset(); root.querySelector("#te-id").value = ""; root.querySelector("#tr-add").open = false; });
@@ -433,6 +447,33 @@ pd.DataFrame({"id": test.id, "prediction": pred > thr}).to_csv("working/submissi
           s.settings.budgetMin = Number(root.querySelector("#ts-budget").value) || 75;
         });
         draw();
+      });
+      root.querySelector("#lg-parse").addEventListener("click", () => {
+        const o = root.querySelector("#lg-out");
+        const r = E.logparse.parse(root.querySelector("#lg-text").value);
+        if (!r.found.length) { o.innerHTML = UI.speech("sad", "I couldn't find any scores in that text. Fold lines look like <code>Fold 2 … auc: 0.81</code>, and a CV summary like <code>CV 0.81 +/- 0.01</code>."); return; }
+        const rows = [
+          ["folds", "Fold scores", r.folds.length ? r.folds.join("  ") : null],
+          ["cv", "CV mean ± std", r.cv !== undefined ? `${r.cv}${r.cvStd !== undefined ? " ± " + r.cvStd : ""}` : r.cvFromFolds !== undefined ? `${UI.fmt(r.cvFromFolds)} (mean of folds)` : null],
+          ["ood", "Stress split", r.ood], ["train", "Train score", r.train], ["lb", "Public LB", r.lb],
+          ["runtime", "Runtime (min)", r.runtime !== undefined ? r.runtime.toFixed(1) : null], ["mem", "Peak memory (GB)", r.mem !== undefined ? r.mem.toFixed(2) : null],
+        ].filter(([, , v]) => v !== null && v !== undefined);
+        o.innerHTML = `<div class="table-wrap"><table><thead><tr><th>Field</th><th>Value</th><th>From line</th></tr></thead><tbody>${rows.map(([k, l, v]) => `<tr><td>${esc(l)}</td><td class="num">${esc(v)}</td><td><code class="ev-line">${esc(r.evidence[k] || "")}</code></td></tr>`).join("")}</tbody></table></div>
+          <div class="btn-row"><button type="button" class="btn btn-primary" id="lg-fill">Fill the run form</button><span class="small muted">Check each value against its line before saving.</span></div>`;
+        o.querySelector("#lg-fill").addEventListener("click", () => {
+          const set = (id, v) => { if (v !== undefined && v !== null && v !== "") root.querySelector("#te-" + id).value = v; };
+          set("folds", r.folds.join(" "));
+          if (!r.folds.length) { set("cv", r.cv); set("cvStd", r.cvStd); }
+          set("ood", r.ood); set("train", r.train); set("lb", r.lb);
+          set("runtime", r.runtime !== undefined ? r.runtime.toFixed(1) : ""); set("mem", r.mem !== undefined ? r.mem.toFixed(2) : "");
+          set("model", r.model);
+          if (!root.querySelector("#te-notes").value) root.querySelector("#te-notes").value = "Numbers parsed from a pasted training log";
+          root.querySelector("#tr-add").open = true;
+          root.querySelector("#te-name").focus();
+          UI.award("log:first", 20, "log parsed");
+          UI.badge("log-reader");
+          UI.toast("Form filled. Name the run, pick its parent, then save.");
+        });
       });
       const demoBtn = root.querySelector("#tr-demo");
       if (demoBtn) demoBtn.addEventListener("click", () => {

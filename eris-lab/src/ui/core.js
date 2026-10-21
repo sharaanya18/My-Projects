@@ -21,23 +21,148 @@
   const SEV_LABEL = { blocker: "Blocker", high: "High", medium: "Medium", low: "Low", info: "Info", grey: "Grey area", ok: "OK" };
   UI.sev = (s) => `<span class="sev sev-${esc(s)}">${esc(SEV_LABEL[s] || s)}</span>`;
 
-  /* ---------- persistence (localStorage; wrapped because it can throw) ---------- */
-  const KEY = "eris-lab:v1";
-  let memory = null;
+  /* ---------- persistence (localStorage; wrapped because it can throw) ----------
+   * v2 layout: one workspace per challenge plus global learning progress.
+   *   { version: 2, active, workspaces: [{ id, name, color, created, data }], global }
+   * load() returns the ACTIVE workspace's data, so views read and write the
+   * same shape as before. v1 data (a single workspace) is migrated on first load. */
+  const KEY = "eris-lab:v2";
+  const KEY_V1 = "eris-lab:v1";
+  const WS_COLORS = ["teal", "coral", "lilac", "sun", "sky", "mint"];
+  const freshData = (name) => ({ experiments: [], settings: { direction: "max", budgetMin: 75, challenge: name || "" }, checklist: {}, workflow: {}, leakage: {}, analysis: null, audit: null, promptCtx: {}, analyzerText: null });
+  const freshGlobal = () => ({ xp: 0, awarded: {}, badges: {}, lessons: {}, quiz: {}, game: { best: null, plays: 0 }, tourDone: false });
+  let root = null;
+
+  function readRoot() {
+    let r = null;
+    try { r = JSON.parse(localStorage.getItem(KEY) || "null"); } catch (_) { r = null; }
+    if (!r || r.version !== 2 || !Array.isArray(r.workspaces) || !r.workspaces.length) {
+      let v1 = null;
+      try { v1 = JSON.parse(localStorage.getItem(KEY_V1) || "null"); } catch (_) { v1 = null; }
+      const id = "ws" + Date.now().toString(36);
+      const name = (v1 && v1.settings && v1.settings.challenge) || "My first challenge";
+      r = { version: 2, active: id, workspaces: [{ id, name, color: "teal", created: Date.now(), data: Object.assign(freshData(name), v1 || {}) }], global: freshGlobal() };
+    }
+    r.global = Object.assign(freshGlobal(), r.global || {});
+    r.workspaces.forEach((w) => { w.data = Object.assign(freshData(w.name), w.data || {}); });
+    if (!r.workspaces.some((w) => w.id === r.active)) r.active = r.workspaces[0].id;
+    return r;
+  }
+  const activeWs = () => root.workspaces.find((w) => w.id === root.active);
+
   UI.store = {
-    load() {
-      if (memory) return memory;
-      let data = {};
-      try { data = JSON.parse(localStorage.getItem(KEY) || "{}") || {}; } catch (_) { data = {}; }
-      memory = Object.assign({ experiments: [], settings: { direction: "max", budgetMin: 75 }, checklist: {}, workflow: {}, leakage: {}, analysis: null, audit: null, promptCtx: {}, analyzerText: null }, data);
-      return memory;
-    },
+    root() { if (!root) root = readRoot(); return root; },
+    load() { UI.store.root(); return activeWs().data; },
+    global() { UI.store.root(); return root.global; },
+    active() { UI.store.root(); return activeWs(); },
+    list() { UI.store.root(); return root.workspaces; },
     save() {
-      try { localStorage.setItem(KEY, JSON.stringify(memory)); return true; } catch (_) { return false; }
+      try { localStorage.setItem(KEY, JSON.stringify(root)); return true; } catch (_) { return false; }
     },
     update(fn) { const s = UI.store.load(); fn(s); UI.store.save(); return s; },
-    reset() { memory = null; try { localStorage.removeItem(KEY); } catch (_) {} },
+    updateGlobal(fn) { const g = UI.store.global(); fn(g); UI.store.save(); return g; },
+    create(name) {
+      UI.store.root();
+      const id = "ws" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+      const nm = String(name || "").trim() || `Challenge ${root.workspaces.length + 1}`;
+      root.workspaces.push({ id, name: nm, color: WS_COLORS[root.workspaces.length % WS_COLORS.length], created: Date.now(), data: freshData(nm) });
+      root.active = id;
+      UI.store.save();
+      return id;
+    },
+    switchTo(id) { UI.store.root(); if (root.workspaces.some((w) => w.id === id)) { root.active = id; UI.store.save(); } },
+    rename(id, name) { const w = UI.store.list().find((x) => x.id === id); if (w && String(name).trim()) { w.name = String(name).trim(); w.data.settings.challenge = w.name; UI.store.save(); } },
+    remove(id) {
+      UI.store.root();
+      if (root.workspaces.length <= 1) return false;
+      root.workspaces = root.workspaces.filter((w) => w.id !== id);
+      if (root.active === id) root.active = root.workspaces[0].id;
+      UI.store.save();
+      return true;
+    },
+    reset() { root = null; try { localStorage.removeItem(KEY); localStorage.removeItem(KEY_V1); } catch (_) {} },
   };
+
+  /* ---------- XP, levels and badges ----------
+   * Each award key pays out once, so repeating an action can't farm XP. */
+  UI.level = (xp) => {
+    const L = E.LEVELS || [{ xp: 0, name: "Seed" }];
+    let i = 0;
+    while (i + 1 < L.length && xp >= L[i + 1].xp) i++;
+    const next = L[i + 1];
+    return { index: i, name: L[i].name, xp, floor: L[i].xp, next: next ? next.xp : null, nextName: next ? next.name : null, pct: next ? (xp - L[i].xp) / (next.xp - L[i].xp) : 1 };
+  };
+  UI.award = (key, xp, label) => {
+    const g = UI.store.global();
+    if (g.awarded[key]) return false;
+    const before = UI.level(g.xp).index;
+    UI.store.updateGlobal((gg) => { gg.awarded[key] = Date.now(); gg.xp += xp; });
+    const after = UI.level(g.xp);
+    UI.toast(`+${xp} XP · ${label}`);
+    if (after.index > before) setTimeout(() => { UI.toast(`Level up: you're now a ${after.name}!`); UI.confetti(); }, 900);
+    document.dispatchEvent(new CustomEvent("eris:xp"));
+    return true;
+  };
+  UI.badge = (id) => {
+    const g = UI.store.global();
+    if (g.badges[id] || !E.BADGES || !E.BADGES[id]) return false;
+    UI.store.updateGlobal((gg) => { gg.badges[id] = Date.now(); });
+    setTimeout(() => { UI.toast(`Badge unlocked: ${E.BADGES[id].name}`); UI.confetti(); }, 400);
+    document.dispatchEvent(new CustomEvent("eris:xp"));
+    return true;
+  };
+
+  /* ---------- confetti (skipped when the viewer prefers reduced motion) ---------- */
+  UI.confetti = () => {
+    if (typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const c = document.createElement("canvas");
+    c.className = "confetti";
+    c.width = innerWidth; c.height = innerHeight;
+    document.body.appendChild(c);
+    const ctx = c.getContext("2d");
+    if (!ctx) { c.remove(); return; }
+    const cs = getComputedStyle(document.documentElement);
+    const cols = ["--accent", "--coral", "--lilac", "--sun", "--sky", "--mint"].map((v) => cs.getPropertyValue(v).trim() || "#f5b700");
+    const P = Array.from({ length: 90 }, () => ({ x: innerWidth / 2 + (Math.random() - 0.5) * 160, y: innerHeight * 0.35, vx: (Math.random() - 0.5) * 11, vy: -Math.random() * 11 - 4, r: Math.random() * 6 + 4, a: Math.random() * 6, va: (Math.random() - 0.5) * 0.4, c: cols[Math.floor(Math.random() * cols.length)] }));
+    const t0 = performance.now();
+    const frame = (t) => {
+      const dt = t - t0;
+      ctx.clearRect(0, 0, c.width, c.height);
+      P.forEach((p) => { p.vy += 0.32; p.x += p.vx; p.y += p.vy; p.a += p.va; ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.a); ctx.fillStyle = p.c; ctx.globalAlpha = Math.max(0, 1 - dt / 1700); ctx.fillRect(-p.r / 2, -p.r / 4, p.r, p.r / 2); ctx.restore(); });
+      if (dt < 1700) requestAnimationFrame(frame); else c.remove();
+    };
+    requestAnimationFrame(frame);
+  };
+
+  /* ---------- Pip, the golden apple (Eris's apple of discord) ----------
+   * mood: happy | wow | sad | think | wink. Character colours are fixed in both themes. */
+  let pipSeq = 0;
+  UI.pip = (mood = "happy", size = 56, label = "Pip the golden apple") => {
+    const g = "pipg" + ++pipSeq;
+    const mouths = {
+      happy: '<path d="M25 41 Q32 48 39 41" stroke="#5a3200" stroke-width="2.4" fill="none" stroke-linecap="round"/>',
+      wow: '<ellipse cx="32" cy="43" rx="3.6" ry="4.4" fill="#5a3200"/>',
+      sad: '<path d="M26 45 Q32 39.5 38 45" stroke="#5a3200" stroke-width="2.4" fill="none" stroke-linecap="round"/>',
+      think: '<path d="M27 43 L37 42" stroke="#5a3200" stroke-width="2.4" stroke-linecap="round"/>',
+      wink: '<path d="M25 41 Q32 48 39 41" stroke="#5a3200" stroke-width="2.4" fill="none" stroke-linecap="round"/>',
+    };
+    const eyes = mood === "wink"
+      ? '<circle cx="25" cy="33" r="3.3" fill="#3b2200"/><circle cx="26.2" cy="31.8" r="1.1" fill="#fff"/><path d="M36 33 Q39.5 30.5 43 33" stroke="#3b2200" stroke-width="2.2" fill="none" stroke-linecap="round"/>'
+      : mood === "sad"
+        ? '<circle cx="25" cy="34" r="3" fill="#3b2200"/><circle cx="39" cy="34" r="3" fill="#3b2200"/><path d="M21 29 L28 30.5 M43 29 L36 30.5" stroke="#3b2200" stroke-width="1.8" stroke-linecap="round"/>'
+        : '<circle cx="25" cy="33" r="3.3" fill="#3b2200"/><circle cx="39" cy="33" r="3.3" fill="#3b2200"/><circle cx="26.2" cy="31.8" r="1.1" fill="#fff"/><circle cx="40.2" cy="31.8" r="1.1" fill="#fff"/>';
+    return `<svg class="pip pip-${esc(mood)}" width="${size}" height="${size}" viewBox="0 0 64 64" role="img" aria-label="${esc(label)}">
+      <defs><radialGradient id="${g}" cx="38%" cy="32%" r="70%"><stop offset="0" stop-color="#ffe680"/><stop offset="0.55" stop-color="#ffc533"/><stop offset="1" stop-color="#e89a00"/></radialGradient></defs>
+      <path d="M32 15 C22 9 8 15 9 33 C10 50 22 59 32 56 C42 59 54 50 55 33 C56 15 42 9 32 15 Z" fill="url(#${g})" stroke="#c98200" stroke-width="1.5"/>
+      <path d="M32 16 C31 11 32 7 35 4" stroke="#7a4a12" stroke-width="2.6" fill="none" stroke-linecap="round"/>
+      <path d="M35 8 C41 2 50 4 52 8 C46 12 40 12 35 8 Z" fill="#4cc38a" stroke="#2f9a68" stroke-width="1.2"/>
+      <ellipse cx="18" cy="24" rx="4" ry="6" fill="#fff6c9" opacity="0.65" transform="rotate(-25 18 24)"/>
+      ${eyes}
+      <ellipse cx="19.5" cy="40" rx="3.6" ry="2.3" fill="#ff8a8a" opacity="0.55"/><ellipse cx="44.5" cy="40" rx="3.6" ry="2.3" fill="#ff8a8a" opacity="0.55"/>
+      ${mouths[mood] || mouths.happy}
+    </svg>`;
+  };
+  UI.speech = (mood, html) => `<div class="pip-say">${UI.pip(mood, 52)}<div class="bubble">${html}</div></div>`;
 
   /* ---------- copy / download ---------- */
   const copyTexts = new Map();

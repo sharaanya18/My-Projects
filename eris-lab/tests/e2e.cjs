@@ -8,7 +8,7 @@ const assert = require("node:assert/strict");
 
 const url = "file://" + path.join(__dirname, "..", "index.html");
 const shotDir = process.argv.includes("--shots") ? process.argv[process.argv.indexOf("--shots") + 1] : null;
-const ROUTES = ["dashboard", "rules", "analyzer", "workflow", "leaderboard", "generalization", "library", "prompts", "templates", "auditor", "tracker", "checker", "review"];
+const ROUTES = ["dashboard", "rules", "learn", "game", "analyzer", "workflow", "leaderboard", "generalization", "oof", "library", "prompts", "templates", "auditor", "tracker", "checker", "review"];
 
 (async () => {
   const browser = await chromium.launch();
@@ -177,6 +177,84 @@ const ROUTES = ["dashboard", "rules", "analyzer", "workflow", "leaderboard", "ge
     const visible = await page.$$eval(".lib", (els) => els.filter((e) => !e.hidden).map((e) => e.dataset.kind));
     assert.ok(visible.length > 0 && visible.every((k) => k === "lesson"));
   });
+
+  await step("learn: demo reacts, quiz answers, lesson completes with XP", async () => {
+    await page.goto(url + "#learn");
+    await page.click("[data-lesson=metric]");
+    await page.waitForSelector("#thr-stats");
+    const before = await page.textContent("#thr-stats");
+    await page.evaluate(() => { const r = document.querySelector("#thr"); r.value = "0.8"; r.dispatchEvent(new Event("input")); });
+    assert.notEqual(await page.textContent("#thr-stats"), before);
+    for (let i = 0; i < 3; i++) await page.click(`.qcard[data-qi='${i}'] .qopt[data-oi='0']`);
+    assert.equal(await page.locator(".qwhy:not([hidden])").count(), 3);
+    await page.click("#ls-done");
+    const g = await page.evaluate(() => Eris.ui.store.global());
+    assert.ok(g.lessons.metric && g.xp >= 50 && g.badges["first-lesson"]);
+  });
+  await step("learn: split and capacity demos", async () => {
+    await page.click("#ls-back");
+    await page.click("[data-lesson=cv]");
+    await page.waitForSelector(".gchip");
+    assert.match(await page.textContent("#sm"), /appear on both sides/);
+    await page.click(".seg-btn[data-mode=group]");
+    assert.match(await page.textContent("#sm"), /No leaks/);
+    await page.click("#ls-back");
+    await page.click("[data-lesson=fit]");
+    await page.evaluate(() => { const r = document.querySelector("#cap"); r.value = "11"; r.dispatchEvent(new Event("input")); });
+    assert.match(await page.textContent("#cap-msg"), /Overfitting/);
+  });
+  await step("game: a full round records the score", async () => {
+    await page.goto(url + "#game");
+    await page.click("#gm-start");
+    for (let i = 0; i < 12; i++) {
+      await page.click(".vbtn.vb-banned");
+      await page.click("#gm-next");
+    }
+    await page.waitForFunction(() => document.querySelector("main h1").textContent.includes("Round complete"));
+    const g = await page.evaluate(() => Eris.ui.store.global().game);
+    assert.equal(g.plays, 1);
+    assert.ok(g.best >= 0 && g.best <= 12);
+  });
+  await step("oof lab: sample analysis, blend and send to tracker", async () => {
+    await page.goto(url + "#oof");
+    await page.click("#lab-sample");
+    await page.waitForSelector(".tiles");
+    assert.ok(await page.$(".heat"));
+    assert.equal(await page.locator(".wbars li").count(), 3);
+    assert.equal(await page.locator(".sg-bars li").count(), 2);
+    assert.match(await page.textContent("#lab-out"), /Best F1/);
+    await page.click("[data-send=blend]");
+    const runs = await page.evaluate(() => Eris.ui.store.load().experiments.map((e) => e.name));
+    assert.ok(runs.some((n) => n.startsWith("blend-")));
+    await page.click("[data-send='0']");
+    const n = await page.evaluate(() => Eris.ui.store.load().experiments.filter((e) => e.name.startsWith("oof-") || e.name.startsWith("blend-")).length);
+    assert.equal(n, 2, "each click logs exactly one run");
+  });
+  await step("tracker: log parser fills the run form", async () => {
+    await page.goto(url + "#tracker");
+    await page.click("#tr-log summary");
+    await page.fill("#lg-text", "Fold 1 val_auc 0.81\nFold 2 val_auc 0.83\nFold 3 val_auc 0.82\nruntime 30 min\nLODO auc 0.74");
+    await page.click("#lg-parse");
+    await page.waitForSelector("#lg-fill");
+    await page.click("#lg-fill");
+    assert.equal(await page.inputValue("#te-folds"), "0.81 0.83 0.82");
+    assert.equal(await page.inputValue("#te-ood"), "0.74");
+    assert.equal(await page.inputValue("#te-runtime"), "30.0");
+  });
+  await step("workspaces: create, isolate and switch back", async () => {
+    await page.goto(url + "#dashboard");
+    const firstId = await page.evaluate(() => Eris.ui.store.active().id);
+    await page.fill("#ws-name", "Second challenge");
+    await page.click("#ws-new button[type=submit]");
+    await page.waitForFunction(() => Eris.ui.store.active().name === "Second challenge");
+    assert.equal(await page.evaluate(() => Eris.ui.store.load().experiments.length), 0);
+    await page.goto(url + "#tracker");
+    assert.match(await page.textContent("#tr-main"), /No runs in "Second challenge"/);
+    await page.selectOption("#ws-select", firstId);
+    await page.waitForSelector(".exp-table");
+    assert.ok(await page.evaluate(() => Eris.ui.store.load().experiments.length) > 0);
+    assert.ok(await page.evaluate(() => Eris.ui.store.global().badges.organised));
+  });
   await step("workflow ticks persist across reload", async () => {
     await page.goto(url + "#workflow");
     await page.check("input[data-wf='w2:0']");
@@ -185,6 +263,22 @@ const ROUTES = ["dashboard", "rules", "analyzer", "workflow", "leaderboard", "ge
   });
   await ctx.close();
 
+
+  // v1 → v2 migration keeps existing data
+  const mctx = await browser.newContext();
+  await mctx.addInitScript(() => {
+    if (!localStorage.getItem("eris-lab:v2") && !localStorage.getItem("eris-lab:v1"))
+      localStorage.setItem("eris-lab:v1", JSON.stringify({ experiments: [{ id: "x1", name: "legacy-run", folds: "0.7 0.71" }], settings: { direction: "max", challenge: "Old challenge" } }));
+  });
+  const mp = await mctx.newPage();
+  mp.on("pageerror", (e) => errors.push(`migration pageerror: ${e.message}`));
+  await step("storage: v1 data migrates into the first workspace", async () => {
+    await mp.goto(url + "#tracker");
+    await mp.waitForSelector(".exp-table");
+    assert.match(await mp.textContent(".exp-table"), /legacy-run/);
+    assert.equal(await mp.evaluate(() => Eris.ui.store.active().name), "Old challenge");
+  });
+  await mctx.close();
   // Phone width
   const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
   const pp = await phone.newPage();
@@ -196,7 +290,7 @@ const ROUTES = ["dashboard", "rules", "analyzer", "workflow", "leaderboard", "ge
       await pp.waitForFunction((h) => document.querySelector(`.nav a[href="#${h}"]`)?.classList.contains("active"), r);
       const over = await pp.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
       assert.ok(over <= 1, `overflow ${over}px`);
-      if (shotDir && ["dashboard", "tracker", "auditor"].includes(r)) await pp.screenshot({ path: path.join(shotDir, `phone-${r}.png`) });
+      if (shotDir && ["dashboard", "tracker", "learn", "game", "oof"].includes(r)) await pp.screenshot({ path: path.join(shotDir, `phone-${r}.png`) });
     });
   }
   await step("phone: menu opens the navigation drawer", async () => {

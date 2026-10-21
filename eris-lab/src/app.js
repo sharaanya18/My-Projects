@@ -1,20 +1,25 @@
-/* App shell: navigation, hash routing, global search, theme toggle. */
+/* App shell: navigation, workspace switcher, XP widget, hash routing,
+ * global search and theme toggle. */
 (function () {
   const E = globalThis.Eris;
   const UI = E.ui;
   const { esc } = UI;
 
   const NAV = [
-    ["Overview", [["dashboard", "Dashboard"], ["rules", "Platform rules"]]],
-    ["Plan", [["analyzer", "Challenge analyzer"], ["workflow", "Workflow"]]],
-    ["Improve", [["leaderboard", "Leaderboard optimization"], ["generalization", "Generalization"], ["library", "Strategy library"]]],
-    ["Build with Claude", [["prompts", "Prompt generator"], ["templates", "Templates"]]],
-    ["Verify", [["auditor", "Solution auditor"], ["tracker", "Experiment tracker"], ["checker", "Runtime & submission"], ["review", "Final review"]]],
+    ["Overview", "teal", [["dashboard", "Dashboard"], ["rules", "Platform rules"]]],
+    ["Learn", "coral", [["learn", "Lessons"], ["game", "Allowed or banned?"]]],
+    ["Plan", "sun", [["analyzer", "Challenge analyzer"], ["workflow", "Workflow"]]],
+    ["Improve", "lilac", [["leaderboard", "Leaderboard optimization"], ["generalization", "Generalization"], ["oof", "OOF lab"], ["library", "Strategy library"]]],
+    ["Build with Claude", "sky", [["prompts", "Prompt generator"], ["templates", "Templates"]]],
+    ["Verify", "mint", [["auditor", "Solution auditor"], ["tracker", "Experiment tracker"], ["checker", "Runtime & submission"], ["review", "Final review"]]],
   ];
-  const ROUTES = NAV.flatMap(([, items]) => items.map(([id]) => id));
+  const ROUTES = NAV.flatMap(([, , items]) => items.map(([id]) => id));
+  const GROUP_OF = {};
+  NAV.forEach(([, color, items]) => items.forEach(([id]) => { GROUP_OF[id] = color; }));
 
   let index = null;
   let pendingAnchor = null;
+  let lastRoute = null;
 
   function route() {
     const h = (location.hash || "").replace(/^#/, "");
@@ -23,9 +28,13 @@
 
   function render() {
     const id = route();
+    if (lastRoute && lastRoute !== id && E.views[lastRoute] && E.views[lastRoute].leave) E.views[lastRoute].leave();
+    const sameRoute = lastRoute === id;
+    lastRoute = id;
     const view = E.views[id];
     const main = document.getElementById("main");
     const state = UI.store.load();
+    main.dataset.group = GROUP_OF[id];
     main.innerHTML = view.render(state);
     document.title = `${view.title} · Eris Solver Lab`;
     document.querySelectorAll(".nav a").forEach((a) => {
@@ -35,6 +44,7 @@
     });
     if (view.mount) view.mount(main, state);
     document.body.classList.remove("nav-open");
+    refreshXp();
     if (pendingAnchor) {
       const el = document.getElementById(pendingAnchor);
       pendingAnchor = null;
@@ -47,17 +57,35 @@
         return;
       }
     }
-    main.focus({ preventScroll: true });
-    window.scrollTo(0, 0);
+    if (!sameRoute) { main.focus({ preventScroll: true }); window.scrollTo(0, 0); }
   }
-  E.app = { render };
 
   function navHTML() {
-    return NAV.map(([group, items]) => `<div class="nav-group"><p class="nav-label">${esc(group)}</p>${items.map(([id, label]) => `<a href="#${id}">${esc(label)}</a>`).join("")}</div>`).join("");
+    return NAV.map(([group, color, items]) => `<div class="nav-group nav-${color}"><p class="nav-label"><i class="nav-dot" aria-hidden="true"></i>${esc(group)}</p>${items.map(([id, label]) => `<a href="#${id}">${esc(label)}</a>`).join("")}</div>`).join("");
   }
+
+  function refreshXp() {
+    const box = document.getElementById("xp-box");
+    if (!box) return;
+    const g = UI.store.global();
+    const lv = UI.level(g.xp);
+    box.innerHTML = `<a href="#learn" class="xp-link">${UI.pip(lv.index >= 5 ? "wink" : "happy", 40)}<span class="xp-text"><b>${esc(lv.name)}</b><span class="num">${g.xp} XP</span></span></a>
+      <div class="xpbar" role="img" aria-label="${Math.round(lv.pct * 100)}% to the next level"><span style="width:${(lv.pct * 100).toFixed(1)}%"></span></div>
+      <p class="xp-next">${lv.next ? `${lv.next - g.xp} XP to ${esc(lv.nextName)}` : "Top level!"}</p>`;
+  }
+
+  function refreshChrome() {
+    const sel = document.getElementById("ws-select");
+    const act = UI.store.active();
+    sel.innerHTML = UI.store.list().map((w) => `<option value="${esc(w.id)}" ${w.id === act.id ? "selected" : ""}>${esc(w.name)}</option>`).join("") + `<option value="__new">+ New challenge…</option>`;
+    document.getElementById("ws-dot").className = "ws-swatch ws-c-" + act.color;
+    refreshXp();
+  }
+  E.app = { render, refreshChrome };
 
   function go(r, anchor) {
     pendingAnchor = anchor || null;
+    if (anchor && anchor.startsWith("lesson-") && E.openLesson) { E.openLesson(anchor.slice(7)); pendingAnchor = null; }
     if (location.hash === "#" + r) render(); else location.hash = r;
   }
 
@@ -110,14 +138,28 @@
   }
 
   function boot() {
-    document.getElementById("nav").innerHTML = navHTML();
+    document.getElementById("nav").innerHTML = navHTML() + `<div class="xp-box" id="xp-box"></div>`;
     document.getElementById("menu-btn").addEventListener("click", () => document.body.classList.toggle("nav-open"));
     document.addEventListener("click", (e) => {
       const a = e.target.closest("a[data-anchor]");
       if (a) { e.preventDefault(); go(a.getAttribute("href").slice(1), a.dataset.anchor); }
     });
+    document.getElementById("ws-select").addEventListener("change", (e) => {
+      if (e.target.value === "__new") {
+        e.target.value = UI.store.active().id;
+        go("dashboard", "workspaces");
+        setTimeout(() => { const n = document.getElementById("ws-name"); if (n) n.focus(); }, 60);
+        return;
+      }
+      UI.store.switchTo(e.target.value);
+      refreshChrome();
+      render();
+      UI.toast(`Switched to "${UI.store.active().name}"`);
+    });
+    document.addEventListener("eris:xp", refreshXp);
     setupSearch();
     setupTheme();
+    refreshChrome();
     window.addEventListener("hashchange", render);
     render();
   }

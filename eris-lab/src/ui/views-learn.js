@@ -21,7 +21,17 @@
       const wfTotal = E.WORKFLOW.reduce((n, w) => n + w.steps.length, 0);
       const fcDone = E.FINAL_CHECKLIST.filter((c) => s.checklist[c.id]).length;
       const audit = s.audit;
+      const g = UI.store.global();
+      const lv = UI.level(g.xp);
+      const lessonsDone = E.LESSONS.filter((l) => g.lessons[l.id]).length;
+      const rule = E.RULES[Math.floor(Date.now() / 86400000) % E.RULES.length];
+      const ws = UI.store.active();
+      const all = UI.store.list();
       return `${pageHead("Project Eris · Shipd", "Solver dashboard", "Platform limits, the state of your current challenge, and what to do next. Everything cites the document it came from, and every number in the panels is one you entered.")}
+      <section class="hello">
+        ${UI.speech("happy", `<p class="hello-ws">Working on <b class="ws-dot ws-c-${esc(ws.color)}">${esc(ws.name)}</b></p><p><b>Rule of the day:</b> ${esc(rule.title)}. ${esc(rule.text)} ${UI.cite(rule.cite)}</p>`)}
+        <a class="learn-card" href="#learn"><span class="lc-k">Your level</span><span class="lc-v">${esc(lv.name)}</span><span class="xpbar"><span style="width:${(lv.pct * 100).toFixed(1)}%"></span></span><span class="small"><span class="num">${g.xp}</span> XP · ${lessonsDone}/${E.LESSONS.length} lessons · ${Object.keys(g.badges).length}/${Object.keys(E.BADGES).length} badges</span></a>
+      </section>
       <section class="panel-grid status-row" aria-label="Current challenge status">
         <article class="stat">
           <h2 class="stat-label">Best validated run</h2>
@@ -50,6 +60,23 @@
       <section class="section">
         <div class="section-head"><h2>Next steps from your evidence</h2><a class="btn btn-ghost btn-small" href="#tracker">Tracker</a></div>
         <ol class="rec-list">${recs.map((r) => `<li class="rec p${r.priority}"><div><strong>${esc(r.title)}</strong><p class="muted">${esc(r.evidence)}</p><p>${esc(r.action)}</p></div></li>`).join("")}</ol>
+      </section>
+
+      <section class="section" id="workspaces">
+        <div class="section-head"><h2>Challenge workspaces</h2><span class="muted small">Each challenge keeps its own runs, audit, analysis and checklists</span></div>
+        <div class="ws-grid">${all.map((w) => {
+          const runs = w.data.experiments.filter((e) => !e.demo);
+          const b = E.tracker.best(runs, w.data.settings.direction || "max");
+          const on = w.id === ws.id;
+          return `<article class="ws-card ws-c-${esc(w.color)}${on ? " on" : ""}" data-ws="${esc(w.id)}">
+            <div class="ws-top"><h3 class="ws-name">${esc(w.name)}</h3>${on ? '<span class="tag tag-rule">open</span>' : ""}</div>
+            <p class="small muted">${runs.length} run${runs.length === 1 ? "" : "s"} · best ${b ? UI.fmt(E.tracker.stats(b).mean) : "–"} · audit ${w.data.audit ? esc(w.data.audit.verdict) : "–"}</p>
+            <form class="ws-rename" hidden><label class="sr-only" for="rn-${esc(w.id)}">New name</label><input id="rn-${esc(w.id)}" value="${esc(w.name)}"><button class="btn btn-small btn-primary">Save</button></form>
+            <div class="btn-row">${on ? "" : `<button type="button" class="btn btn-small btn-primary" data-act="open">Open</button>`}<button type="button" class="btn btn-small btn-ghost" data-act="rename">Rename</button>${all.length > 1 ? `<button type="button" class="btn btn-small btn-ghost danger" data-act="delete">Delete</button>` : ""}</div>
+          </article>`;
+        }).join("")}
+          <form class="ws-new" id="ws-new" autocomplete="off"><label for="ws-name">Start a new challenge</label><input id="ws-name" placeholder="e.g. Pump failure forecasting" maxlength="60"><button type="submit" class="btn btn-primary">Create workspace</button></form>
+        </div>
       </section>
 
       <section class="section">
@@ -86,6 +113,31 @@
         <h2>Where your documents disagree</h2>
         <div class="conflicts">${E.CONFLICTS.map((c, i) => `<details id="conf-${i}" class="conflict"><summary>${UI.prov("verify")} <strong>${esc(c.topic)}</strong></summary><dl><dt>One source</dt><dd>${esc(c.a)}</dd><dt>Another source</dt><dd>${esc(c.b)}</dd><dt>Working resolution</dt><dd>${esc(c.resolution)}</dd></dl></details>`).join("")}</div>
       </section>`;
+    },
+    mount(root) {
+      root.querySelector("#ws-new").addEventListener("submit", (e) => {
+        e.preventDefault();
+        const name = root.querySelector("#ws-name").value;
+        UI.store.create(name);
+        if (UI.store.list().length >= 2) { UI.award("ws:second", 20, "new workspace"); UI.badge("organised"); }
+        UI.toast(`Opened workspace "${UI.store.active().name}"`);
+        E.app.refreshChrome(); E.app.render();
+      });
+      root.querySelector(".ws-grid").addEventListener("click", (e) => {
+        const b = e.target.closest("[data-act]"); if (!b) return;
+        const card = b.closest("[data-ws]"); const id = card.dataset.ws;
+        if (b.dataset.act === "open") { UI.store.switchTo(id); E.app.refreshChrome(); E.app.render(); UI.toast(`Switched to "${UI.store.active().name}"`); }
+        if (b.dataset.act === "rename") { const f = card.querySelector(".ws-rename"); f.hidden = !f.hidden; if (!f.hidden) f.querySelector("input").select(); }
+        if (b.dataset.act === "delete") {
+          if (b.dataset.confirm !== "1") { b.dataset.confirm = "1"; b.textContent = "Confirm: delete runs too"; setTimeout(() => { if (b.isConnected) { b.dataset.confirm = ""; b.textContent = "Delete"; } }, 4000); return; }
+          UI.store.remove(id); E.app.refreshChrome(); E.app.render(); UI.toast("Workspace deleted");
+        }
+      });
+      root.querySelectorAll(".ws-rename").forEach((f) => f.addEventListener("submit", (e) => {
+        e.preventDefault();
+        UI.store.rename(f.closest("[data-ws]").dataset.ws, f.querySelector("input").value);
+        E.app.refreshChrome(); E.app.render();
+      }));
     },
   };
 

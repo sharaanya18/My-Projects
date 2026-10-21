@@ -16,6 +16,9 @@
     (E.ROBUSTNESS_TESTS || []).forEach((r, i) => add("Robustness", r.name, r.how, "generalization", "rob-" + i));
     (E.CONFLICTS || []).forEach((c, i) => add("Doc conflict", c.topic, `${c.a} ${c.b} ${c.resolution}`, "dashboard", "conf-" + i));
     (E.KEY_FACTS || []).forEach((k) => add("Fact", k.label, `${k.value} ${k.cite}`, "dashboard", ""));
+    (E.LESSONS || []).forEach((l) => add("Lesson", l.title, l.body.join(" "), "learn", "lesson-" + l.id));
+    (E.GLOSSARY || []).forEach(([t, d], i) => add("Glossary", t, d, "learn", "gloss-" + i));
+    (E.SCENARIOS || []).forEach((s) => add("Rules game", s.s.length > 70 ? s.s.slice(0, 68) + "…" : s.s, `${s.why} ${s.a} ${s.cite}`, "game", ""));
     return items;
   }
 
