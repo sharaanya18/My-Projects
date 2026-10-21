@@ -69,7 +69,28 @@
       } else UI.toast("Clipboard blocked here. Select the text and copy it manually.");
     }
   }
-  UI.download = (filename, text, type = "text/plain") => {
+  /* Inside the claude.ai artifact viewer, files go through its "downloads"
+   * capability (the viewer confirms each save). Opened locally, a plain link works. */
+  let downloadsNs;
+  const getDownloads = () => {
+    if (downloadsNs !== undefined) return Promise.resolve(downloadsNs);
+    const c = globalThis.claude;
+    if (!c || typeof c.use !== "function") return Promise.resolve((downloadsNs = null));
+    return c.use("downloads").then((n) => (downloadsNs = n || null), () => (downloadsNs = null));
+  };
+  UI.download = async (filename, text, type = "text/plain") => {
+    const ns = await getDownloads();
+    if (ns) {
+      try { await ns.save({ filename, data: text }); UI.toast(`Saved ${filename}`); }
+      catch (e) {
+        const code = e && e.code;
+        UI.toast(code === "declined" ? "Download cancelled"
+          : code === "rejected_extension" ? `.${filename.split(".").pop()} files can't be saved from this view. Use Copy instead.`
+          : code === "rate_limited" ? "A save prompt is already open."
+          : "Downloads aren't available here. Use Copy instead.");
+      }
+      return;
+    }
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([text], { type }));
     a.download = filename;
