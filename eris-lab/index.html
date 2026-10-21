@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Eris Solver Lab</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="description" content="Solution-engineering workbench for Shipd / Project Eris ML challenges with Claude Code.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..100,500..800&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="btn btn-ghost menu-btn" id="menu-btn" aria-label="Toggle navigation" aria-controls="nav">Menu</button>
+  <a class="brand" href="#dashboard"><span class="brand-mark" aria-hidden="true">§</span><span class="brand-name">Eris Solver Lab</span></a>
+  <div class="search-wrap" role="combobox" aria-haspopup="listbox" aria-owns="search-results">
+    <label for="search" class="sr-only">Search everything</label>
+    <input id="search" type="search" placeholder="Search rules, techniques, prompts…  (Ctrl K)" autocomplete="off" aria-autocomplete="list" aria-controls="search-results" aria-expanded="false">
+    <ul id="search-results" role="listbox" hidden></ul>
+  </div>
+  <button type="button" class="btn btn-ghost theme-btn" id="theme-btn">Theme: auto</button>
+</header>
+<div class="shell">
+  <nav class="nav" id="nav" aria-label="Sections"></nav>
+  <main id="main" class="main" tabindex="-1"></main>
+</div>
+<script src="src/data/platform.js"></script>
+<script src="src/data/library.js"></script>
+<script src="src/data/techniques.js"></script>
+<script src="src/data/prompts.js"></script>
+<script src="src/data/templates.js"></script>
+<script src="src/engines/auditor.js"></script>
+<script src="src/engines/checker.js"></script>
+<script src="src/engines/analyzer.js"></script>
+<script src="src/engines/tracker.js"></script>
+<script src="src/engines/report.js"></script>
+<script src="src/engines/search.js"></script>
+<script src="src/ui/core.js"></script>
+<script src="src/ui/views-learn.js"></script>
+<script src="src/ui/views-tools.js"></script>
+<script src="src/app.js"></script>
+</body>
+</html>
