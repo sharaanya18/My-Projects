@@ -8,7 +8,7 @@ import os
 import csv
 
 # Configure Gemini API Key
-GEMINI_API_KEY = "AIzaSyBl0cTqrM_946b4OL5T-Rnosy8-EfdEjPU"
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]  # set in your shell; never commit keys
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-pro')
 
